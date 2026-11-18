@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>blenderbot · Seedance 2.5 &amp; 3D Studio</title>
+  <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+  <link rel="stylesheet" href="/assets/app.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <img src="/favicon.svg" alt="" class="brand-icon" />
+      <span class="brand-title">blenderbot</span>
+      <span class="brand-sub">Seedance 2.5 &times; 3DGS Splat &times; Blender 5.3 Studio</span>
+    </div>
+    <div class="status-pills">
+      <button id="pill-blender" class="pill pill-btn pill-muted" title="Click to connect or hot-swap onto live headed Blender 5.3 GUI Bridge">Blender: checking…</button>
+      <button id="btn-or-key" class="pill pill-btn" title="Configure OpenRouter API key">OpenRouter: checking…</button>
+      <span id="pill-health" class="pill pill-ok" title="Agent context health">Health: healthy</span>
+      <span id="pill-cost" class="pill pill-muted" title="Accumulated session spend">$0.0000</span>
+    </div>
+  </header>
+
+  <div id="key-drawer" class="key-drawer hidden">
+    <div class="key-drawer-inner">
+      <label for="input-or-key"><strong>OPENROUTER_API_KEY</strong> (saved to <code>~/.blenderbot/.env</code>):</label>
+      <input id="input-or-key" type="password" placeholder="sk-or-v1-…" autocomplete="off" />
+      <button id="btn-save-key" class="btn btn-primary btn-sm">Save Key</button>
+      <button id="btn-close-key" class="btn btn-ghost btn-sm">Cancel</button>
+    </div>
+  </div>
+
+  <main class="studio-grid">
+    <!-- LEFT COLUMN: Workspace Media Picker & Upload + Blender Capture -->
+    <section class="pane pane-library" id="dropzone-library">
+      <div class="pane-header">
+        <h2>Media Library</h2>
+        <div class="header-actions">
+          <button id="btn-upload-trigger" class="btn btn-primary btn-sm" title="Upload videos, images, or audio from your computer">+ Upload Files</button>
+          <input id="file-upload-input" type="file" multiple accept="image/*,video/*,audio/*" class="hidden" />
+          <button id="btn-refresh-media" class="btn btn-ghost btn-sm" title="Rescan workspace">↻</button>
+        </div>
+      </div>
+
+      <div class="capture-bar">
+        <button id="btn-cap-still" class="btn btn-secondary btn-sm" title="Render current active camera frame from Blender 5.3">📸 Grab Blender Frame</button>
+        <button id="btn-cap-playblast" class="btn btn-secondary btn-sm" title="Render EEVEE MP4 playblast from Blender 5.3">🎞 Grab Playblast</button>
+      </div>
+
+      <div class="filter-bar">
+        <div class="tabs" id="media-tabs">
+          <button class="tab active" data-filter="all">All</button>
+          <button class="tab" data-filter="video">Videos</button>
+          <button class="tab" data-filter="image">Images</button>
+          <button class="tab" data-filter="audio">Audio</button>
+          <button class="tab" data-filter="seedance">Seedance</button>
+        </div>
+        <input id="media-search" type="search" placeholder="Filter workspace files…" class="search-input" />
+      </div>
+
+      <div class="drop-hint" id="drop-hint">
+        Click <b>Source</b> / <b>+Ref Vid</b> on videos, or <b>First</b> / <b>Last</b> / <b>+Ref</b> on images — active inputs glow green/orange
+      </div>
+      <div id="media-grid" class="media-grid"></div>
+    </section>
+
+    <!-- CENTER COLUMN: Seedance 2.5 Composer + 3DGS Splat Studio -->
+    <section class="pane pane-composer">
+      <div class="pane-header">
+        <div class="studio-mode-tabs">
+          <button id="tab-mode-seedance" class="studio-mode-btn active" type="button">🎬 Seedance 2.5</button>
+          <button id="tab-mode-splat" class="studio-mode-btn" type="button">🌐 3DGS Splat Studio</button>
+        </div>
+        <select id="select-video-model" class="model-select" title="OpenRouter Video API model &amp; output rate">
+          <option value="bytedance/seedance-2.5">bytedance/seedance-2.5 · $0.1028/s (~$0.51 / 5s)</option>
+        </select>
+      </div>
+
+      <div id="panel-seedance-composer" class="composer-scroll">
+        <!-- 1. Conditioning Slots -->
+        <div class="section-label">
+          <span>1. Select Input Video / Frames</span>
+          <button id="btn-clear-cond" class="link-btn">Clear all inputs</button>
+        </div>
+
+        <!-- Dual Source Video Selectors (Source Video 1 + Source Video 2!) -->
+        <div id="slot-video-card" class="cond-video-card">
+          <div class="cond-video-top">
+            <label for="sel-source-video" class="picker-label">Source Video 1:</label>
+            <select id="sel-source-video" class="video-picker-select">
+              <option value="">— None —</option>
+            </select>
+            <button id="btn-clear-video" class="btn btn-ghost btn-xs hidden" title="Clear Video 1">✕</button>
+          </div>
+
+          <div class="cond-video-top">
+            <label for="sel-source-video-2" class="picker-label">Source Video 2:</label>
+            <select id="sel-source-video-2" class="video-picker-select">
+              <option value="">— None (Single video / optional 2nd clip) —</option>
+            </select>
+            <button id="btn-swap-videos" class="btn btn-ghost btn-xs hidden" title="Swap Video 1 &amp; Video 2">⇄</button>
+            <button id="btn-clear-video-2" class="btn btn-ghost btn-xs hidden" title="Clear Video 2">✕</button>
+          </div>
+
+          <div id="dual-video-mode-bar" class="dual-mode-bar hidden">
+            <label for="sel-dual-mode"><b>2-Video Combine Mode:</b></label>
+            <select id="sel-dual-mode" class="video-picker-select">
+              <option value="bridge_v1_to_v2" selected>Bridge Transition (Video 1 End → Video 2 Start + both refs)</option>
+              <option value="span_v1_to_v2">Span Full Arc (Video 1 Start → Video 2 End + both refs)</option>
+              <option value="v1_primary_v2_ref">Video 1 Motion Lock + Video 2 Style/Subject Refs</option>
+            </select>
+          </div>
+
+          <div class="sub-hint" id="slot-video-label">Pick 1 or 2 videos above (or click <b>Vid 1</b> / <b>Vid 2</b> on cards in the Library)</div>
+
+          <div id="dual-video-previews" class="dual-video-previews hidden">
+            <video id="slot-video-preview" class="slot-video-el hidden" controls muted loop playsinline></video>
+            <video id="slot-video-preview-2" class="slot-video-el hidden" controls muted loop playsinline></video>
+          </div>
+
+          <div id="slot-video-opts" class="video-opts hidden">
+            <label id="lbl-vid-first" title="Extract t=0s PNG into frame_images[first_frame]"><input type="checkbox" id="chk-vid-first" checked /> Lock First Frame</label>
+            <label id="lbl-vid-last" title="Extract end PNG into frame_images[last_frame]"><input type="checkbox" id="chk-vid-last" checked /> Lock Last Frame</label>
+            <label title="Sample interior guide keyframes per video into input_references">Mid Keyframes:
+              <select id="sel-vid-mids">
+                <option value="0">0</option>
+                <option value="1">1</option>
+                <option value="2" selected>2</option>
+                <option value="3">3</option>
+              </select>
+            </label>
+            <label title="Extract MP3 track into input_references[audio_url]"><input type="checkbox" id="chk-vid-audio" /> Extract Audio</label>
+          </div>
+        </div>
+
+        <!-- Explicit First & Last Frame Slots -->
+        <div class="frame-slots-row">
+          <div class="frame-slot" id="slot-first">
+            <div class="frame-slot-head">
+              <span>First Frame Override (<code>first_frame</code>)</span>
+              <button id="btn-clear-first" class="icon-x hidden" title="Clear">✕</button>
+            </div>
+            <div class="frame-slot-body" id="slot-first-body">
+              <span class="empty-placeholder">Click <b>First</b> on any image</span>
+            </div>
+          </div>
+
+          <div class="frame-slot" id="slot-last">
+            <div class="frame-slot-head">
+              <span>Last Frame Override (<code>last_frame</code>)</span>
+              <button id="btn-clear-last" class="icon-x hidden" title="Clear">✕</button>
+            </div>
+            <div class="frame-slot-body" id="slot-last-body">
+              <span class="empty-placeholder">Click <b>Last</b> on any image</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Extra Reference Videos, Images & Audio (`input_references`) -->
+        <div class="refs-box">
+          <div class="refs-head">
+            <span>Extra Reference Assets (<code>input_references</code>: extra videos, style images &amp; audio)</span>
+          </div>
+          <div id="refs-chips" class="refs-chips">
+            <span class="empty-placeholder">Optional — click <b>+Ref Vid</b> on extra videos, <b>+Ref</b> on images, or <b>Audio</b></span>
+          </div>
+        </div>
+
+        <!-- 2. Prompt & Motion Mode (with Up/Down Arrow History!) -->
+        <div class="section-label">
+          <div class="prompt-label-left">
+            <span>2. Prompt</span>
+            <span id="prompt-hist-badge" class="hist-badge" title="Press Up/Down Arrow to cycle prompt history">↑/↓ history</span>
+            <select id="sel-prompt-history" class="hist-select" title="Recall a previous prompt">
+              <option value="">🕒 Recent prompts…</option>
+            </select>
+          </div>
+          <div class="mode-pills" id="mode-pills">
+            <button class="mode-pill active" data-mode="standard" title="Exact prompt as written">Standard</button>
+            <button class="mode-pill" data-mode="orbit_plate" title="Appends smooth steady camera parallax hints for 3D Gaussian Splatting">3D Orbit Plate</button>
+            <button class="mode-pill" data-mode="subject_4d" title="Appends clean silhouette &amp; coherent motion cues for 4D unprojection">4D Subject</button>
+          </div>
+        </div>
+
+        <textarea
+          id="input-prompt"
+          class="prompt-textarea"
+          rows="4"
+          placeholder="Describe the shot, lighting, camera move, and subject motion… (↑/↓ recalls previous prompts · Ctrl+Enter generates)"
+        ></textarea>
+
+        <!-- 3. Output Settings (with live USD output cost inside dropdowns!) -->
+        <div class="section-label"><span>3. Output Settings &amp; Pricing</span></div>
+        <div class="params-grid">
+          <label class="field">
+            <span>Duration &amp; Est. Output Cost</span>
+            <select id="sel-duration"></select>
+          </label>
+
+          <label class="field">
+            <span>Dimensions (<code>size</code>) &amp; Output Cost</span>
+            <select id="sel-size"></select>
+          </label>
+
+          <label class="field">
+            <span>Seed (optional)</span>
+            <input id="input-seed" type="number" placeholder="random" />
+          </label>
+
+          <label class="field">
+            <span>Output Path (optional)</span>
+            <input id="input-outpath" type="text" placeholder="assets/seedance/shot_01.mp4" />
+          </label>
+        </div>
+
+        <div class="toggles-row">
+          <label><input type="checkbox" id="chk-gen-audio" /> Generate native audio</label>
+          <label><input type="checkbox" id="chk-attach-ctx" checked /> Attach finished MP4 to Gemini Vision context</label>
+        </div>
+
+        <!-- 4. Live Outbound Context & Cost Inspector -->
+        <div class="payload-inspector" id="payload-inspector">
+          <div class="inspector-head">
+            <span>📡 Outbound Context Sent to Model</span>
+            <span id="inspector-cost-pill" class="inspector-cost">Est. Output: ~$0.5140</span>
+          </div>
+          <div id="inspector-body" class="inspector-body"></div>
+        </div>
+
+        <div class="submit-bar">
+          <div class="est-cost" id="est-cost-label">Est. Output ~$0.51 USD</div>
+          <button id="btn-generate" class="btn btn-accent btn-lg">✦ Generate with Seedance 2.5</button>
+        </div>
+      </div>
+
+      <!-- 3DGS CLOUD SPLAT STUDIO PANEL -->
+      <div id="panel-splat-studio" class="composer-scroll hidden">
+        <div class="section-label">
+          <span>1. Choose 3D Splat Source</span>
+          <div class="mode-pills" id="splat-source-pills">
+            <button type="button" class="mode-pill active" data-src="video">🎬 From Video (.mp4)</button>
+            <button type="button" class="mode-pill" data-src="blender">🧊 From Live Blender 5.3</button>
+          </div>
+        </div>
+
+        <div id="splat-src-video-box" class="cond-video-card">
+          <div class="cond-video-top">
+            <label for="sel-splat-video" class="picker-label">Source Video:</label>
+            <select id="sel-splat-video" class="video-picker-select">
+              <option value="">— Select workspace / Seedance video —</option>
+            </select>
+          </div>
+          <div class="sub-hint">Reconstructs metric camera poses via <b>VGGT-1B</b>, locks floor to <code>Z=0</code>, and trains 3D Gaussians on Modal GPU. (Tip: click <b>Splat</b> on any video card in the Library!)</div>
+        </div>
+
+        <div id="splat-src-blender-box" class="cond-video-card hidden">
+          <div class="params-grid">
+            <label class="field">
+              <span>Orbital Views</span>
+              <input id="inp-splat-views" type="number" min="8" max="96" value="28" />
+            </label>
+            <label class="field">
+              <span>Isolate Objects (optional, comma-sep)</span>
+              <input id="inp-splat-targets" type="text" placeholder="blank = entire visible scene" />
+            </label>
+          </div>
+          <label class="sub-hint"><input type="checkbox" id="chk-splat-rgba" checked /> Render transparent RGBA silhouette views (eliminates background floaters for hero props)</label>
+        </div>
+
+        <div class="section-label">
+          <span>2. Cloud GPU &amp; Training Parameters</span>
+          <div class="iters-preset-pills" id="splat-iter-pills">
+            <button type="button" class="mode-pill" data-iters="2000">2k fast</button>
+            <button type="button" class="mode-pill active" data-iters="5000">5k clean</button>
+            <button type="button" class="mode-pill" data-iters="8000">8k crisp</button>
+            <button type="button" class="mode-pill" data-iters="12000">12k max</button>
+          </div>
+        </div>
+        <div class="params-grid">
+          <label class="field">
+            <span>Training Iterations (editable 200–30,000)</span>
+            <input id="inp-splat-iters" type="number" min="200" max="30000" step="100" value="5000" />
+          </label>
+
+          <label class="field">
+            <span>Modal Serverless GPU</span>
+            <select id="sel-splat-gpu">
+              <option value="H100" selected>NVIDIA H100 80GB · $3.95/hr</option>
+              <option value="L40S">NVIDIA L40S 48GB · $1.95/hr</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>Blender 5.3 Import Mode</span>
+            <select id="sel-splat-rendermode">
+              <option value="ellipsoids_viewport" selected>Full Smooth 3DGS Ellipsoids in Viewport &amp; Render</option>
+              <option value="hybrid">Fast 60fps Dots in Viewport + Smooth 3DGS on F12</option>
+              <option value="pointcloud">Pure PointCloud Dots Only</option>
+            </select>
+          </label>
+
+          <label class="field">
+            <span>SH Color Degree</span>
+            <select id="sel-splat-sh">
+              <option value="1" selected>Degree 1 (View-dependent sheen)</option>
+              <option value="0">Degree 0 (Anti-flicker diffuse DC)</option>
+              <option value="2">Degree 2 (Full specular SH)</option>
+            </select>
+          </label>
+        </div>
+
+        <!-- Collapsible Anti-Floater & Culling Knobs (arcgs / tt-splat) -->
+        <details class="splat-knobs-drawer">
+          <summary>🛠 Anti-Floater, Culling &amp; Blender Import Knobs (opacity reset, needle cull, VGGT filter)</summary>
+          <div class="params-grid" style="margin-top:8px">
+            <label class="field" title="L1 penalty on opacity — higher evaporates misty AI-video air floaters">
+              <span>Floater Opacity Penalty (<code>opa_reg</code>)</span>
+              <input id="inp-splat-opareg" type="number" step="0.0001" min="0" max="0.02" value="0.0005" />
+            </label>
+            <label class="field" title="Drops Gaussians dimmer than this threshold every 100 steps">
+              <span>Cull Min Opacity (<code>prune_opa</code>)</span>
+              <input id="inp-splat-pruneopa" type="number" step="0.005" min="0.005" max="0.25" value="0.025" />
+            </label>
+            <label class="field" title="Resets all opacities every N steps (0 = off) to kill camera-hugging floaters">
+              <span>Opacity Reset Every N Steps</span>
+              <input id="inp-splat-opareset" type="number" step="500" min="0" max="10000" value="2000" />
+            </label>
+            <label class="field" title="Drops lowest N% confidence VGGT points before training starts">
+              <span>VGGT Low-Conf Point Cull (%)</span>
+              <input id="inp-splat-vggtconf" type="number" step="5" min="0" max="85" value="45" />
+            </label>
+            <label class="field" title="Max world radius (m) kept when importing into Blender">
+              <span>Blender Max Splat Size (m)</span>
+              <input id="inp-splat-maxscale" type="number" step="0.05" min="0.05" max="2.0" value="0.25" />
+            </label>
+            <label class="field" title="Filters out long spiky needle splats (s_max / s_mid) on Blender import">
+              <span>Blender Max Needle Ratio</span>
+              <input id="inp-splat-maxaniso" type="number" step="1" min="2" max="50" value="10" />
+            </label>
+            <label class="field" title="VGGT-1B solves fast metric poses on all videos; COLMAP SIFT is exact on rigid scenes">
+              <span>Camera Pose Solver</span>
+              <select id="sel-splat-pose-backend">
+                <option value="vggt" selected>VGGT-1B (Fast Metric GPU · Letterbox-safe)</option>
+                <option value="colmap">COLMAP SIFT + Mapper (Exact Rigid SfM)</option>
+              </select>
+            </label>
+          </div>
+        </details>
+
+        <div class="toggles-row">
+          <label><input type="checkbox" id="chk-splat-autoimport" checked /> Auto-import trained <code>.ply</code> + <code>SeedanceSourceCam</code> into Blender 5.3 on completion</label>
+        </div>
+
+        <div class="submit-bar">
+          <div class="est-cost" id="splat-est-cost">Est. Modal H100 ~$0.03 USD</div>
+          <button id="btn-train-splat" type="button" class="btn btn-primary btn-lg">🚀 Train 3D Gaussian Splat</button>
+        </div>
+
+        <!-- Live Training Telemetry Card -->
+        <div id="splat-live-card" class="splat-live-card hidden">
+          <div class="splat-live-head">
+            <span id="splat-live-title">Training…</span>
+            <span id="splat-live-metrics" class="splat-metrics-pill">PSNR — dB · 0 Gaussians</span>
+          </div>
+          <div class="splat-prog-track"><div id="splat-prog-fill" class="splat-prog-fill" style="width:0%"></div></div>
+          <div id="splat-live-preview-wrap" class="splat-live-preview-wrap hidden">
+            <img id="splat-live-img" alt="Live 3DGS render" />
+            <img id="splat-live-diff" class="hidden" alt="3x Luminance Error" />
+            <div class="splat-preview-toggle">
+              <button type="button" id="btn-splat-show-render" class="btn btn-secondary btn-xs">Render</button>
+              <button type="button" id="btn-splat-show-diff" class="btn btn-ghost btn-xs">Error Map</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Saved & Completed Splat Jobs -->
+        <div class="section-label">
+          <span>3. Saved 3D Splat Scenes (<code>assets/splats/</code>)</span>
+          <button type="button" id="btn-refresh-splats" class="link-btn">↻ Refresh</button>
+        </div>
+        <div id="splat-jobs-list" class="splat-jobs-list">
+          <div class="empty-placeholder">Loading splat artifacts…</div>
+        </div>
+      </div>
+
+      <div id="composer-toast" class="toast hidden" style="margin:0 12px 10px"></div>
+    </section>
+
+    <!-- RIGHT COLUMN: Theater Player, WebGL 3D Splat Viewer, Job Queue & Agent Co-Pilot -->
+    <section class="pane pane-stage">
+      <div class="pane-header">
+        <h2>Preview Stage &amp; 3D Viewer</h2>
+        <span id="stage-title" class="stage-filename">Select media or 3D splat</span>
+      </div>
+
+      <div class="theater" id="theater-box">
+        <div id="theater-empty" class="theater-empty">
+          Seedance 2.5 videos, Blender renders &amp; interactive 3D Gaussian Splats appear here
+        </div>
+        <video id="theater-video" class="theater-media hidden" controls autoplay loop playsinline></video>
+        <img id="theater-image" class="theater-media hidden" alt="preview" />
+        <canvas id="theater-splat-canvas" class="theater-splat-canvas hidden"></canvas>
+        <div id="theater-splat-hud" class="splat-hud hidden">
+          <span id="splat-hud-info">3DGS Viewer · Drag to orbit · Right-drag pan · Scroll zoom</span>
+          <button type="button" id="btn-splat-reset-cam" class="btn btn-ghost btn-xs">Reset View</button>
+        </div>
+        <audio id="theater-audio" class="hidden" controls></audio>
+      </div>
+
+      <div id="theater-actions" class="theater-actions hidden">
+        <span id="theater-meta" class="theater-meta"></span>
+        <div class="theater-btns">
+          <button id="btn-stage-to-splat" class="btn btn-primary btn-xs hidden">🌐 Train 3D Splat</button>
+          <button id="btn-stage-import-bl" class="btn btn-primary btn-xs hidden">📥 Import into Blender 5.3</button>
+          <button id="btn-stage-use-vid" class="btn btn-secondary btn-xs hidden">Set Source Video</button>
+          <button id="btn-stage-ref-vid" class="btn btn-secondary btn-xs hidden">+Ref Video</button>
+          <button id="btn-stage-use-first" class="btn btn-secondary btn-xs hidden">Set First Frame</button>
+          <button id="btn-stage-at-agent" class="btn btn-secondary btn-xs">Insert @path to Agent</button>
+          <a id="link-stage-download" class="btn btn-ghost btn-xs" download>Download</a>
+        </div>
+      </div>
+
+      <div class="jobs-section">
+        <div class="section-label"><span>Seedance Job Queue &amp; Billed Output Cost</span></div>
+        <div id="jobs-list" class="jobs-list">
+          <div class="empty-placeholder">No Seedance jobs submitted in this session yet.</div>
+        </div>
+      </div>
+
+      <div class="copilot-section">
+        <div class="section-label">
+          <span>Blender 5.3 Agent Co-Pilot</span>
+          <button id="btn-agent-cancel" class="btn btn-ghost btn-xs hidden">■ Cancel Turn</button>
+        </div>
+
+        <!-- Live LLM Context Window & Token Cost Strip -->
+        <div id="agent-ctx-bar" class="agent-ctx-bar" title="Click to inspect or drop segments sent to the LLM">
+          <span id="agent-ctx-summary">LLM Context: loading…</span>
+          <span class="ctx-toggle-lbl">▾ details</span>
+        </div>
+        <div id="agent-ctx-drawer" class="agent-ctx-drawer hidden"></div>
+
+        <div id="agent-feed" class="agent-feed"></div>
+        <form id="agent-form" class="agent-form">
+          <input id="agent-input" type="text" placeholder="Ask blenderbot (↑/↓ prompt history · '@path' attaches media)" autocomplete="off" />
+          <button type="submit" class="btn btn-primary btn-sm">Send</button>
+        </form>
+      </div>
+    </section>
+  </main>
+
+  <script src="/assets/app.js"></script>
+</body>
+</html>
