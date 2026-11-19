@@ -93,6 +93,12 @@ def _build_protocol_default(role: str = "master") -> str:
             "Replace exact text in workspace file (sandboxed & journaled)",
         ),
         (
+            "gen.seedream",
+            "mutate",
+            "`prompt`, `output_path`?, `resolution`? (`1K`|`1.5K`|`2K`), `aspect_ratio`?, `output_format`? (`png`|`jpeg`), `background`? (`auto`|`transparent`|`opaque`), `reference_images`?, `mode`?, `seed`?",
+            "Generate PNG/JPEG image via OpenRouter Image API (`bytedance-seed/seedream-5-5`) with up to 10 `input_references`",
+        ),
+        (
             "gen.seedance",
             "mutate",
             "`prompt`?, `output_path`?, `duration`?, `size`?, `first_frame`?, `last_frame`?, `video_path`?, `reference_images`?, `audio_path`?, `mode`?, `generate_audio`?, `seed`?",

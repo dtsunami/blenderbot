@@ -332,6 +332,21 @@ class WebState:
                 except Exception:  # noqa: BLE001, S110
                     pass
 
+            if n_gauss == 0:
+                if splat_p.is_file():
+                    n_gauss = splat_p.stat().st_size // 32
+                else:
+                    try:
+                        with ply_p.open("rb") as fh:
+                            hdr_b = fh.read(512).decode("ascii", errors="ignore")
+                        for hln in hdr_b.splitlines():
+                            hp = hln.strip().split()
+                            if len(hp) >= 3 and hp[0] == "element" and hp[1] == "vertex":
+                                n_gauss = int(hp[2])
+                                break
+                    except Exception:  # noqa: BLE001, S110
+                        pass
+
             out.append(
                 {
                     "job_id": d.name,
@@ -349,6 +364,8 @@ class WebState:
                     "ssim": round(ssim_v, 4),
                     "it_per_sec": 0.0,
                     "n_gaussians": n_gauss,
+                    "ply_size_bytes": ply_p.stat().st_size,
+                    "has_orig": (d / "splat.orig.ply").is_file(),
                     "elapsed_sec": round(wall_s, 1),
                     "cost_usd": round(cost_usd, 5),
                     "error": None,
@@ -371,8 +388,11 @@ class WebState:
             )
         return out[:max_items]
 
-    def scan_workspace_media(self, max_items: int = 160) -> list[dict[str, Any]]:
+    def scan_workspace_media(self, max_items: int = 180) -> list[dict[str, Any]]:
+        from PIL import Image
+
         cwd = self.session.cfg.cwd
+        splats_dir = (cwd / "assets" / "splats").resolve()
         found: list[tuple[float, Path, str]] = []
 
         def _walk(folder: Path, depth: int) -> None:
@@ -382,12 +402,22 @@ class WebState:
                 entries = list(folder.iterdir())
             except OSError:
                 return
+            is_inside_splat = False
+            try:
+                folder.resolve().relative_to(splats_dir)
+                is_inside_splat = folder.resolve() != splats_dir
+            except ValueError:
+                pass
+
             for entry in entries:
                 name = entry.name
                 if name.startswith(".") and name not in (".",):
                     continue
                 if entry.is_dir():
                     if name in SKIP_SCAN_DIRS:
+                        continue
+                    # Hide internal splat training snapshots/previews from loose media hierarchy
+                    if is_inside_splat and name in ("previews", "snapshots"):
                         continue
                     _walk(entry, depth + 1)
                 elif entry.is_file():
@@ -420,15 +450,30 @@ class WebState:
         items: list[dict[str, Any]] = []
         for mtime, p, kind in found[:max_items]:
             rel = self.session.sandbox.rel(p).replace("\\", "/")
+            folder_rel = str(Path(rel).parent).replace("\\", "/")
+            if folder_rel == ".":
+                folder_rel = "workspace"
+            w_px: int | None = None
+            h_px: int | None = None
+            if kind == "image":
+                try:
+                    with Image.open(p) as im:
+                        w_px, h_px = int(im.width), int(im.height)
+                except Exception:  # noqa: BLE001, S110
+                    pass
             items.append(
                 {
                     "path": rel,
+                    "folder": folder_rel,
                     "name": p.name,
                     "kind": kind,
                     "ext": p.suffix.lower(),
                     "size_bytes": p.stat().st_size,
+                    "width": w_px,
+                    "height": h_px,
                     "mtime": int(mtime),
                     "is_seedance": "seedance" in rel.lower(),
+                    "is_seedream": "seedream" in rel.lower(),
                     "cost_usd": cost_by_rel.get(rel),
                     "url": self.media_url_for(p),
                 }

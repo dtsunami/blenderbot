@@ -609,5 +609,112 @@ def op_scene_snapshot_restore(ctx: OpContext, params: dict[str, Any]) -> dict[st
     return op_blender_status(ctx, {})
 
 
+@blender_op(
+    "scene.viewport_triangles",
+    tier="read",
+    summary="Extract evaluated world-space mesh triangles + normals + material colors for live WebGL2 FPS navigation.",
+    params_doc={
+        "max_triangles": "Max triangles to stream (default 45000)",
+    },
+)
+def op_scene_viewport_triangles(ctx: OpContext, params: dict[str, Any]) -> dict[str, Any]:
+    bpy = ctx.bpy
+    sc = ctx.scene
+    max_tris = max(500, min(150_000, int(params.get("max_triangles") or 45_000)))
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+
+    def _mat_rgba(obj: Any, mat_idx: int) -> tuple[float, float, float, float]:
+        slots = getattr(obj, "material_slots", None)
+        if slots and 0 <= mat_idx < len(slots):
+            mat = slots[mat_idx].material
+            if mat is not None:
+                if getattr(mat, "use_nodes", False) and mat.node_tree is not None:
+                    for n in mat.node_tree.nodes:
+                        if n.type == "BSDF_PRINCIPLED" and "Base Color" in n.inputs:
+                            c = n.inputs["Base Color"].default_value
+                            return (
+                                float(c[0]) ** (1.0 / 2.2),
+                                float(c[1]) ** (1.0 / 2.2),
+                                float(c[2]) ** (1.0 / 2.2),
+                                1.0,
+                            )
+                dc = getattr(mat, "diffuse_color", None)
+                if dc is not None:
+                    return (
+                        float(dc[0]) ** (1.0 / 2.2),
+                        float(dc[1]) ** (1.0 / 2.2),
+                        float(dc[2]) ** (1.0 / 2.2),
+                        1.0,
+                    )
+        return (0.74, 0.77, 0.82, 1.0)
+
+    verts_flat: list[float] = []
+    tri_count = 0
+    obj_names: list[str] = []
+
+    for obj in sc.objects:
+        if obj.type != "MESH" or obj.hide_get() or obj.display_type in ("WIRE", "BOUNDS"):
+            continue
+        if obj.name.endswith("_ShadowGround"):
+            continue
+        eval_obj = obj.evaluated_get(depsgraph)
+        try:
+            mesh = eval_obj.to_mesh()
+        except RuntimeError:
+            mesh = None
+        if mesh is None:
+            continue
+        try:
+            mesh.calc_loop_triangles()
+            n_t = len(mesh.loop_triangles)
+            if n_t == 0:
+                continue
+            mw = obj.matrix_world
+            verts = mesh.vertices
+            cols = [_mat_rgba(obj, i) for i in range(max(1, len(obj.material_slots)))]
+            stride = max(1, (tri_count + n_t) // max_tris) if (tri_count + n_t > max_tris) else 1
+            obj_names.append(obj.name)
+            for ti in range(0, n_t, stride):
+                if tri_count >= max_tris:
+                    break
+                tri = mesh.loop_triangles[ti]
+                p0 = mw @ verts[tri.vertices[0]].co
+                p1 = mw @ verts[tri.vertices[1]].co
+                p2 = mw @ verts[tri.vertices[2]].co
+                nrm = (p1 - p0).cross(p2 - p0)
+                if nrm.length < 1e-9:
+                    continue
+                nrm.normalize()
+                nx, ny, nz = float(nrm.x), float(nrm.y), float(nrm.z)
+                cr, cg, cb, ca = cols[tri.material_index] if tri.material_index < len(cols) else cols[0]
+                for p in (p0, p1, p2):
+                    verts_flat.extend([float(p.x), float(p.y), float(p.z), nx, ny, nz, cr, cg, cb, ca])
+                tri_count += 1
+        finally:
+            eval_obj.to_mesh_clear()
+        if tri_count >= max_tris:
+            break
+
+    cam_info: dict[str, Any] | None = None
+    if sc.camera is not None and sc.camera.type == "CAMERA":
+        mw_c = sc.camera.evaluated_get(depsgraph).matrix_world
+        loc_c = mw_c.to_translation()
+        fwd_c = (-float(mw_c[0][2]), -float(mw_c[1][2]), -float(mw_c[2][2]))
+        cam_info = {
+            "name": sc.camera.name,
+            "eye": [round(float(loc_c.x), 4), round(float(loc_c.y), 4), round(float(loc_c.z), 4)],
+            "forward": [round(fwd_c[0], 5), round(fwd_c[1], 5), round(fwd_c[2], 5)],
+            "lens_mm": round(float(sc.camera.data.lens), 2),
+        }
+
+    return {
+        "scene": sc.name,
+        "objects": obj_names,
+        "triangles": tri_count,
+        "vertex_floats": verts_flat,
+        "active_camera": cam_info,
+    }
+
+
 def _unused_import_guard() -> Any:
     return iter_action_fcurves

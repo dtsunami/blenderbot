@@ -1,4 +1,4 @@
-"""Generative video & media pipeline (`blenderbot.media_gen`)."""
+"""Generative image, video & media pipeline (`blenderbot.media_gen`)."""
 
 from .seedance import (
     DEFAULT_SEEDANCE_MODEL,
@@ -14,18 +14,46 @@ from .seedance import (
     probe_media_info,
     snap_seedance_size,
 )
+from .seedream import (
+    DEFAULT_SEEDREAM_MODEL,
+    ESTIMATED_COST_BY_RES_USD,
+    ESTIMATED_COST_PER_IMAGE_USD,
+    SEEDREAM_ASPECT_RATIOS,
+    SEEDREAM_BACKGROUNDS,
+    SEEDREAM_MODES,
+    SEEDREAM_OUTPUT_FORMATS,
+    SEEDREAM_RESOLUTIONS,
+    SeedreamError,
+    default_seedream_output_path,
+    fetch_openrouter_image_models,
+    generate_seedream_image,
+    prepare_seedream_request,
+)
 
 __all__ = [
     "DEFAULT_SEEDANCE_MODEL",
+    "DEFAULT_SEEDREAM_MODEL",
+    "ESTIMATED_COST_BY_RES_USD",
+    "ESTIMATED_COST_PER_IMAGE_USD",
     "SEEDANCE_ASPECT_RATIOS",
     "SEEDANCE_MIMES",
     "SEEDANCE_RESOLUTIONS",
     "SEEDANCE_SIZES",
+    "SEEDREAM_ASPECT_RATIOS",
+    "SEEDREAM_BACKGROUNDS",
+    "SEEDREAM_MODES",
+    "SEEDREAM_OUTPUT_FORMATS",
+    "SEEDREAM_RESOLUTIONS",
     "SeedanceError",
+    "SeedreamError",
     "decompose_video_for_seedance",
+    "default_seedream_output_path",
+    "fetch_openrouter_image_models",
     "fetch_openrouter_video_models",
     "generate_seedance_video",
+    "generate_seedream_image",
     "prepare_seedance_request",
+    "prepare_seedream_request",
     "probe_media_info",
     "snap_seedance_size",
 ]

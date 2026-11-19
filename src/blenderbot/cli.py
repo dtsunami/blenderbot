@@ -278,6 +278,7 @@ def _print_doctor(cfg: Config) -> int:
             "",
             "Providers & Cloud Compute",
             f"  active              {cfg.provider} / {cfg.model.id} (effort={cfg.effort}, role={cfg.role}, vision={'yes' if cfg.model.vision else 'no'}, video={'yes' if cfg.model.video else 'no'})",
+            f"  image generator     {cfg.image_model} (OpenRouter /api/v1/images)",
             f"  video generator     {cfg.video_model} (OpenRouter /api/v1/videos)",
             f"  modal 3dgs cloud    {modal_status} (app: blenderbot-splat)",
         ]

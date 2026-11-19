@@ -3,22 +3,37 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>blenderbot · Seedance 2.5 &amp; 3D Studio</title>
+  <title>blenderbot · 3D Studio, Seedance 2.5, Seedream 5.5 &amp; FPS Splat Editor</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
   <link rel="stylesheet" href="/assets/app.css" />
 </head>
 <body>
+  <!-- TOP WORKBENCH TITLE / COMMAND BAR -->
   <header class="topbar">
-    <div class="brand">
-      <img src="/favicon.svg" alt="" class="brand-icon" />
-      <span class="brand-title">blenderbot</span>
-      <span class="brand-sub">Seedance 2.5 &times; 3DGS Splat &times; Blender 5.3 Studio</span>
+    <div class="topbar-left">
+      <button id="btn-toggle-left" type="button" class="btn btn-ghost btn-sm panel-toggle-btn active" title="Toggle Left Explorer Sidebar (Ctrl+B)">☰ Explorer</button>
+      <div class="brand">
+        <img src="/favicon.svg" alt="" class="brand-icon" />
+        <span class="brand-title">blenderbot</span>
+      </div>
+
+      <!-- App-Wide Center Stage Mode Switcher -->
+      <div class="view-mode-bar" role="tablist" aria-label="Center Viewport Mode">
+        <button id="btn-view-inspect" type="button" class="view-mode-btn active" title="Inspect Media, Images, Videos, or 3D Turntable Orbit">👁 View / Orbit</button>
+        <button id="btn-view-fps" type="button" class="view-mode-btn" title="FPS Camera &amp; Splat Editor — Minecraft Creative Fly (Space×2) + 60fps Gaussian Culling (Key: F)">🎮 FPS &amp; Splat Edit (F)</button>
+        <button id="btn-view-compare" type="button" class="view-mode-btn hidden" title="Compare Original Video vs Modal Cloud / Blender Render + 3D Camera Path">🎬 Compare &amp; Path</button>
+      </div>
     </div>
+
     <div class="status-pills">
-      <button id="pill-blender" class="pill pill-btn pill-muted" title="Click to connect or hot-swap onto live headed Blender 5.3 GUI Bridge">Blender: checking…</button>
-      <button id="btn-or-key" class="pill pill-btn" title="Configure OpenRouter API key">OpenRouter: checking…</button>
+      <button id="btn-cap-still" type="button" class="btn btn-secondary btn-sm" title="Render current active camera frame from Blender 5.3">📸 Grab Blender</button>
+      <button id="btn-cap-playblast" type="button" class="btn btn-secondary btn-sm" title="Render EEVEE MP4 playblast from Blender 5.3">🎞 Playblast</button>
+      <button id="pill-blender" type="button" class="pill pill-btn pill-muted" title="Click to connect or hot-swap onto live Blender 5.3">Blender: checking…</button>
+      <button id="btn-or-key" type="button" class="pill pill-btn" title="Configure OpenRouter API key">OpenRouter: checking…</button>
       <span id="pill-health" class="pill pill-ok" title="Agent context health">Health: healthy</span>
       <span id="pill-cost" class="pill pill-muted" title="Accumulated session spend">$0.0000</span>
+      <button id="btn-topbar-agent" type="button" class="btn btn-ghost btn-sm panel-toggle-btn" title="Show/Hide Agent Co-Pilot Chat Drawer (Ctrl+J)">🤖 Chat <span id="topbar-agent-dot" class="agent-live-dot hidden"></span></button>
+      <button id="btn-toggle-right" type="button" class="btn btn-ghost btn-sm panel-toggle-btn active" title="Toggle Right Inspector Sidebar (Ctrl+Alt+B)">Inspector ☰</button>
     </div>
   </header>
 
@@ -26,496 +41,179 @@
     <div class="key-drawer-inner">
       <label for="input-or-key"><strong>OPENROUTER_API_KEY</strong> (saved to <code>~/.blenderbot/.env</code>):</label>
       <input id="input-or-key" type="password" placeholder="sk-or-v1-…" autocomplete="off" />
-      <button id="btn-save-key" class="btn btn-primary btn-sm">Save Key</button>
-      <button id="btn-close-key" class="btn btn-ghost btn-sm">Cancel</button>
+      <button id="btn-save-key" type="button" class="btn btn-primary btn-sm">Save Key</button>
+      <button id="btn-close-key" type="button" class="btn btn-ghost btn-sm">Cancel</button>
     </div>
   </div>
 
-  <main class="studio-grid">
-    <!-- LEFT COLUMN: Workspace Media Picker & Upload + Blender Capture -->
-    <section class="pane pane-library" id="dropzone-library">
-      <div class="pane-header">
-        <h2>Media Library</h2>
-        <div class="header-actions">
-          <button id="btn-upload-trigger" class="btn btn-primary btn-sm" title="Upload videos, images, or audio from your computer">+ Upload Files</button>
-          <input id="file-upload-input" type="file" multiple accept="image/*,video/*,audio/*" class="hidden" />
-          <button id="btn-refresh-media" class="btn btn-ghost btn-sm" title="Rescan workspace">↻</button>
-        </div>
-      </div>
+  <!-- FLOATING RICH HOVER PREVIEW TOOLTIP FOR LEFT HIERARCHY -->
+  <div id="hierarchy-tooltip" class="hierarchy-tooltip hidden" role="tooltip">
+    <div id="ht-preview-box" class="ht-preview-box"></div>
+    <div class="ht-meta-box">
+      <div id="ht-title" class="ht-title"></div>
+      <div id="ht-path" class="ht-path"></div>
+      <div id="ht-specs" class="ht-specs"></div>
+    </div>
+  </div>
 
-      <div class="capture-bar">
-        <button id="btn-cap-still" class="btn btn-secondary btn-sm" title="Render current active camera frame from Blender 5.3">📸 Grab Blender Frame</button>
-        <button id="btn-cap-playblast" class="btn btn-secondary btn-sm" title="Render EEVEE MP4 playblast from Blender 5.3">🎞 Grab Playblast</button>
+  <!-- VSCODE / CHROME DEVTOOLS RESIZABLE 3-PANE WORKBENCH -->
+  <main class="studio-grid" id="studio-workbench">
+    <!-- DOCKED EDGE RESTORE TAB WHEN LEFT EXPLORER IS HIDDEN -->
+    <button id="edge-restore-left" type="button" class="edge-restore-tab edge-left hidden" title="Show Explorer Hierarchy (Ctrl+B)">
+      <span>▸</span>
+      <span class="edge-restore-lbl">EXPLORER</span>
+    </button>
+
+    <!-- LEFT PANE: VSCODE-STYLE EXPLORER HIERARCHY TREE -->
+    <aside class="pane pane-library" id="dropzone-library" aria-label="Explorer Hierarchy">
+      <div class="pane-header explorer-header">
+        <h2 class="vsc-pane-title" title="Scene &amp; Workspace Hierarchy">EXPLORER</h2>
+        <div class="header-actions">
+          <button id="btn-upload-trigger" type="button" class="icon-action-btn accent-icon" title="Upload images, videos, audio, or .ply/.splat splats">+ Upload</button>
+          <input id="file-upload-input" type="file" multiple accept="image/*,video/*,audio/*,.ply,.splat" class="hidden" />
+          <button id="btn-refresh-media" type="button" class="icon-action-btn" title="Refresh Workspace Explorer">↻</button>
+          <button id="btn-collapse-all-tree" type="button" class="icon-action-btn" title="Collapse / Expand All Folders in Explorer">⊟</button>
+          <button id="btn-close-left" type="button" class="icon-action-btn" title="Hide Explorer Sidebar (Ctrl+B)">«</button>
+        </div>
       </div>
 
       <div class="filter-bar">
+        <div class="search-wrap">
+          <input id="media-search" type="search" placeholder="Search hierarchy (files, splats, stages)…" class="search-input" />
+        </div>
         <div class="tabs" id="media-tabs">
-          <button class="tab active" data-filter="all">All</button>
-          <button class="tab" data-filter="video">Videos</button>
-          <button class="tab" data-filter="image">Images</button>
-          <button class="tab" data-filter="audio">Audio</button>
-          <button class="tab" data-filter="seedance">Seedance</button>
-        </div>
-        <input id="media-search" type="search" placeholder="Filter workspace files…" class="search-input" />
-      </div>
-
-      <div class="drop-hint" id="drop-hint">
-        Click <b>Source</b> / <b>+Ref Vid</b> on videos, or <b>First</b> / <b>Last</b> / <b>+Ref</b> on images — active inputs glow green/orange
-      </div>
-      <div id="media-grid" class="media-grid"></div>
-    </section>
-
-    <!-- CENTER COLUMN: Seedance 2.5 Composer + 3DGS Splat Studio -->
-    <section class="pane pane-composer">
-      <div class="pane-header">
-        <div class="studio-mode-tabs">
-          <button id="tab-mode-seedance" class="studio-mode-btn active" type="button">🎬 Seedance 2.5</button>
-          <button id="tab-mode-splat" class="studio-mode-btn" type="button">🌐 3DGS Splat Studio</button>
-        </div>
-        <select id="select-video-model" class="model-select" title="OpenRouter Video API model &amp; output rate">
-          <option value="bytedance/seedance-2.5">bytedance/seedance-2.5 · $0.1028/s (~$0.51 / 5s)</option>
-        </select>
-      </div>
-
-      <div id="panel-seedance-composer" class="composer-scroll">
-        <!-- 1. Conditioning Slots -->
-        <div class="section-label">
-          <span>1. Select Input Video / Frames</span>
-          <button id="btn-clear-cond" class="link-btn">Clear all inputs</button>
-        </div>
-
-        <!-- Dual Source Video Selectors (Source Video 1 + Source Video 2!) -->
-        <div id="slot-video-card" class="cond-video-card">
-          <div class="cond-video-top">
-            <label for="sel-source-video" class="picker-label">Source Video 1:</label>
-            <select id="sel-source-video" class="video-picker-select">
-              <option value="">— None —</option>
-            </select>
-            <button id="btn-clear-video" class="btn btn-ghost btn-xs hidden" title="Clear Video 1">✕</button>
-          </div>
-
-          <div class="cond-video-top">
-            <label for="sel-source-video-2" class="picker-label">Source Video 2:</label>
-            <select id="sel-source-video-2" class="video-picker-select">
-              <option value="">— None (Single video / optional 2nd clip) —</option>
-            </select>
-            <button id="btn-swap-videos" class="btn btn-ghost btn-xs hidden" title="Swap Video 1 &amp; Video 2">⇄</button>
-            <button id="btn-clear-video-2" class="btn btn-ghost btn-xs hidden" title="Clear Video 2">✕</button>
-          </div>
-
-          <div id="dual-video-mode-bar" class="dual-mode-bar hidden">
-            <label for="sel-dual-mode"><b>2-Video Combine Mode:</b></label>
-            <select id="sel-dual-mode" class="video-picker-select">
-              <option value="bridge_v1_to_v2" selected>Bridge Transition (Video 1 End → Video 2 Start + both refs)</option>
-              <option value="span_v1_to_v2">Span Full Arc (Video 1 Start → Video 2 End + both refs)</option>
-              <option value="v1_primary_v2_ref">Video 1 Motion Lock + Video 2 Style/Subject Refs</option>
-            </select>
-          </div>
-
-          <div class="sub-hint" id="slot-video-label">Pick 1 or 2 videos above (or click <b>Vid 1</b> / <b>Vid 2</b> on cards in the Library)</div>
-
-          <div id="dual-video-previews" class="dual-video-previews hidden">
-            <video id="slot-video-preview" class="slot-video-el hidden" controls muted loop playsinline></video>
-            <video id="slot-video-preview-2" class="slot-video-el hidden" controls muted loop playsinline></video>
-          </div>
-
-          <div id="slot-video-opts" class="video-opts hidden">
-            <label id="lbl-vid-first" title="Extract t=0s PNG into frame_images[first_frame]"><input type="checkbox" id="chk-vid-first" checked /> Lock First Frame</label>
-            <label id="lbl-vid-last" title="Extract end PNG into frame_images[last_frame]"><input type="checkbox" id="chk-vid-last" checked /> Lock Last Frame</label>
-            <label title="Sample interior guide keyframes per video into input_references">Mid Keyframes:
-              <select id="sel-vid-mids">
-                <option value="0">0</option>
-                <option value="1">1</option>
-                <option value="2" selected>2</option>
-                <option value="3">3</option>
-              </select>
-            </label>
-            <label title="Extract MP3 track into input_references[audio_url]"><input type="checkbox" id="chk-vid-audio" /> Extract Audio</label>
-          </div>
-        </div>
-
-        <!-- Explicit First & Last Frame Slots -->
-        <div class="frame-slots-row">
-          <div class="frame-slot" id="slot-first">
-            <div class="frame-slot-head">
-              <span>First Frame Override (<code>first_frame</code>)</span>
-              <button id="btn-clear-first" class="icon-x hidden" title="Clear">✕</button>
-            </div>
-            <div class="frame-slot-body" id="slot-first-body">
-              <span class="empty-placeholder">Click <b>First</b> on any image</span>
-            </div>
-          </div>
-
-          <div class="frame-slot" id="slot-last">
-            <div class="frame-slot-head">
-              <span>Last Frame Override (<code>last_frame</code>)</span>
-              <button id="btn-clear-last" class="icon-x hidden" title="Clear">✕</button>
-            </div>
-            <div class="frame-slot-body" id="slot-last-body">
-              <span class="empty-placeholder">Click <b>Last</b> on any image</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- Extra Reference Videos, Images & Audio (`input_references`) -->
-        <div class="refs-box">
-          <div class="refs-head">
-            <span>Extra Reference Assets (<code>input_references</code>: extra videos, style images &amp; audio)</span>
-          </div>
-          <div id="refs-chips" class="refs-chips">
-            <span class="empty-placeholder">Optional — click <b>+Ref Vid</b> on extra videos, <b>+Ref</b> on images, or <b>Audio</b></span>
-          </div>
-        </div>
-
-        <!-- 2. Prompt & Motion Mode (with Up/Down Arrow History!) -->
-        <div class="section-label">
-          <div class="prompt-label-left">
-            <span>2. Prompt</span>
-            <span id="prompt-hist-badge" class="hist-badge" title="Press Up/Down Arrow to cycle prompt history">↑/↓ history</span>
-            <select id="sel-prompt-history" class="hist-select" title="Recall a previous prompt">
-              <option value="">🕒 Recent prompts…</option>
-            </select>
-          </div>
-          <div class="mode-pills" id="mode-pills">
-            <button type="button" id="btn-pull-cam-prompt" class="btn btn-secondary btn-xs" title="Compile active Blender 5.3 camera lens, 3D dolly/orbit arc &amp; elevation into prompt">🎥 Pull Blender Cam</button>
-            <button class="mode-pill active" data-mode="standard" title="Exact prompt as written">Standard</button>
-            <button class="mode-pill" data-mode="orbit_plate" title="Appends smooth steady camera parallax hints for 3D Gaussian Splatting">3D Orbit Plate</button>
-            <button class="mode-pill" data-mode="subject_4d" title="Appends clean silhouette &amp; coherent motion cues for 4D unprojection">4D Subject</button>
-          </div>
-        </div>
-
-        <textarea
-          id="input-prompt"
-          class="prompt-textarea"
-          rows="4"
-          placeholder="Describe the shot, lighting, camera move, and subject motion… (↑/↓ recalls previous prompts · Ctrl+Enter generates)"
-        ></textarea>
-
-        <!-- 3. Output Settings (with live USD output cost inside dropdowns!) -->
-        <div class="section-label"><span>3. Output Settings &amp; Pricing</span></div>
-        <div class="params-grid">
-          <label class="field">
-            <span>Duration &amp; Est. Output Cost</span>
-            <select id="sel-duration"></select>
-          </label>
-
-          <label class="field">
-            <span>Dimensions (<code>size</code>) &amp; Output Cost</span>
-            <select id="sel-size"></select>
-          </label>
-
-          <label class="field">
-            <span>Seed (optional)</span>
-            <input id="input-seed" type="number" placeholder="random" />
-          </label>
-
-          <label class="field">
-            <span>Output Path (optional)</span>
-            <input id="input-outpath" type="text" placeholder="assets/seedance/shot_01.mp4" />
-          </label>
-        </div>
-
-        <div class="toggles-row">
-          <label><input type="checkbox" id="chk-gen-audio" /> Generate native audio</label>
-          <label><input type="checkbox" id="chk-attach-ctx" checked /> Attach finished MP4 to Gemini Vision context</label>
-        </div>
-
-        <!-- 4. Live Outbound Context & Cost Inspector -->
-        <div class="payload-inspector" id="payload-inspector">
-          <div class="inspector-head">
-            <span>📡 Outbound Context Sent to Model</span>
-            <span id="inspector-cost-pill" class="inspector-cost">Est. Output: ~$0.5140</span>
-          </div>
-          <div id="inspector-body" class="inspector-body"></div>
-        </div>
-
-        <div class="submit-bar">
-          <div class="est-cost" id="est-cost-label">Est. Output ~$0.51 USD</div>
-          <button id="btn-generate" class="btn btn-accent btn-lg">✦ Generate with Seedance 2.5</button>
+          <button type="button" class="tab active" data-filter="all">All</button>
+          <button type="button" class="tab" data-filter="splat" title="3D Stages &amp; Gaussian Splats">🌐 3D</button>
+          <button type="button" class="tab" data-filter="video" title="Videos">🎬 Video</button>
+          <button type="button" class="tab" data-filter="image" title="Images">🖼 Image</button>
+          <button type="button" class="tab" data-filter="audio" title="Audio">🔊 Audio</button>
         </div>
       </div>
 
-      <!-- 3DGS CLOUD SPLAT STUDIO PANEL -->
-      <div id="panel-splat-studio" class="composer-scroll hidden">
-        <div class="section-label">
-          <span>1. Choose 3D Splat Source</span>
-          <div class="mode-pills" id="splat-source-pills">
-            <button type="button" class="mode-pill active" data-src="video">🎬 From Video (.mp4)</button>
-            <button type="button" class="mode-pill" data-src="blender">🧊 From Live Blender 5.3</button>
-          </div>
+      <div id="hierarchy-tree" class="hierarchy-tree vsc-tree" role="tree" aria-label="Workspace Hierarchy"></div>
+    </aside>
+
+    <!-- LEFT VERTICAL RESIZE SPLITTER (Drag to resize, drag far left to hide, double-click to reset) -->
+    <div id="sash-left" class="pane-sash sash-vertical" role="separator" aria-orientation="vertical" title="Drag to resize Explorer · Double-click to reset width"></div>
+
+    <!-- CENTER COLUMN: [MAIN 3D / MEDIA STAGE] + [ALWAYS-PRESENT EXPANDABLE AGENT CHAT DRAWER] -->
+    <section class="pane pane-stage" id="pane-center-stage">
+      <div class="pane-header stage-header">
+        <div class="stage-title-group">
+          <span id="stage-kind-badge" class="stage-kind-badge">3D STAGE</span>
+          <h2 id="stage-title" class="stage-filename">Default Cube Courtyard</h2>
+          <span id="theater-meta" class="theater-meta"></span>
         </div>
-
-        <div id="splat-src-video-box" class="cond-video-card">
-          <div class="cond-video-top">
-            <label for="sel-splat-video" class="picker-label">Source Video:</label>
-            <select id="sel-splat-video" class="video-picker-select">
-              <option value="">— Select workspace / Seedance video —</option>
-            </select>
-          </div>
-          <div class="cond-video-top" style="margin-top:6px">
-            <label for="sel-splat-known-cams" class="picker-label" title="Lock or nudge Seedance video reconstruction onto a known Blender / prior camera path">Camera Prior:</label>
-            <select id="sel-splat-known-cams" class="video-picker-select">
-              <option value="">— Auto Solve Poses (VGGT / COLMAP) —</option>
-              <option value="__blender_active__">🎥 Active Blender 5.3 Camera (Zero-Drift Lock / Prior)</option>
-            </select>
-          </div>
-          <div class="sub-hint">Extracts exact video PTS timestamps, solves or locks metric camera poses (<code>Z=0</code> floor), and exports <code>.ply</code> + <code>.splat</code> + <code>proxy_collision.glb</code>.</div>
-        </div>
-
-        <div id="splat-src-blender-box" class="cond-video-card hidden">
-          <div class="params-grid">
-            <label class="field">
-              <span>Orbital Views</span>
-              <input id="inp-splat-views" type="number" min="8" max="96" value="28" />
-            </label>
-            <label class="field">
-              <span>Isolate Objects (optional, comma-sep)</span>
-              <input id="inp-splat-targets" type="text" placeholder="blank = entire visible scene" />
-            </label>
-          </div>
-          <label class="sub-hint"><input type="checkbox" id="chk-splat-rgba" checked /> Render transparent RGBA silhouette views (eliminates background floaters for hero props)</label>
-        </div>
-
-        <div class="section-label">
-          <span>2. Cloud GPU &amp; Training Parameters</span>
-          <div class="iters-preset-pills" id="splat-iter-pills">
-            <button type="button" class="mode-pill" data-iters="2000">2k fast</button>
-            <button type="button" class="mode-pill active" data-iters="5000">5k clean</button>
-            <button type="button" class="mode-pill" data-iters="8000">8k crisp</button>
-            <button type="button" class="mode-pill" data-iters="12000">12k max</button>
-          </div>
-        </div>
-        <div class="params-grid">
-          <label class="field">
-            <span>Training Iterations (editable 200–30,000)</span>
-            <input id="inp-splat-iters" type="number" min="200" max="30000" step="100" value="5000" />
-          </label>
-
-          <label class="field">
-            <span>Modal Serverless GPU</span>
-            <select id="sel-splat-gpu">
-              <option value="H100" selected>NVIDIA H100 80GB · $3.95/hr</option>
-              <option value="L40S">NVIDIA L40S 48GB · $1.95/hr</option>
-            </select>
-          </label>
-
-          <label class="field">
-            <span>Blender 5.3 Import Mode</span>
-            <select id="sel-splat-rendermode">
-              <option value="ellipsoids_viewport" selected>Full Smooth 3DGS Ellipsoids in Viewport &amp; Render</option>
-              <option value="hybrid">Fast 60fps Dots in Viewport + Smooth 3DGS on F12</option>
-              <option value="pointcloud">Pure PointCloud Dots Only</option>
-            </select>
-          </label>
-
-          <label class="field">
-            <span>SH Color Degree</span>
-            <select id="sel-splat-sh">
-              <option value="1" selected>Degree 1 (View-dependent sheen)</option>
-              <option value="0">Degree 0 (Anti-flicker diffuse DC)</option>
-              <option value="2">Degree 2 (Full specular SH)</option>
-            </select>
-          </label>
-        </div>
-
-        <!-- Collapsible Anti-Floater, Pose Optimization & Quality Knobs (`tt-splat` + `gsplat`) -->
-        <details class="splat-knobs-drawer">
-          <summary>🛠 Quality, Pose Refinement &amp; Anti-Floater Knobs (DSSIM λ, se(3) Pose Opt, Mip-Splat, COLMAP Prior)</summary>
-          <div class="params-grid" style="margin-top:8px">
-            <label class="field" title="(1-λ)·L1 + λ·(1-SSIM): higher sharpens structural edges">
-              <span>DSSIM Weight (<code>lambda_dssim</code>)</span>
-              <input id="inp-splat-dssim" type="number" step="0.05" min="0" max="0.95" value="0.20" />
-            </label>
-            <label class="field" title="L1 penalty on opacity — higher evaporates misty AI-video air floaters">
-              <span>Floater Opacity Penalty (<code>opa_reg</code>)</span>
-              <input id="inp-splat-opareg" type="number" step="0.0001" min="0" max="0.02" value="0.0005" />
-            </label>
-            <label class="field" title="Drops Gaussians dimmer than this threshold every 100 steps">
-              <span>Cull Min Opacity (<code>prune_opa</code>)</span>
-              <input id="inp-splat-pruneopa" type="number" step="0.005" min="0.005" max="0.25" value="0.025" />
-            </label>
-            <label class="field" title="Resets all opacities every N steps (0 = off) to kill camera-hugging floaters">
-              <span>Opacity Reset Every N Steps</span>
-              <input id="inp-splat-opareset" type="number" step="500" min="0" max="10000" value="2000" />
-            </label>
-            <label class="field" title="Drops lowest N% confidence VGGT points before training starts">
-              <span>VGGT Low-Conf Point Cull (%)</span>
-              <input id="inp-splat-vggtconf" type="number" step="5" min="0" max="85" value="45" />
-            </label>
-            <label class="field" title="Max world radius (m) kept when importing into Blender">
-              <span>Blender Max Splat Size (m)</span>
-              <input id="inp-splat-maxscale" type="number" step="0.05" min="0.05" max="2.0" value="0.25" />
-            </label>
-            <label class="field" title="Filters out long spiky needle splats (s_max / s_mid) on Blender import">
-              <span>Blender Max Needle Ratio</span>
-              <input id="inp-splat-maxaniso" type="number" step="1" min="2" max="50" value="10" />
-            </label>
-            <label class="field" title="2D EWA anti-aliasing filter prevents distant shimmer in Blender/UE">
-              <span>Rasterizer Filter</span>
-              <select id="sel-splat-rastmode">
-                <option value="antialiased" selected>Mip-Splatting Antialiased</option>
-                <option value="classic">Classic 3DGS</option>
-              </select>
-            </label>
-            <label class="field" title="VGGT-1B solves fast metric poses; COLMAP Prior locks PINHOLE K + Umeyama Sim3 onto Blender camera">
-              <span>Camera Pose Solver</span>
-              <select id="sel-splat-pose-backend">
-                <option value="vggt" selected>VGGT-1B (Fast Metric GPU · Letterbox-safe)</option>
-                <option value="colmap">COLMAP PINHOLE (Rigid SfM)</option>
-                <option value="colmap_prior">COLMAP + Blender Prior (PINHOLE K + Umeyama)</option>
-                <option value="known_cameras">Hard Lock to Camera Prior (0px Drift)</option>
-              </select>
-            </label>
-          </div>
-          <div class="toggles-row" style="margin-top:8px">
-            <label title="Optimizes 6D rotation + 3D translation per camera during gsplat training"><input type="checkbox" id="chk-splat-refineposes" checked /> Sub-pixel <code>se(3)</code> camera pose refinement</label>
-            <label title="Also import Surface-Nets proxy_collision.glb as Cycles shadow-catcher / collider"><input type="checkbox" id="chk-splat-proxyglb" /> Import coarse <code>proxy_collision.glb</code> into Blender</label>
-          </div>
-        </details>
-
-        <div class="toggles-row">
-          <label><input type="checkbox" id="chk-splat-autoimport" checked /> Auto-import trained <code>.ply</code> + <code>SeedanceSourceCam</code> into Blender 5.3 on completion</label>
-        </div>
-
-        <div class="submit-bar">
-          <div class="est-cost" id="splat-est-cost">Est. Modal H100 ~$0.03 USD</div>
-          <button id="btn-train-splat" type="button" class="btn btn-primary btn-lg">🚀 Train 3D Gaussian Splat</button>
-        </div>
-
-        <!-- Live Training Telemetry Card + `tt-splat` Plots, Stage Bar, Scrubber & Surgical Workbench -->
-        <div id="splat-live-card" class="splat-live-card hidden">
-          <div class="splat-live-head">
-            <span id="splat-live-title">Training…</span>
-            <span id="splat-live-metrics" class="splat-metrics-pill">PSNR — dB · 0 Gaussians</span>
-          </div>
-          <div class="splat-prog-track"><div id="splat-prog-fill" class="splat-prog-fill" style="width:0%"></div></div>
-
-          <!-- Mid-Train Live Controls (`tt-splat` Operations) -->
-          <div id="splat-live-ctl-bar" class="splat-ctl-bar">
-            <button type="button" id="btn-wb-pause" class="btn btn-secondary btn-xs" title="Pause / Resume GPU training loop">⏸ Pause</button>
-            <button type="button" id="btn-wb-saveckpt" class="btn btn-secondary btn-xs" title="Write intermediate checkpoint on Modal Volume">💾 Save Ckpt</button>
-            <button type="button" id="btn-wb-stop" class="btn btn-ghost btn-xs" title="Stop training early and export .ply/.splat now">⏹ Stop &amp; Export</button>
-            <select id="sel-wb-focus-cam" class="wb-mini-select" title="Lock optimization to a single camera view ('Focus here')">
-              <option value="">🎯 Focus: All Views</option>
-            </select>
-            <button type="button" id="btn-wb-push-knobs" class="btn btn-secondary btn-xs" title="Push current DSSIM λ &amp; opa_reg sliders live into running job">⚡ Push Knobs</button>
-          </div>
-
-          <div id="splat-live-preview-wrap" class="splat-live-preview-wrap hidden">
-            <img id="splat-live-img" alt="Live 3DGS render" />
-            <img id="splat-live-diff" class="hidden" alt="3x Luminance Error" />
-            <div class="splat-preview-toggle">
-              <button type="button" id="btn-splat-show-render" class="btn btn-secondary btn-xs">Render</button>
-              <button type="button" id="btn-splat-show-diff" class="btn btn-ghost btn-xs">Error Map</button>
-            </div>
-          </div>
-
-          <!-- `tt-splat` Stacked GPU Stage Breakdown Bar -->
-          <div id="splat-stage-wrap" class="splat-stage-wrap hidden">
-            <div id="splat-stage-bar" class="splat-stage-bar"></div>
-            <div id="splat-stage-legend" class="splat-stage-legend"></div>
-          </div>
-
-          <!-- Interactive Loss/PSNR + Gaussian Count Charts -->
-          <div id="splat-charts-wrap" class="splat-charts-wrap hidden">
-            <div class="chart-head">
-              <span id="lbl-chart-hover">Loss (orange) · L1 (cyan) · PSNR dB (green) · dashed = densify/surgery</span>
-            </div>
-            <canvas id="canvas-splat-loss-psnr" class="splat-chart-canvas" width="520" height="125"></canvas>
-            <canvas id="canvas-splat-count" class="splat-chart-canvas" width="520" height="68"></canvas>
-          </div>
-
-          <!-- Snapshot Timeline Scrubber -->
-          <div id="splat-snap-row" class="splat-snap-row hidden">
-            <span class="wb-lbl">📸 Snapshots:</span>
-            <input type="range" id="rng-splat-snap" min="0" max="0" value="0" />
-            <span id="lbl-splat-snap" class="wb-mono">—</span>
-          </div>
-
-          <!-- Surgical & Blender 3D CropBox / Proxy Mesh Bar -->
-          <div id="splat-surgery-bar" class="splat-ctl-bar">
-            <button type="button" id="btn-surg-reset-opa" class="btn btn-secondary btn-xs" title="Reset opacities to 0.01 &amp; run +1,500 steps so floaters evaporate">🫧 Reset Opa</button>
-            <button type="button" id="btn-surg-clamp-scale" class="btn btn-secondary btn-xs" title="Clamp overgrown spiky log-scales &amp; polish +1,000 steps">✂️ Clamp Spikes</button>
-            <button type="button" id="btn-cropbox-spawn" class="btn btn-secondary btn-xs" title="Spawn wireframe SplatCropBox cube in Blender 5.3 viewport">📦 Spawn CropBox</button>
-            <button type="button" id="btn-cropbox-cull" class="btn btn-primary btn-xs" title="Cull Gaussians inside Blender SplatCropBox &amp; heal background (+1,500 steps)">🔥 Cull Box &amp; Heal</button>
-            <button type="button" id="btn-cropbox-keep" class="btn btn-secondary btn-xs" title="Keep ONLY Gaussians inside Blender SplatCropBox &amp; polish">🎯 Keep Box</button>
-            <button type="button" id="btn-build-proxy" class="btn btn-secondary btn-xs" title="Generate Surface-Nets proxy_collision.glb &amp; import into Blender 5.3">🕸 Proxy .GLB</button>
-          </div>
-        </div>
-
-        <!-- Saved & Completed Splat Jobs -->
-        <div class="section-label">
-          <span>3. Saved 3D Splat Scenes (<code>assets/splats/</code>)</span>
-          <button type="button" id="btn-refresh-splats" class="link-btn">↻ Refresh</button>
-        </div>
-        <div id="splat-jobs-list" class="splat-jobs-list">
-          <div class="empty-placeholder">Loading splat artifacts…</div>
-        </div>
-      </div>
-
-      <div id="composer-toast" class="toast hidden" style="margin:0 12px 10px"></div>
-    </section>
-
-    <!-- RIGHT COLUMN: Theater Player, WebGL 3D Splat Viewer, Job Queue & Agent Co-Pilot -->
-    <section class="pane pane-stage">
-      <div class="pane-header">
-        <h2>Preview Stage &amp; 3D Sandbox</h2>
         <div class="header-actions">
-          <button type="button" id="btn-open-fps-sandbox" class="btn btn-secondary btn-xs" title="Open Minecraft/Rust FPS Camera Rail, Subject-Track &amp; Voxel Sandbox (works on active splat or blank Z=0 grid!)">🎮 FPS Rail Sandbox</button>
-          <span id="stage-title" class="stage-filename">Select media or 3D splat</span>
+          <button id="btn-zen-mode" type="button" class="btn btn-ghost btn-xs" title="Maximize Center Viewport / Hide Sidebars (Key: Tab)">⛶ Zen (Tab)</button>
         </div>
       </div>
 
       <div class="theater" id="theater-box">
-        <div id="theater-empty" class="theater-empty">
-          Seedance 2.5 videos, Blender renders &amp; interactive 3D Gaussian Splats appear here
+        <div id="stage-drop-overlay" class="stage-drop-overlay hidden">
+          <div class="drop-card">
+            <div class="drop-card-title">Drop Media, <code>.ply</code>, or <code>.splat</code> Here</div>
+            <div class="drop-card-sub">Opens directly in the Center Stage</div>
+          </div>
         </div>
+
+        <div id="theater-empty" class="theater-empty hidden">
+          Click any 3D Stage, Splat, Video, or Image in the Left Explorer to view &amp; edit here
+        </div>
+
         <video id="theater-video" class="theater-media hidden" controls autoplay loop playsinline></video>
-        <img id="theater-image" class="theater-media hidden" alt="preview" />
-        <canvas id="theater-splat-canvas" class="theater-splat-canvas hidden"></canvas>
-
-        <!-- FPS Crosshair + Telemetry Overlay -->
-        <div id="fps-crosshair-wrap" class="fps-crosshair-wrap hidden">
-          <div id="fps-crosshair" class="fps-crosshair">+</div>
-          <div id="fps-reticle-tag" class="fps-reticle-tag">35mm · WALK 1.65m</div>
+        <img id="theater-image" class="theater-media hidden" alt="Selected asset preview" />
+        <div id="theater-audio-wrap" class="theater-audio-wrap hidden">
+          <div class="audio-stage-icon">♫</div>
+          <div id="theater-audio-title" class="audio-stage-title"></div>
+          <audio id="theater-audio" controls></audio>
         </div>
 
-        <!-- Rust/PUBG Tactical Radar Minimap (shows Body Heading vs Alt Free-Look Cone + Landmarks!) -->
-        <canvas id="fps-radar-canvas" class="fps-radar-canvas hidden" width="104" height="104" title="Tactical Minimap: Green arrow = movement heading · Cyan cone = Alt look direction · Gold = Cam Rail · Magenta = Subject · Orange = Pings"></canvas>
+        <!-- Unified Multi-Pass Depth-Tested WebGL2 3D Splat + Solid Mesh + FPS Canvas -->
+        <canvas id="theater-splat-canvas" class="theater-splat-canvas"></canvas>
 
-        <!-- Inline Non-Blocking Ping Note Input -->
+        <!-- Top-Center 3D / FPS Status Bar -->
+        <div id="fps-top-strip" class="fps-top-strip">
+          <span id="badge-locomotion" class="hud-badge badge-walk" title="Space = Jump · Double-tap Space×2 or G = Toggle Minecraft Creative Fly">🚶 WALK 1.65m</span>
+          <span id="badge-splat-stats" class="hud-badge badge-splat">Loading…</span>
+          <button id="btn-undo" type="button" class="hud-pill-btn" title="Undo Splat Edit (Ctrl+Z)" disabled>↶ Undo</button>
+          <button id="btn-redo" type="button" class="hud-pill-btn" title="Redo Splat Edit (Ctrl+Y)" disabled>↷ Redo</button>
+          <button id="btn-fps-help" type="button" class="hud-pill-btn" title="Show Flight &amp; Splat Culling Keybinds (Key: H)">? Keys (H)</button>
+        </div>
+
+        <!-- FPS Crosshair + Dynamic 2D Brush Ring -->
+        <div id="fps-crosshair-wrap" class="fps-crosshair-wrap hidden">
+          <div id="fps-brush-ring" class="fps-brush-ring hidden"></div>
+          <div id="fps-crosshair" class="fps-crosshair">+</div>
+          <div id="fps-reticle-tag" class="fps-reticle-tag">Click viewport to lock mouse · Space×2 = Creative Fly</div>
+        </div>
+
+        <!-- Top-Right Tactical Radar Minimap -->
+        <canvas id="fps-radar-canvas" class="fps-radar-canvas hidden" width="118" height="118" title="Tactical Minimap"></canvas>
+
+        <!-- Inline Spatial Ping Callout Input -->
         <div id="fps-ping-modal" class="fps-ping-modal hidden">
           <span id="fps-ping-coords" class="wb-mono">📍 Ping #1</span>
-          <input id="inp-fps-ping-note" type="text" placeholder="Callout for agent (e.g. 'weathered blast door 2.2m here') — Enter saves" autocomplete="off" />
-          <button type="button" id="btn-fps-ping-save" class="btn btn-primary btn-xs">Save</button>
-          <button type="button" id="btn-fps-ping-cancel" class="btn btn-ghost btn-xs">✕</button>
+          <input id="inp-fps-ping-note" type="text" placeholder="Callout note for Blender Agent (Enter saves, Esc cancels)" autocomplete="off" />
+          <button type="button" id="btn-fps-ping-save" class="btn btn-primary btn-sm">Save</button>
+          <button type="button" id="btn-fps-ping-cancel" class="btn btn-ghost btn-sm">✕</button>
         </div>
 
-        <!-- Top FPS / Rail Collateral Export Bar -->
-        <div id="fps-rail-topbar" class="fps-rail-topbar hidden">
-          <label class="wb-mono">Dur:
-            <input id="inp-rail-dur" type="number" min="2" max="30" step="1" value="5" style="width:42px" />s
-          </label>
-          <button type="button" id="btn-rail-ride" class="btn btn-secondary btn-xs" title="Ride your Camera Rail &amp; preview moving Subject capsule (Key: P)">▶ Ride (P)</button>
-          <button type="button" id="btn-rail-track-sub" class="btn btn-ghost btn-xs" title="Auto-aim Camera Rail at moving Subject capsule (Key: K)">🎯 Track Subj: OFF</button>
-          <button type="button" id="btn-rail-to-seedance" class="btn btn-accent btn-xs" title="Export clean First/Last node frames + optical &amp; subject prompt into Seedance 2.5 + lock Camera Prior">🎬 → Seedance</button>
-          <button type="button" id="btn-rail-farm-modal" class="btn btn-primary btn-xs" title="Farm 1080p H.264 render of this rail on Modal H100 (~2s)">☁️ Modal Render</button>
-          <button type="button" id="btn-rail-sync-bl" class="btn btn-secondary btn-xs" title="Export shot.usda + blockout.glb + brief.md into Blender 5.3 &amp; Agent">🧊 → Blender+Brief</button>
-          <button type="button" id="btn-rail-clear" class="btn btn-ghost btn-xs" title="Clear rail, subject waypoints, voxels &amp; pings">Clear</button>
-        </div>
-
-        <!-- Bottom Survival Hotbar (`1-4` + Orbit/FPS Toggle) -->
-        <div id="theater-splat-hud" class="splat-hud hidden">
-          <div id="fps-hotbar" class="fps-hotbar hidden">
-            <button type="button" class="hotbar-slot active" data-slot="1" title="[1] LMB drops Camera Node · Hold R records flight · X removes">[1] 🎥 Cam <b id="cnt-hb-cam">0</b></button>
-            <button type="button" class="hotbar-slot" data-slot="2" title="[2] LMB drops Subject/Player waypoint relative to landmarks · X removes">[2] 🏃 Subj <b id="cnt-hb-sub">0</b></button>
-            <button type="button" class="hotbar-slot" data-slot="3" title="[3] LMB snap-builds Voxel block · [ ] size · X breaks">[3] 🧱 Voxel <b id="cnt-hb-vox">0</b></button>
-            <button type="button" class="hotbar-slot" data-slot="4" title="[4] LMB drops raycast 3D Spatial Brief Ping + Hero screenshot">[4] 📍 Ping <b id="cnt-hb-ping">0</b></button>
+        <!-- Keybind Cheat-Sheet Overlay (`H` key) -->
+        <div id="fps-help-modal" class="fps-help-modal hidden">
+          <div class="help-card">
+            <div class="help-head">
+              <h3>🎮 FPS Camera &amp; Splat Editor Controls</h3>
+              <button id="btn-close-fps-help" type="button" class="btn btn-ghost btn-sm">✕ Close (H)</button>
+            </div>
+            <div class="help-cols">
+              <div>
+                <h4>🛸 Movement &amp; Minecraft Flight</h4>
+                <ul>
+                  <li><code>Click Viewport</code> — Lock mouse look (<code>Esc</code> unlocks)</li>
+                  <li><code>W A S D</code> — Walk / Fly horizontally</li>
+                  <li><code>Space</code> — Jump (steps onto Voxels &amp; Courtyard stairs)</li>
+                  <li><code>Space × 2</code> or <code>G</code> — Toggle <b>Minecraft Creative Fly</b></li>
+                  <li><code>Hold Space</code> / <code>Shift or C</code> (Fly) — Ascend / Descend</li>
+                  <li><code>Ctrl</code> (Fly) / <code>Shift</code> (Walk) — Fast Sprint</li>
+                  <li><code>C</code> / <code>Z</code> (Walk) — Crouch / Prone · <code>Q</code>/<code>E</code> — Peek</li>
+                  <li><code>T</code> — Auto-Run · <code>Hold Alt</code> — Free-Look over shoulder</li>
+                </ul>
+              </div>
+              <div>
+                <h4>✂️ 8-Slot Splat &amp; Director Hotbar</h4>
+                <ul>
+                  <li><code>1</code> <b>Cull Brush:</b> <code>LMB</code> erase Gaussians · <code>RMB</code> restore</li>
+                  <li><code>2</code> <b>Crop Box:</b> <code>LMB</code> Corner 1 &amp; 2 · <code>Del</code> cull inside</li>
+                  <li><code>3</code> <b>Paint/Select:</b> <code>LMB</code> select/tint/shrink · <code>RMB</code> deselect</li>
+                  <li><code>4</code> <b>Clean Floaters:</b> Live opacity/size/needle sliders</li>
+                  <li><code>5</code> <b>Cam Rail:</b> <code>LMB</code> add node · <code>Hold R</code> record · <code>P</code> ride</li>
+                  <li><code>6</code> <b>Subject:</b> <code>LMB</code> waypoint · <code>K</code> auto-track</li>
+                  <li><code>7</code> <b>Voxel:</b> <code>LMB</code> build block · <code>RMB</code>/<code>X</code> break</li>
+                  <li><code>8</code> / <code>MMB</code> / <code>V</code> — Spatial Brief Ping</li>
+                  <li><code>[</code> / <code>]</code> — Brush/Voxel size · <code>Scroll</code> — Lens (<code>Alt+Scroll</code> reach)</li>
+                </ul>
+              </div>
+            </div>
           </div>
-          <span id="splat-hud-info">3DGS Viewer · Drag orbit · Click 🎮 FPS for WASD+Rail</span>
-          <div style="display:flex;gap:4px">
-            <button type="button" id="btn-splat-fps-toggle" class="btn btn-primary btn-xs" title="Toggle WASD + PointerLock + RMB Target-Lock + Hotbar (Key: F)">🎮 FPS Mode</button>
-            <button type="button" id="btn-splat-reset-cam" class="btn btn-ghost btn-xs">Reset</button>
+        </div>
+
+        <!-- Bottom Docked 8-Slot Minecraft Hotbar -->
+        <div id="theater-splat-hud" class="splat-hud">
+          <div id="fps-hotbar" class="fps-hotbar">
+            <button type="button" class="hotbar-slot active" data-slot="1" title="[1] Sphere Cull Brush: LMB erases Gaussians · RMB restores · [ ] size"><span class="hb-num">1</span>🔫 Cull</button>
+            <button type="button" class="hotbar-slot" data-slot="2" title="[2] 3D AABB Crop Box: LMB Corner 1 -> LMB Corner 2 · Del culls inside"><span class="hb-num">2</span>📦 Box</button>
+            <button type="button" class="hotbar-slot" data-slot="3" title="[3] Select / Tint Color / Shrink Scale Brush"><span class="hb-num">3</span>🎨 Paint</button>
+            <button type="button" class="hotbar-slot" data-slot="4" title="[4] Smart Floater Cleaner"><span class="hb-num">4</span>🪄 Clean</button>
+            <span class="hb-divider"></span>
+            <button type="button" class="hotbar-slot" data-slot="5" title="[5] Camera Rail Keyframe: LMB adds node · Hold R records · P rides"><span class="hb-num">5</span>🎥 Cam <b id="cnt-hb-cam">0</b></button>
+            <button type="button" class="hotbar-slot" data-slot="6" title="[6] Subject Waypoint · K tracks"><span class="hb-num">6</span>🏃 Subj <b id="cnt-hb-sub">0</b></button>
+            <button type="button" class="hotbar-slot" data-slot="7" title="[7] Solid Voxel Block: LMB builds · RMB/X breaks"><span class="hb-num">7</span>🧱 Voxel <b id="cnt-hb-vox">0</b></button>
+            <button type="button" class="hotbar-slot" data-slot="8" title="[8] Raycast 3D Spatial Ping + Screenshot"><span class="hb-num">8</span>📍 Ping <b id="cnt-hb-ping">0</b></button>
+          </div>
+          <div class="splat-hud-right">
+            <button type="button" id="btn-splat-fps-toggle" class="btn btn-primary btn-sm" title="Toggle Pointer-Lock FPS Fly/Edit vs Orbit (Key: F)">🎮 Enter FPS (F)</button>
+            <button type="button" id="btn-splat-reset-cam" class="btn btn-secondary btn-sm" title="Reset Camera Framing">Reset View</button>
           </div>
         </div>
 
@@ -525,8 +223,8 @@
             <select id="sel-cmp-left" class="wb-mini-select" title="Left player clip"></select>
             <span class="wb-lbl">vs</span>
             <select id="sel-cmp-right" class="wb-mini-select" title="Right player clip"></select>
-            <button type="button" id="btn-cmp-farm-modal" class="btn btn-primary btn-xs" title="Farm full-rate recreated camera path render to Modal H100 gsplat (~2s)">☁️ Farm Modal Render</button>
-            <button type="button" id="btn-cmp-render-blender" class="btn btn-secondary btn-xs" title="Render matching camera trajectory in Blender 5.3 EEVEE">🧊 Render Blender</button>
+            <button type="button" id="btn-cmp-farm-modal" class="btn btn-primary btn-sm" title="Farm full-rate recreated camera path render to Modal H100 gsplat (~2s)">☁️ Farm Modal Render</button>
+            <button type="button" id="btn-cmp-render-blender" class="btn btn-secondary btn-sm" title="Render matching camera trajectory in Blender 5.3 EEVEE">🧊 Render Blender</button>
           </div>
 
           <div class="cmp-videos-row">
@@ -542,9 +240,9 @@
           </div>
 
           <div class="cmp-transport">
-            <button type="button" id="btn-cmp-play" class="btn btn-secondary btn-xs">▶ Play</button>
-            <button type="button" id="btn-cmp-prevf" class="btn btn-ghost btn-xs" title="Step -1 frame">◀</button>
-            <button type="button" id="btn-cmp-nextf" class="btn btn-ghost btn-xs" title="Step +1 frame">▶</button>
+            <button type="button" id="btn-cmp-play" class="btn btn-secondary btn-sm">▶ Play</button>
+            <button type="button" id="btn-cmp-prevf" class="btn btn-ghost btn-sm" title="Step -1 frame">◀</button>
+            <button type="button" id="btn-cmp-nextf" class="btn btn-ghost btn-sm" title="Step +1 frame">▶</button>
             <div class="cmp-scrub-box">
               <input type="range" id="rng-cmp-scrub" min="0" max="100" value="0" />
               <div id="cmp-keyframe-ticks" class="cmp-keyframe-ticks"></div>
@@ -559,55 +257,799 @@
           <div id="lbl-cmp-readout" class="cmp-readout">f 001/001 · t=0.00s · Yaw 0.0° Pitch 0.0° Roll 0.0°</div>
 
           <div class="cmp-viz-row">
-            <canvas id="canvas-cmp-path3d" title="Drag to orbit 3D camera trajectory · Gold cones = solved keyframes · Cyan cone = live camera"></canvas>
-            <canvas id="canvas-cmp-angles" title="Yaw° (cyan) · Pitch° (orange) · Roll° (purple) · Speed m/s (green) · Click to seek"></canvas>
+            <canvas id="canvas-cmp-path3d" title="Drag to orbit 3D camera trajectory"></canvas>
+            <canvas id="canvas-cmp-angles" title="Yaw° · Pitch° · Roll° · Speed m/s · Click to seek"></canvas>
+          </div>
+        </div>
+      </div>
+
+      <!-- Context-Aware Quick Action Bar Below Center Viewport -->
+      <div id="theater-actions" class="theater-actions">
+        <div id="stage-3d-btns" class="theater-btns">
+          <button id="btn-3d-to-first" type="button" class="btn btn-secondary btn-sm" title="Capture clean perspective PNG from current 3D angle into Seedance First Frame">📸 View → 1st Frame</button>
+          <button id="btn-3d-to-last" type="button" class="btn btn-secondary btn-sm" title="Capture clean perspective PNG from current 3D angle into Seedance Last Frame">📸 View → Last Frame</button>
+          <button id="btn-3d-to-seedream" type="button" class="btn btn-secondary btn-sm" title="Capture current 3D angle as a Seedream 5.5 Reference Image">🎨 View → Seedream</button>
+          <button id="btn-stage-save-splat" type="button" class="btn btn-primary btn-sm" title="Save culled/edited Gaussians to .ply + .splat (Ctrl+S)">💾 Save Splat</button>
+          <button id="btn-stage-import-bl" type="button" class="btn btn-secondary btn-sm" title="Import active Splat .ply + Cameras into Blender 5.3">📥 Import → Blender</button>
+        </div>
+
+        <div id="stage-media-btns" class="theater-btns hidden">
+          <button id="btn-stage-use-first" type="button" class="btn btn-secondary btn-sm hidden">Set 1st Frame</button>
+          <button id="btn-stage-use-last" type="button" class="btn btn-secondary btn-sm hidden">Set Last Frame</button>
+          <button id="btn-stage-use-sr" type="button" class="btn btn-secondary btn-sm hidden">🎨 +Seedream Ref</button>
+          <button id="btn-stage-use-vid" type="button" class="btn btn-secondary btn-sm hidden">Set Video 1</button>
+          <button id="btn-stage-ref-vid" type="button" class="btn btn-secondary btn-sm hidden">Set Video 2</button>
+          <button id="btn-stage-to-splat" type="button" class="btn btn-primary btn-sm hidden">🌐 Train 3D Splat</button>
+          <button id="btn-stage-at-agent" type="button" class="btn btn-ghost btn-sm">@path → Co-Pilot</button>
+          <a id="link-stage-download" class="btn btn-ghost btn-sm" download>⬇ Download</a>
+        </div>
+      </div>
+
+      <!-- =========================================================
+           ALWAYS-PRESENT, HIDDEN-BY-DEFAULT, EXPANDABLE AGENT CHAT DRAWER
+           (VS Code Bottom Panel / Chrome DevTools Console Drawer Style)
+           ========================================================= -->
+      <section id="agent-drawer" class="agent-drawer collapsed" aria-label="Blender 5.3 Agent Co-Pilot">
+        <div id="sash-agent" class="pane-sash sash-horizontal" role="separator" aria-orientation="horizontal" title="Drag up/down to resize Agent Chat · Double-click to reset height"></div>
+
+        <div id="agent-drawer-header" class="agent-drawer-header" title="Click to Expand / Hide Agent Co-Pilot Chat (Ctrl+J)">
+          <div class="agent-drawer-left">
+            <span id="agent-drawer-chevron" class="vsc-chevron">▴</span>
+            <span class="agent-drawer-title">🤖 AGENT CO-PILOT</span>
+            <span id="agent-status-pill" class="agent-status-pill">Ready</span>
+            <span id="agent-unread-badge" class="tab-cnt hidden">0</span>
+            <span id="agent-drawer-preview" class="agent-drawer-preview">Ask Blender 5.3 Agent or press Ctrl+J to expand…</span>
+          </div>
+          <div class="agent-drawer-actions">
+            <button id="btn-agent-cancel" type="button" class="btn btn-ghost btn-xs hidden" title="Cancel running agent turn">■ Cancel</button>
+            <button id="btn-agent-clear" type="button" class="icon-action-btn agent-expanded-only" title="Clear local chat transcript view">⌫</button>
+            <button id="btn-agent-maximize" type="button" class="icon-action-btn agent-expanded-only" title="Maximize / Restore Chat Panel Height">⤢</button>
+            <button id="btn-agent-toggle" type="button" class="icon-action-btn" title="Expand / Hide Agent Chat (Ctrl+J)">▴ Expand</button>
           </div>
         </div>
 
-        <audio id="theater-audio" class="hidden" controls></audio>
-      </div>
-
-      <div id="theater-actions" class="theater-actions hidden">
-        <span id="theater-meta" class="theater-meta"></span>
-        <div class="theater-btns">
-          <button id="btn-stage-compare" class="btn btn-accent btn-xs hidden">🎬 Compare &amp; Path</button>
-          <button id="btn-stage-to-splat" class="btn btn-primary btn-xs hidden">🌐 Train 3D Splat</button>
-          <button id="btn-stage-import-bl" class="btn btn-primary btn-xs hidden">📥 Import into Blender 5.3</button>
-          <button id="btn-stage-use-vid" class="btn btn-secondary btn-xs hidden">Set Source Video</button>
-          <button id="btn-stage-ref-vid" class="btn btn-secondary btn-xs hidden">+Ref Video</button>
-          <button id="btn-stage-use-first" class="btn btn-secondary btn-xs hidden">Set First Frame</button>
-          <button id="btn-stage-at-agent" class="btn btn-secondary btn-xs">Insert @path to Agent</button>
-          <a id="link-stage-download" class="btn btn-ghost btn-xs" download>Download</a>
+        <div id="agent-drawer-body" class="agent-drawer-body">
+          <div id="agent-ctx-bar" class="agent-ctx-bar" title="Click to inspect or drop LLM context segments">
+            <span id="agent-ctx-summary">LLM Context: loading…</span>
+            <span>▾</span>
+          </div>
+          <div id="agent-ctx-drawer" class="agent-ctx-drawer hidden"></div>
+          <div id="agent-feed" class="agent-feed">
+            <div class="feed-msg feed-op">Blender 5.3 Agent Co-Pilot ready. Type a command, scene edit, or '@path' media reference below.</div>
+          </div>
+          <form id="agent-form" class="agent-dock-form">
+            <input id="agent-input" type="text" placeholder="Ask blenderbot Co-Pilot ('@path' attaches media · Esc hides when empty)…" autocomplete="off" />
+            <button type="submit" class="btn btn-primary btn-sm">Send</button>
+          </form>
         </div>
-      </div>
+      </section>
 
-      <div class="jobs-section">
-        <div class="section-label"><span>Seedance Job Queue &amp; Billed Output Cost</span></div>
-        <div id="jobs-list" class="jobs-list">
-          <div class="empty-placeholder">No Seedance jobs submitted in this session yet.</div>
-        </div>
-      </div>
-
-      <div class="copilot-section">
-        <div class="section-label">
-          <span>Blender 5.3 Agent Co-Pilot</span>
-          <button id="btn-agent-cancel" class="btn btn-ghost btn-xs hidden">■ Cancel Turn</button>
-        </div>
-
-        <!-- Live LLM Context Window & Token Cost Strip -->
-        <div id="agent-ctx-bar" class="agent-ctx-bar" title="Click to inspect or drop segments sent to the LLM">
-          <span id="agent-ctx-summary">LLM Context: loading…</span>
-          <span class="ctx-toggle-lbl">▾ details</span>
-        </div>
-        <div id="agent-ctx-drawer" class="agent-ctx-drawer hidden"></div>
-
-        <div id="agent-feed" class="agent-feed"></div>
-        <form id="agent-form" class="agent-form">
-          <input id="agent-input" type="text" placeholder="Ask blenderbot (↑/↓ prompt history · '@path' attaches media)" autocomplete="off" />
-          <button type="submit" class="btn btn-primary btn-sm">Send</button>
-        </form>
-      </div>
+      <div id="composer-toast" class="toast hidden"></div>
     </section>
+
+    <!-- RIGHT VERTICAL RESIZE SPLITTER (Drag to resize Inspector, drag far right to hide, double-click to reset) -->
+    <div id="sash-right" class="pane-sash sash-vertical" role="separator" aria-orientation="vertical" title="Drag to resize Inspector · Double-click to reset width"></div>
+
+    <!-- RIGHT PANE: SCROLLABLE, RESIZABLE INSPECTOR WITH EXPAND-DOWN ACCORDIONS -->
+    <aside class="pane pane-composer" id="pane-inspector" aria-label="Studio Inspector">
+      <div class="pane-header inspector-tabs-header">
+        <div class="studio-mode-tabs" role="tablist" aria-label="Inspector Mode">
+          <button id="tab-mode-seedance" class="studio-mode-btn active" type="button" title="Seedance 2.5 Composer">🎬 Seedance</button>
+          <button id="tab-mode-seedream" class="studio-mode-btn" type="button" title="Seedream 5.5 Image Generator">🎨 Seedream</button>
+          <button id="tab-mode-fps" class="studio-mode-btn" type="button" title="FPS Camera Pose, Splat Culling &amp; Cloud 3DGS">✂️ FPS &amp; Splat</button>
+          <button id="tab-mode-copilot" class="studio-mode-btn" type="button" title="Generation &amp; Cloud Job Queue">📋 Jobs <span id="badge-jobs-cnt" class="tab-cnt hidden">0</span></button>
+        </div>
+        <div class="inspector-win-btns">
+          <button id="btn-toggle-all-sections" type="button" class="icon-action-btn" title="Expand / Collapse Additional Options in Active Tab">⊞</button>
+          <button id="btn-expand-right" type="button" class="icon-action-btn" title="Expand / Restore Inspector Width">⇔</button>
+          <button id="btn-close-right" type="button" class="icon-action-btn" title="Hide Right Inspector (Ctrl+Alt+B)">»</button>
+        </div>
+      </div>
+
+      <!-- =========================================================
+           TAB 1: Seedance 2.5 Composer
+           ========================================================= -->
+      <div id="panel-seedance-composer" class="composer-scroll" aria-label="Seedance 2.5 Composer">
+        <!-- Section 1: Core Prompt, Sizing & Generate -->
+        <details class="insp-section" id="sec-sd-prompt" open>
+          <summary class="insp-section-head">
+            <span class="insp-sec-title"><span class="sec-chev">▸</span> Prompt &amp; Camera Shot</span>
+            <select id="sel-prompt-history" class="hist-select" title="Recall previous prompt">
+              <option value="">🕒 History…</option>
+            </select>
+          </summary>
+          <div class="insp-section-body">
+            <div class="mode-pills" id="mode-pills">
+              <button type="button" id="btn-pull-cam-prompt" class="btn btn-secondary btn-xs" title="Compile Blender camera move into prompt">🎥 Pull Cam</button>
+              <button type="button" class="mode-pill active" data-mode="standard">Standard</button>
+              <button type="button" class="mode-pill" data-mode="orbit_plate">3D Orbit</button>
+              <button type="button" class="mode-pill" data-mode="subject_4d">4D Subject</button>
+            </div>
+            <textarea
+              id="input-prompt"
+              class="prompt-textarea"
+              rows="3"
+              placeholder="Describe shot, camera motion &amp; lighting… (↑/↓ history · Ctrl+Enter generates)"
+            ></textarea>
+
+            <div class="params-grid">
+              <label class="field">
+                <span>Duration</span>
+                <select id="sel-duration"></select>
+              </label>
+              <label class="field">
+                <span>Dimensions (<code>size</code>)</span>
+                <select id="sel-size"></select>
+              </label>
+            </div>
+            <input id="input-outpath" type="hidden" value="" />
+
+            <div class="submit-bar">
+              <div class="est-cost" id="est-cost-label">~$0.51 USD</div>
+              <button id="btn-generate" type="button" class="btn btn-accent btn-lg">✦ Generate Video</button>
+            </div>
+
+            <!-- Additional Options Expand Down -->
+            <details class="insp-more" id="more-sd-advanced">
+              <summary class="insp-more-head">
+                <span><span class="sec-chev">▸</span> Additional Options (Model, Seed &amp; Audio)</span>
+              </summary>
+              <div class="insp-more-body">
+                <div class="params-grid">
+                  <label class="field">
+                    <span>Model</span>
+                    <select id="select-video-model">
+                      <option value="bytedance/seedance-2.5">bytedance/seedance-2.5</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Seed</span>
+                    <input id="input-seed" type="number" placeholder="random" />
+                  </label>
+                </div>
+                <div class="toggles-row">
+                  <label><input type="checkbox" id="chk-gen-audio" /> Native audio</label>
+                  <label><input type="checkbox" id="chk-attach-ctx" checked /> Attach to Vision LLM</label>
+                </div>
+              </div>
+            </details>
+
+            <details class="insp-more inspector-details" id="more-sd-payload">
+              <summary class="insp-more-head">
+                <span><span class="sec-chev">▸</span> 📡 Outbound Request Summary</span>
+                <span id="inspector-cost-pill" class="wb-mono">~$0.51</span>
+              </summary>
+              <div id="inspector-body" class="inspector-body"></div>
+            </details>
+          </div>
+        </details>
+
+        <!-- Section 2: First & Last Anchor Frames -->
+        <details class="insp-section" id="sec-sd-anchors" open>
+          <summary class="insp-section-head">
+            <span class="insp-sec-title"><span class="sec-chev">▸</span> Anchor Frames (1st &amp; Last)</span>
+            <button id="btn-clear-cond" type="button" class="link-btn">Clear all</button>
+          </summary>
+          <div class="insp-section-body">
+            <div class="frame-slots-row">
+              <div class="frame-slot" id="slot-first" title="Click card to display First Frame in Center Stage">
+                <div class="frame-slot-head">
+                  <span>1st Frame</span>
+                  <div class="slot-head-btns">
+                    <button id="btn-grab3d-first" type="button" class="mini-tag-btn" title="Capture current Center 3D View into 1st Frame">📸 3D</button>
+                    <button id="btn-clear-first" type="button" class="icon-x hidden" title="Clear 1st Frame">✕</button>
+                  </div>
+                </div>
+                <div class="frame-slot-body" id="slot-first-body">
+                  <span class="empty-placeholder">Click <b>1st</b> on an image or <b>📸 3D</b></span>
+                </div>
+              </div>
+
+              <div class="frame-slot" id="slot-last" title="Click card to display Last Frame in Center Stage">
+                <div class="frame-slot-head">
+                  <span>Last Frame</span>
+                  <div class="slot-head-btns">
+                    <button id="btn-grab3d-last" type="button" class="mini-tag-btn" title="Capture current Center 3D View into Last Frame">📸 3D</button>
+                    <button id="btn-clear-last" type="button" class="icon-x hidden" title="Clear Last Frame">✕</button>
+                  </div>
+                </div>
+                <div class="frame-slot-body" id="slot-last-body">
+                  <span class="empty-placeholder">Click <b>Last</b> on an image or <b>📸 3D</b></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <!-- Section 3 (Expands Down): Source Video Conditioning & Dual-Clip Bridge -->
+        <details class="insp-section" id="sec-sd-video">
+          <summary class="insp-section-head">
+            <span class="insp-sec-title"><span class="sec-chev">▸</span> Video Conditioning &amp; Dual-Clip Bridge</span>
+            <span id="badge-sd-video-state" class="sec-meta-pill">Optional</span>
+          </summary>
+          <div class="insp-section-body">
+            <div id="slot-video-card" class="cond-video-card">
+              <div class="cond-video-top">
+                <label for="sel-source-video" class="picker-label">Vid 1:</label>
+                <select id="sel-source-video" class="video-picker-select">
+                  <option value="">— None —</option>
+                </select>
+                <button id="btn-view-vid1" type="button" class="btn btn-ghost btn-xs hidden" title="Show Video 1 in Center Stage">👁</button>
+                <button id="btn-clear-video" type="button" class="btn btn-ghost btn-xs hidden" title="Clear Video 1">✕</button>
+              </div>
+
+              <div class="cond-video-top">
+                <label for="sel-source-video-2" class="picker-label">Vid 2:</label>
+                <select id="sel-source-video-2" class="video-picker-select">
+                  <option value="">— Optional 2nd clip —</option>
+                </select>
+                <button id="btn-view-vid2" type="button" class="btn btn-ghost btn-xs hidden" title="Show Video 2 in Center Stage">👁</button>
+                <button id="btn-swap-videos" type="button" class="btn btn-ghost btn-xs hidden" title="Swap Vid 1 &amp; 2">⇄</button>
+                <button id="btn-clear-video-2" type="button" class="btn btn-ghost btn-xs hidden" title="Clear Video 2">✕</button>
+              </div>
+
+              <div id="dual-video-mode-bar" class="dual-mode-bar hidden">
+                <select id="sel-dual-mode" class="video-picker-select">
+                  <option value="bridge_v1_to_v2" selected>Bridge (Vid 1 End → Vid 2 Start)</option>
+                  <option value="span_v1_to_v2">Span Arc (Vid 1 Start → Vid 2 End)</option>
+                  <option value="v1_primary_v2_ref">Vid 1 Motion + Vid 2 Style Refs</option>
+                </select>
+              </div>
+
+              <div id="slot-video-opts" class="video-opts hidden">
+                <label id="lbl-vid-first"><input type="checkbox" id="chk-vid-first" checked /> Lock 1st</label>
+                <label id="lbl-vid-last"><input type="checkbox" id="chk-vid-last" checked /> Lock Last</label>
+                <label>Mids:
+                  <select id="sel-vid-mids">
+                    <option value="0">0</option>
+                    <option value="1">1</option>
+                    <option value="2" selected>2</option>
+                    <option value="3">3</option>
+                  </select>
+                </label>
+                <label><input type="checkbox" id="chk-vid-audio" /> Audio</label>
+              </div>
+            </div>
+          </div>
+        </details>
+
+        <!-- Section 4 (Expands Down): Extra Reference Media & Audio -->
+        <details class="insp-section" id="sec-sd-refs">
+          <summary class="insp-section-head">
+            <span class="insp-sec-title"><span class="sec-chev">▸</span> Extra References &amp; Audio</span>
+            <span id="badge-sd-refs-state" class="sec-meta-pill">0 refs</span>
+          </summary>
+          <div class="insp-section-body">
+            <div class="refs-box">
+              <div class="refs-head">Click chip to preview in Center Stage</div>
+              <div id="refs-chips" class="refs-chips">
+                <span class="empty-placeholder">Optional — click <b>Audio</b> or add extra refs</span>
+              </div>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- =========================================================
+           TAB 2: Seedream 5.5 Image Composer (`POST /api/v1/images`)
+           ========================================================= -->
+      <div id="panel-seedream-composer" class="composer-scroll hidden" aria-label="Seedream 5.5 Composer">
+        <details class="insp-section" id="sec-sr-prompt" open>
+          <summary class="insp-section-head">
+            <span class="insp-sec-title"><span class="sec-chev">▸</span> Seedream 5.5 Prompt &amp; Sizing</span>
+          </summary>
+          <div class="insp-section-body">
+            <div class="mode-pills" id="sr-mode-pills">
+              <button type="button" class="mode-pill active" data-srmode="standard">Standard</button>
+              <button type="button" class="mode-pill" data-srmode="concept_plate">3D Plate</button>
+              <button type="button" class="mode-pill" data-srmode="pbr_texture">PBR Texture</button>
+              <button type="button" class="mode-pill" data-srmode="cutout_prop">Cutout Prop</button>
+            </div>
+
+            <textarea
+              id="input-sr-prompt"
+              class="prompt-textarea"
+              rows="4"
+              placeholder="Describe image or camera-preserved restyle… (Ctrl+Enter generates)"
+            ></textarea>
+
+            <div class="params-grid">
+              <label class="field">
+                <span>Resolution</span>
+                <select id="sel-sr-res">
+                  <option value="1K" selected>1K (~$0.02)</option>
+                  <option value="1.5K">1.5K (~$0.03)</option>
+                  <option value="2K">2K (~$0.04)</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Aspect Ratio</span>
+                <select id="sel-sr-aspect">
+                  <option value="16:9" selected>16:9 Wide</option>
+                  <option value="auto">auto</option>
+                  <option value="1:1">1:1 Square</option>
+                  <option value="4:3">4:3 Classic</option>
+                  <option value="3:4">3:4 Portrait</option>
+                  <option value="9:16">9:16 Vertical</option>
+                  <option value="3:2">3:2 Photo</option>
+                  <option value="2:3">2:3 Tall</option>
+                  <option value="21:9">21:9 Cinema</option>
+                </select>
+              </label>
+            </div>
+            <input id="inp-sr-outpath" type="hidden" value="" />
+
+            <div class="submit-bar">
+              <div class="est-cost" id="sr-est-cost-label">~$0.02 USD</div>
+              <button id="btn-generate-seedream" type="button" class="btn btn-accent btn-lg">✦ Generate Image</button>
+            </div>
+
+            <!-- Additional Options Expand Down -->
+            <details class="insp-more" id="more-sr-advanced">
+              <summary class="insp-more-head">
+                <span><span class="sec-chev">▸</span> Additional Options (Format, Alpha, Seed &amp; Handoff)</span>
+              </summary>
+              <div class="insp-more-body">
+                <div class="params-grid">
+                  <label class="field">
+                    <span>Model</span>
+                    <select id="select-image-model">
+                      <option value="bytedance-seed/seedream-5-5">bytedance-seed/seedream-5-5</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Background</span>
+                    <select id="sel-sr-bg">
+                      <option value="auto" selected>auto</option>
+                      <option value="transparent">transparent (PNG)</option>
+                      <option value="opaque">opaque</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Format</span>
+                    <select id="sel-sr-fmt">
+                      <option value="png" selected>png</option>
+                      <option value="jpeg">jpeg</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Seed</span>
+                    <input id="inp-sr-seed" type="number" placeholder="random" />
+                  </label>
+                </div>
+                <div class="toggles-row">
+                  <label><input type="checkbox" id="chk-sr-attach-ctx" checked /> Attach to Vision LLM</label>
+                  <label><input type="checkbox" id="chk-sr-to-seedance" /> Auto-set as Seedance 1st Frame</label>
+                </div>
+              </div>
+            </details>
+
+            <details class="insp-more inspector-details" id="more-sr-payload">
+              <summary class="insp-more-head">
+                <span><span class="sec-chev">▸</span> 📡 Outbound <code>/api/v1/images</code> Summary</span>
+                <span id="sr-inspector-cost" class="wb-mono">~$0.02</span>
+              </summary>
+              <div id="sr-inspector-body" class="inspector-body"></div>
+            </details>
+          </div>
+        </details>
+
+        <details class="insp-section" id="sec-sr-refs" open>
+          <summary class="insp-section-head">
+            <span class="insp-sec-title"><span class="sec-chev">▸</span> Reference Images</span>
+            <div class="sec-head-inline">
+              <button id="btn-sr-grab3d" type="button" class="mini-tag-btn" title="Capture Center 3D View as Seedream Reference">📸 Grab 3D</button>
+              <button id="btn-sr-clear-refs" type="button" class="link-btn">Clear</button>
+            </div>
+          </summary>
+          <div class="insp-section-body">
+            <div id="sr-refs-chips" class="refs-chips">
+              <span class="empty-placeholder">0 refs (Text-to-Image) — click <b>🎨 SR</b> on up to 10 images</span>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- =========================================================
+           TAB 3: FPS Camera, Splat Culling/Editing & Cloud 3DGS Trainer
+           ========================================================= -->
+      <div id="panel-fps-splat" class="composer-scroll hidden" aria-label="FPS &amp; Splat Inspector">
+        <!-- Section 1: Camera & Locomotion -->
+        <details class="insp-section" id="sec-fps-cam" open>
+          <summary class="insp-section-head">
+            <span class="insp-sec-title"><span class="sec-chev">▸</span> 🎥 Camera &amp; Minecraft Flight</span>
+            <button id="btn-copy-pose" type="button" class="link-btn">Copy JSON</button>
+          </summary>
+          <div class="insp-section-body">
+            <div class="locomotion-row">
+              <button id="btn-mode-walk" type="button" class="btn btn-secondary btn-sm active-mode">🚶 Walk 1.65m</button>
+              <button id="btn-mode-fly" type="button" class="btn btn-secondary btn-sm">🛸 Creative Fly</button>
+              <button id="btn-mode-freecam" type="button" class="btn btn-ghost btn-sm">🎥 3D Fly</button>
+            </div>
+
+            <div class="params-grid">
+              <label class="field">
+                <span>Prime Lens</span>
+                <select id="sel-lens">
+                  <option value="14">14mm Ultra-Wide</option>
+                  <option value="18">18mm Wide</option>
+                  <option value="24">24mm Cinema</option>
+                  <option value="28">28mm Street</option>
+                  <option value="35" selected>35mm Director</option>
+                  <option value="50">50mm Standard</option>
+                  <option value="85">85mm Portrait</option>
+                  <option value="105">105mm Tele</option>
+                  <option value="135">135mm Spotter</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Fly/Walk Speed <b id="lbl-speed">1.0×</b></span>
+                <input id="rng-speed" type="range" min="0.2" max="4.5" step="0.05" value="1.0" />
+              </label>
+            </div>
+
+            <div class="btn-grid-2">
+              <button id="btn-push-bl-cam" type="button" class="btn btn-primary btn-sm">🎥 Push → Blender</button>
+              <button id="btn-pull-bl-cam" type="button" class="btn btn-secondary btn-sm">📥 Pull ← Blender</button>
+            </div>
+            <label class="live-link-lbl">
+              <input type="checkbox" id="chk-live-link-bl" /> 🔗 Live-Link FPS Camera Pose → Blender 5.3
+            </label>
+
+            <!-- Expand-Down Additional Camera Coordinates, Presets & Scene Streaming -->
+            <details class="insp-more" id="more-fps-pose">
+              <summary class="insp-more-head">
+                <span><span class="sec-chev">▸</span> Coordinates, POV Presets &amp; Blender Mesh</span>
+              </summary>
+              <div class="insp-more-body">
+                <div class="xyz-grid">
+                  <label><span>X (m)</span><input id="inp-cam-x" type="number" step="0.1" value="0.00" /></label>
+                  <label><span>Y (m)</span><input id="inp-cam-y" type="number" step="0.1" value="-5.20" /></label>
+                  <label><span>Z (m)</span><input id="inp-cam-z" type="number" step="0.1" value="1.65" /></label>
+                  <label><span>Yaw°</span><input id="inp-cam-yaw" type="number" step="1" value="0.0" /></label>
+                  <label><span>Pitch°</span><input id="inp-cam-pitch" type="number" step="1" value="-3.0" /></label>
+                  <label><span>Roll°</span><input id="inp-cam-roll" type="number" step="1" value="0.0" /></label>
+                </div>
+
+                <div class="mode-pills" id="pov-presets">
+                  <button type="button" class="mode-pill" data-pov="hero">3/4 Hero</button>
+                  <button type="button" class="mode-pill" data-pov="front">Front</button>
+                  <button type="button" class="mode-pill" data-pov="right">Right</button>
+                  <button type="button" class="mode-pill" data-pov="top">Top-Down</button>
+                  <button type="button" class="mode-pill" data-pov="frame">Frame All</button>
+                </div>
+
+                <div class="toggles-row">
+                  <label><input type="checkbox" id="chk-double-space" checked /> <code>Space×2</code> Fly toggle</label>
+                  <label><input type="checkbox" id="chk-auto-land" checked /> Ground auto-land</label>
+                </div>
+
+                <div class="btn-grid-2">
+                  <button id="btn-spawn-bl-cube" type="button" class="btn btn-secondary btn-xs">🧊 Spawn Cube in BL</button>
+                  <button id="btn-pull-bl-mesh" type="button" class="btn btn-secondary btn-xs">🟠 Stream BL Scene</button>
+                </div>
+              </div>
+            </details>
+          </div>
+        </details>
+
+        <!-- Section 2 (Expands Down): Camera Rail & Shot Pack -->
+        <details class="insp-section" id="sec-fps-rail">
+          <summary class="insp-section-head">
+            <span class="insp-sec-title"><span class="sec-chev">▸</span> 🎬 Camera Rail &amp; Shot Pack</span>
+            <span class="sec-meta-pill">Dur <input id="inp-rail-dur" type="number" min="2" max="30" value="5" class="mini-num" />s</span>
+          </summary>
+          <div class="insp-section-body">
+            <div class="btn-grid-3">
+              <button id="btn-rail-add-node" type="button" class="btn btn-secondary btn-xs">+ Cam Node</button>
+              <button id="btn-rail-ride" type="button" class="btn btn-secondary btn-xs">▶ Ride (P)</button>
+              <button id="btn-rail-track-sub" type="button" class="btn btn-ghost btn-xs">🎯 Subj: OFF</button>
+            </div>
+            <div class="btn-grid-2">
+              <button id="btn-rail-to-seedance" type="button" class="btn btn-accent btn-xs">🎬 Rail → Seedance</button>
+              <button id="btn-rail-farm-modal" type="button" class="btn btn-primary btn-xs">☁️ Modal Render</button>
+              <button id="btn-rail-sync-bl" type="button" class="btn btn-secondary btn-xs">🧊 Rail → Blender</button>
+              <button id="btn-rail-clear" type="button" class="btn btn-ghost btn-xs">✕ Clear Rail/Voxels</button>
+            </div>
+          </div>
+        </details>
+
+        <!-- Section 3: Splat Brush, Display & Save -->
+        <details class="insp-section" id="sec-fps-splat" open>
+          <summary class="insp-section-head">
+            <span class="insp-sec-title"><span class="sec-chev">▸</span> ✂️ Splat Brush, Display &amp; Save</span>
+            <button id="btn-reset-splat-edits" type="button" class="link-btn">Uncull All</button>
+          </summary>
+          <div class="insp-section-body">
+            <div class="params-grid">
+              <label class="field">
+                <span>Splat Shader</span>
+                <select id="sel-splat-vis">
+                  <option value="0" selected>Smooth 3DGS Ellipsoids</option>
+                  <option value="1">Point Cloud Centers</option>
+                  <option value="2">Shrunk Ellipsoids (0.35×)</option>
+                  <option value="3">Elevation Z Heatmap</option>
+                  <option value="4">Floater / Needle X-Ray</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Splat Scale <b id="lbl-splat-scale">1.00×</b></span>
+                <input id="rng-splat-scale" type="range" min="0.10" max="2.50" step="0.05" value="1.00" />
+              </label>
+            </div>
+
+            <div class="params-grid">
+              <label class="field">
+                <span>Brush Radius <b id="lbl-brush-rad">0.45m</b> (<code>[</code>/<code>]</code>)</span>
+                <input id="rng-brush-rad" type="range" min="0.05" max="4.50" step="0.05" value="0.45" />
+              </label>
+              <label class="field">
+                <span>Air Reach <b id="lbl-brush-reach">3.5m</b></span>
+                <input id="rng-brush-reach" type="range" min="0.6" max="16.0" step="0.2" value="3.5" />
+              </label>
+            </div>
+            <label class="live-link-lbl">
+              <input type="checkbox" id="chk-fixed-reach" /> Lock brush at Air Reach (vacuum mid-air floaters · Key <code>R</code>)
+            </label>
+
+            <div class="btn-grid-2">
+              <button id="btn-save-splat" type="button" class="btn btn-primary btn-sm">💾 Save .ply/.splat</button>
+              <button id="btn-save-sync-bl" type="button" class="btn btn-accent btn-sm">🧊 Save → Blender</button>
+            </div>
+
+            <!-- Expand-Down Additional Splat Editing Sub-Panels -->
+            <details class="insp-more" id="more-splat-layers">
+              <summary class="insp-more-head">
+                <span><span class="sec-chev">▸</span> Viewport Layer Visibility</span>
+              </summary>
+              <div class="insp-more-body">
+                <div class="toggles-row">
+                  <label><input type="checkbox" id="chk-show-splats" checked /> Splats</label>
+                  <label><input type="checkbox" id="chk-show-solid" checked /> Solid Mesh</label>
+                  <label><input type="checkbox" id="chk-show-grid" checked /> Z=0 Grid</label>
+                  <label><input type="checkbox" id="chk-show-gizmos" checked /> Gizmos</label>
+                </div>
+              </div>
+            </details>
+
+            <details class="insp-more" id="more-splat-paint">
+              <summary class="insp-more-head">
+                <span><span class="sec-chev">▸</span> 🎨 Paint, Select &amp; Tint (Slot 3)</span>
+                <span class="wb-mono">Sel: <span id="lbl-selected-cnt">0</span></span>
+              </summary>
+              <div class="insp-more-body">
+                <div class="mode-pills" id="paint-submodes">
+                  <button type="button" class="mode-pill active" data-pmode="select">✨ Select</button>
+                  <button type="button" class="mode-pill" data-pmode="tint">🎨 Tint RGB</button>
+                  <button type="button" class="mode-pill" data-pmode="shrink">📐 Shrink</button>
+                  <button type="button" class="mode-pill" data-pmode="soften">💨 Soften</button>
+                  <input id="inp-paint-color" type="color" value="#ff7b29" title="Tint / Voxel Color" class="color-swatch" />
+                </div>
+                <div class="btn-grid-3">
+                  <button id="btn-sel-delete" type="button" class="btn btn-primary btn-xs">🔥 Cull Sel</button>
+                  <button id="btn-sel-keep" type="button" class="btn btn-secondary btn-xs">🎯 Keep Sel</button>
+                  <button id="btn-sel-invert" type="button" class="btn btn-ghost btn-xs">⇄ Invert</button>
+                </div>
+              </div>
+            </details>
+
+            <details class="insp-more" id="more-splat-crop">
+              <summary class="insp-more-head">
+                <span><span class="sec-chev">▸</span> 📦 3D Crop Box (Slot 2)</span>
+                <button id="btn-crop-clear" type="button" class="link-btn">Hide Box</button>
+              </summary>
+              <div class="insp-more-body">
+                <div class="btn-grid-3">
+                  <button id="btn-crop-here" type="button" class="btn btn-secondary btn-xs">📦 Box Here</button>
+                  <button id="btn-crop-cull-in" type="button" class="btn btn-primary btn-xs">🔥 Cull Inside</button>
+                  <button id="btn-crop-keep-in" type="button" class="btn btn-accent btn-xs">🎯 Keep Inside</button>
+                </div>
+              </div>
+            </details>
+
+            <details class="insp-more" id="more-splat-cleaner">
+              <summary class="insp-more-head">
+                <span><span class="sec-chev">▸</span> 🪄 Smart Floater Cleaner (Slot 4)</span>
+                <span id="lbl-filter-preview" class="wb-mono">0 marked</span>
+              </summary>
+              <div class="insp-more-body">
+                <div class="params-grid">
+                  <label class="field"><span>Min Opacity <b id="lbl-flt-opa">OFF</b></span><input id="rng-flt-opa" type="range" min="0.00" max="0.60" step="0.01" value="0.00" /></label>
+                  <label class="field"><span>Max Size <b id="lbl-flt-scale">OFF</b></span><input id="rng-flt-scale" type="range" min="0.03" max="1.50" step="0.02" value="1.50" /></label>
+                  <label class="field"><span>Needle Ratio <b id="lbl-flt-aniso">OFF</b></span><input id="rng-flt-aniso" type="range" min="2" max="30" step="1" value="30" /></label>
+                  <label class="field"><span>Floor Min Z <b id="lbl-flt-minz">OFF</b></span><input id="rng-flt-minz" type="range" min="-3.0" max="1.0" step="0.05" value="-3.0" /></label>
+                </div>
+                <div class="btn-grid-2">
+                  <button id="btn-flt-apply" type="button" class="btn btn-primary btn-xs">✓ Apply Filter Cull</button>
+                  <button id="btn-flt-reset" type="button" class="btn btn-ghost btn-xs">Reset Sliders</button>
+                </div>
+              </div>
+            </details>
+
+            <details class="insp-more" id="more-splat-export">
+              <summary class="insp-more-head">
+                <span><span class="sec-chev">▸</span> Copy Name, Download &amp; Restore</span>
+                <button id="btn-restore-orig" type="button" class="link-btn hidden">↺ Restore Orig</button>
+              </summary>
+              <div class="insp-more-body">
+                <input id="inp-save-name" type="text" class="search-input" placeholder="Optional copy name (blank = overwrite active splat)" />
+                <div class="btn-grid-2">
+                  <button id="btn-dl-splat" type="button" class="btn btn-ghost btn-xs">⬇ Download .splat</button>
+                  <button id="btn-dl-ply" type="button" class="btn btn-ghost btn-xs">⬇ Download .ply</button>
+                </div>
+              </div>
+            </details>
+          </div>
+        </details>
+
+        <!-- Section 4 (Expands Down): Train New Cloud 3DGS Splat & `tt-splat` Telemetry -->
+        <details class="insp-section splat-train-drawer" id="drawer-cloud-splat">
+          <summary class="insp-section-head drawer-summary">
+            <span class="insp-sec-title"><span class="sec-chev">▸</span> 🚀 Cloud 3DGS Trainer &amp; Telemetry</span>
+            <span class="sec-meta-pill">Modal H100</span>
+          </summary>
+          <div class="insp-section-body drawer-body">
+            <div class="mode-pills" id="splat-source-pills">
+              <button type="button" class="mode-pill active" data-src="video">🎬 From Video</button>
+              <button type="button" class="mode-pill" data-src="blender">🧊 From Blender 5.3</button>
+            </div>
+
+            <div id="splat-src-video-box" class="cond-video-card">
+              <select id="sel-splat-video" class="video-picker-select">
+                <option value="">— Select workspace video —</option>
+              </select>
+              <select id="sel-splat-known-cams" class="video-picker-select">
+                <option value="">— Auto Solve Poses (VGGT / COLMAP) —</option>
+                <option value="__blender_active__">🎥 Active Blender Camera Prior</option>
+              </select>
+            </div>
+
+            <div id="splat-src-blender-box" class="cond-video-card hidden">
+              <div class="params-grid">
+                <label class="field"><span>Views</span><input id="inp-splat-views" type="number" min="8" max="96" value="28" /></label>
+                <label class="field"><span>Targets</span><input id="inp-splat-targets" type="text" placeholder="entire scene" /></label>
+              </div>
+              <label><input type="checkbox" id="chk-splat-rgba" checked /> RGBA silhouette</label>
+            </div>
+
+            <div class="params-grid">
+              <label class="field"><span>Iterations</span><input id="inp-splat-iters" type="number" min="200" max="30000" step="500" value="5000" /></label>
+              <label class="field"><span>Cloud GPU</span>
+                <select id="sel-splat-gpu">
+                  <option value="H100" selected>H100 80GB</option>
+                  <option value="L40S">L40S 48GB</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="submit-bar">
+              <div class="est-cost" id="splat-est-cost">~$0.03</div>
+              <button id="btn-train-splat" type="button" class="btn btn-primary btn-sm">🚀 Train 3DGS</button>
+            </div>
+
+            <details class="insp-more inspector-details" id="more-splat-knobs">
+              <summary class="insp-more-head">
+                <span><span class="sec-chev">▸</span> Advanced Pose, SH &amp; Floater Knobs</span>
+              </summary>
+              <div class="insp-more-body">
+                <div class="params-grid">
+                  <label class="field"><span>Blender Mode</span>
+                    <select id="sel-splat-rendermode">
+                      <option value="ellipsoids_viewport" selected>Smooth Ellipsoids</option>
+                      <option value="hybrid">Hybrid Viewport</option>
+                      <option value="pointcloud">PointCloud</option>
+                    </select>
+                  </label>
+                  <label class="field"><span>SH Degree</span>
+                    <select id="sel-splat-sh">
+                      <option value="1" selected>Degree 1</option>
+                      <option value="0">Degree 0</option>
+                      <option value="2">Degree 2</option>
+                    </select>
+                  </label>
+                  <label class="field"><span>DSSIM λ</span><input id="inp-splat-dssim" type="number" step="0.05" value="0.20" /></label>
+                  <label class="field"><span>Opa Reg</span><input id="inp-splat-opareg" type="number" step="0.0001" value="0.0005" /></label>
+                  <label class="field"><span>Prune Opa</span><input id="inp-splat-pruneopa" type="number" step="0.005" value="0.025" /></label>
+                  <label class="field"><span>Opa Reset</span><input id="inp-splat-opareset" type="number" step="500" value="2000" /></label>
+                  <label class="field"><span>VGGT Cull %</span><input id="inp-splat-vggtconf" type="number" step="5" value="45" /></label>
+                  <label class="field"><span>Max Size (m)</span><input id="inp-splat-maxscale" type="number" step="0.05" value="0.25" /></label>
+                  <label class="field"><span>Max Needle</span><input id="inp-splat-maxaniso" type="number" step="1" value="10" /></label>
+                  <label class="field"><span>Pose Solver</span>
+                    <select id="sel-splat-pose-backend">
+                      <option value="vggt" selected>VGGT-1B</option>
+                      <option value="colmap">COLMAP</option>
+                      <option value="colmap_prior">COLMAP+Prior</option>
+                      <option value="known_cameras">Hard Lock</option>
+                    </select>
+                  </label>
+                </div>
+                <select id="sel-splat-rastmode" class="hidden"><option value="antialiased" selected>antialiased</option></select>
+                <div class="toggles-row">
+                  <label><input type="checkbox" id="chk-splat-refineposes" checked /> se(3) refine</label>
+                  <label><input type="checkbox" id="chk-splat-autoimport" checked /> Auto-import to BL</label>
+                </div>
+              </div>
+            </details>
+
+            <!-- Live `tt-splat` Telemetry Card -->
+            <div id="splat-live-card" class="splat-live-card hidden">
+              <div class="splat-live-head">
+                <span id="splat-live-title">Training…</span>
+                <span id="splat-live-metrics" class="splat-metrics-pill">PSNR —</span>
+              </div>
+              <div class="splat-prog-track"><div id="splat-prog-fill" class="splat-prog-fill" style="width:0%"></div></div>
+              <div class="splat-ctl-bar">
+                <button type="button" id="btn-wb-pause" class="btn btn-secondary btn-xs">⏸ Pause</button>
+                <button type="button" id="btn-wb-saveckpt" class="btn btn-secondary btn-xs">💾 Ckpt</button>
+                <button type="button" id="btn-wb-stop" class="btn btn-ghost btn-xs">⏹ Stop</button>
+                <select id="sel-wb-focus-cam" class="wb-mini-select"><option value="">🎯 All Views</option></select>
+                <button type="button" id="btn-wb-push-knobs" class="btn btn-secondary btn-xs">⚡ Push</button>
+              </div>
+              <div id="splat-live-preview-wrap" class="splat-live-preview-wrap hidden">
+                <img id="splat-live-img" alt="Live 3DGS render" />
+                <img id="splat-live-diff" class="hidden" alt="Error map" />
+                <div class="splat-preview-toggle">
+                  <button type="button" id="btn-splat-show-render" class="btn btn-secondary btn-xs">Render</button>
+                  <button type="button" id="btn-splat-show-diff" class="btn btn-ghost btn-xs">Error</button>
+                </div>
+              </div>
+              <div id="splat-stage-wrap" class="splat-stage-wrap hidden">
+                <div id="splat-stage-bar" class="splat-stage-bar"></div>
+                <div id="splat-stage-legend" class="splat-stage-legend"></div>
+              </div>
+              <div id="splat-charts-wrap" class="splat-charts-wrap hidden">
+                <div class="chart-head"><span id="lbl-chart-hover">Loss · L1 · PSNR</span></div>
+                <canvas id="canvas-splat-loss-psnr" class="splat-chart-canvas" width="520" height="120"></canvas>
+                <canvas id="canvas-splat-count" class="splat-chart-canvas" width="520" height="64"></canvas>
+              </div>
+              <div id="splat-snap-row" class="splat-snap-row hidden">
+                <span class="wb-lbl">📸</span>
+                <input type="range" id="rng-splat-snap" min="0" max="0" value="0" />
+                <span id="lbl-splat-snap" class="wb-mono">—</span>
+              </div>
+              <div class="splat-ctl-bar">
+                <button type="button" id="btn-surg-reset-opa" class="btn btn-secondary btn-xs">🫧 Reset Opa</button>
+                <button type="button" id="btn-surg-clamp-scale" class="btn btn-secondary btn-xs">✂️ Spikes</button>
+                <button type="button" id="btn-cropbox-spawn" class="btn btn-secondary btn-xs">📦 BL Box</button>
+                <button id="btn-cropbox-cull" class="btn btn-primary btn-xs">🔥 Cull+Heal</button>
+                <button type="button" id="btn-cropbox-keep" class="btn btn-secondary btn-xs">🎯 Keep+Heal</button>
+                <button type="button" id="btn-build-proxy" type="button" class="btn btn-secondary btn-xs">🕸 Proxy GLB</button>
+              </div>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- =========================================================
+           TAB 4: Unified Generation & Cloud Job Queue
+           ========================================================= -->
+      <div id="panel-copilot-jobs" class="composer-scroll hidden" aria-label="Job Queue">
+        <details class="insp-section" id="sec-jobs-queue" open>
+          <summary class="insp-section-head">
+            <span class="insp-sec-title"><span class="sec-chev">▸</span> Seedream &amp; Seedance Jobs</span>
+          </summary>
+          <div class="insp-section-body">
+            <div id="jobs-list" class="jobs-list">
+              <div class="empty-placeholder">No jobs submitted yet.</div>
+            </div>
+          </div>
+        </details>
+
+        <div class="insp-agent-callout">
+          <div>
+            <strong>🤖 Blender 5.3 Agent Co-Pilot</strong>
+            <div class="wb-lbl">Docked at the bottom of the viewport so you can chat from any tab.</div>
+          </div>
+          <button id="btn-open-agent-from-jobs" type="button" class="btn btn-secondary btn-xs">▴ Open Chat</button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- DOCKED EDGE RESTORE TAB WHEN RIGHT INSPECTOR IS HIDDEN -->
+    <button id="edge-restore-right" type="button" class="edge-restore-tab edge-right hidden" title="Show Right Inspector (Ctrl+Alt+B)">
+      <span>◂</span>
+      <span class="edge-restore-lbl">INSPECTOR</span>
+    </button>
   </main>
 
   <script src="/assets/app.js"></script>

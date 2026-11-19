@@ -7,6 +7,7 @@ command completion never drift.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import re
 import subprocess
@@ -26,8 +27,10 @@ from blenderbot.session.profiles_ctl import profile_state, switch_profile
 HELP_TEXT = """Commands
   sh <cmd>                    run a local shell command; output is added to context
   /blender [mode]             show Blender 5.3+ status or reconnect (`auto` | `bridge` | `headless`)
+  /seedream [prompt] [flags]  open Seedream 5.5 Image Studio (or generate `--ref`/`--res`/`--aspect` PNG/JPG)
   /seedance [prompt] [flags]  open Seedance 2.5 GUI Studio (or generate `--video`/`--first`/`--last` MP4)
   /splat [list|import <id>]   open 3DGS Splat Studio GUI, list splats, or import `<job_id>` into Blender
+  /fps [scene|job_id]         open dedicated full-screen Minecraft FPS Camera & 3DGS Splat Editor (`/fps`)
   /web [open]                 start/show the Seedance 2.5 & 3D Studio Web GUI sidecar
   /render [frame] [engine]    render still (`BLENDER_EEVEE` | `CYCLES` | `BLENDER_WORKBENCH`) & attach to context
   /sheet [cols] [rows]          render burned-in `fNNNN | t | lens` mosaic contact sheet & attach to context
@@ -185,6 +188,27 @@ async def handle_command(
         )
         return {"handled": True}
 
+    if cmd == "/fps":
+        import webbrowser as _wb
+        from urllib.parse import quote as _quote
+
+        from blenderbot.server import ensure_web_sidecar
+
+        srv = await ensure_web_sidecar(session, open_browser=False)
+        scene_q = f"&scene={_quote(args[0], safe='')}" if args else ""
+        fps_url = f"{srv.url}/fps?token={_quote(srv.token, safe='')}{scene_q}"
+        try:
+            _wb.open(fps_url)
+        except Exception:  # noqa: BLE001, S110
+            pass
+        push(
+            {
+                "type": "notice",
+                "message": f"Opened Full-Screen FPS Camera & 3DGS Splat Editor -> {fps_url}",
+            }
+        )
+        return {"handled": True}
+
     if cmd == "/splat":
         if not args or args[0].lower() in ("gui", "open", "studio"):
             from blenderbot.server import ensure_web_sidecar
@@ -253,6 +277,133 @@ async def handle_command(
                 "text": "usage: /splat | /splat list | /splat import <job_id> [ellipsoids|pointcloud]",
             }
         )
+        return {"handled": True}
+
+    if cmd == "/seedream":
+        if not args or (
+            len(args) == 1 and args[0].lower() in ("gui", "open", "--gui", "--open", "studio")
+        ):
+            from blenderbot.server import ensure_web_sidecar
+
+            srv = await ensure_web_sidecar(session, open_browser=False)
+            import webbrowser as _wb_sr
+
+            sr_url = f"{srv.auth_url}#seedream"
+            with contextlib.suppress(Exception):
+                _wb_sr.open(sr_url)
+            push({"type": "notice", "message": f"Opened Seedream 5.5 Image Studio -> {sr_url}"})
+            return {"handled": True}
+
+        from blenderbot.media_gen.seedream import (
+            default_seedream_output_path,
+            generate_seedream_image,
+        )
+
+        or_key = session.cfg.keys.get("openrouter")
+        if not or_key:
+            push(
+                {
+                    "type": "warning",
+                    "message": "OPENROUTER_API_KEY is not configured. Run `/keys openrouter <key> --save` or `/seedream` to set it in the GUI.",
+                }
+            )
+            return {"handled": True}
+
+        refs_sr: list[Path | str] = []
+        res_sr: str | None = None
+        ar_sr: str | None = None
+        fmt_sr: str | None = None
+        bg_sr: str | None = None
+        mode_sr = "standard"
+        seed_sr: int | None = None
+        out_sr: str | None = None
+        words_sr: list[str] = []
+        i_sr = 0
+        while i_sr < len(args):
+            t_sr = args[i_sr]
+            if t_sr in ("--ref", "-r") and i_sr + 1 < len(args):
+                rv = args[i_sr + 1]
+                refs_sr.append(
+                    rv if rv.startswith(("https://", "http://", "data:")) else session.sandbox.resolve_for_read(rv)
+                )
+                i_sr += 2
+            elif t_sr in ("--res", "--resolution") and i_sr + 1 < len(args):
+                res_sr = args[i_sr + 1]
+                i_sr += 2
+            elif t_sr in ("--aspect", "--ar", "-a") and i_sr + 1 < len(args):
+                ar_sr = args[i_sr + 1]
+                i_sr += 2
+            elif t_sr in ("--format", "--fmt") and i_sr + 1 < len(args):
+                fmt_sr = args[i_sr + 1]
+                i_sr += 2
+            elif t_sr in ("--bg", "--background") and i_sr + 1 < len(args):
+                bg_sr = args[i_sr + 1]
+                i_sr += 2
+            elif t_sr == "--mode" and i_sr + 1 < len(args):
+                mode_sr = args[i_sr + 1]
+                i_sr += 2
+            elif t_sr == "--seed" and i_sr + 1 < len(args):
+                seed_sr = int(args[i_sr + 1])
+                i_sr += 2
+            elif t_sr in ("--out", "-o") and i_sr + 1 < len(args):
+                out_sr = args[i_sr + 1]
+                i_sr += 2
+            else:
+                words_sr.append(t_sr)
+                i_sr += 1
+
+        prompt_sr = " ".join(words_sr).strip()
+        try:
+            ext_hint = ".jpg" if (fmt_sr or "").lower() in ("jpg", "jpeg") else ".png"
+            out_p_sr = (
+                session.sandbox.resolve_for_write(out_sr)
+                if out_sr
+                else default_seedream_output_path(session.cfg.cwd, ext=ext_hint)
+            )
+            push(
+                {
+                    "type": "notice",
+                    "message": f"Generating Seedream 5.5 image ({session.cfg.image_model}) -> {session.sandbox.rel(out_p_sr)}…",
+                }
+            )
+            res_img = await generate_seedream_image(
+                api_key=or_key,
+                output_path=out_p_sr,
+                model=session.cfg.image_model,
+                prompt=prompt_sr,
+                mode=mode_sr,
+                resolution=res_sr,
+                aspect_ratio=ar_sr,
+                output_format=fmt_sr,
+                background=bg_sr,
+                reference_images=refs_sr,
+                seed=seed_sr,
+                on_progress=lambda _p: session.log.flight.touch(),
+            )
+            final_p = Path(str(res_img["output_path"]))
+            cost_sr = float(res_img.get("cost_usd") or 0.0)
+            session.agent.run_cost += cost_sr
+            session.agent.stats["cost"] += cost_sr
+            session.log.record("seedream", res_img)
+            if session.cfg.model.vision:
+                img_part = load_image_part(final_p)
+                session.ledger.add(
+                    seg_type="media",
+                    label=f"seedream {final_p.name} ({res_img.get('width')}x{res_img.get('height')})",
+                    role="user",
+                    image=img_part,
+                )
+            push(
+                {
+                    "type": "notice",
+                    "message": (
+                        f"Seedream 5.5 completed in {res_img['elapsed_sec']}s (${cost_sr:.4f}, "
+                        f"{res_img.get('width')}x{res_img.get('height')}) -> {session.sandbox.rel(final_p)}"
+                    ),
+                }
+            )
+        except Exception as err:  # noqa: BLE001
+            push({"type": "warning", "message": f"/seedream failed: {err}"})
         return {"handled": True}
 
     if cmd == "/seedance":

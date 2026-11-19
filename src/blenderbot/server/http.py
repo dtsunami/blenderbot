@@ -129,11 +129,20 @@ def create_fastapi_app(state: WebState) -> FastAPI:
         req: Request, call_next: Callable[[Request], Any]
     ) -> Response:
         path = req.url.path
-        if path == "/" or path.startswith("/assets/") or path in ("/favicon.svg", "/favicon.ico"):
+        if (
+            path in ("/", "/fps")
+            or path.startswith("/assets/")
+            or path in ("/favicon.svg", "/favicon.ico")
+        ):
             res_open: Response = await call_next(req)
             return res_open
 
-        allow_q = path in ("/api/events", "/api/media/file", "/api/media/poster")
+        allow_q = path in (
+            "/api/events",
+            "/api/media/file",
+            "/api/media/poster",
+            "/api/fps/default_splat",
+        )
         given = read_request_token(req, allow_query=allow_q)
         if not token_matches(state.secret, given):
             return JSONResponse({"error": "bad or missing token"}, status_code=401)
@@ -142,6 +151,10 @@ def create_fastapi_app(state: WebState) -> FastAPI:
 
     @app.get("/", include_in_schema=False)
     async def serve_index() -> FileResponse:
+        return FileResponse(WEB_STATIC_DIR / "index.html")
+
+    @app.get("/fps", include_in_schema=False)
+    async def serve_fps_studio() -> FileResponse:
         return FileResponse(WEB_STATIC_DIR / "index.html")
 
     @app.get("/favicon.svg", include_in_schema=False)

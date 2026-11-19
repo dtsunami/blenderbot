@@ -1046,7 +1046,13 @@ def run_splat_job_stream(
     masks_dir.mkdir(parents=True, exist_ok=True)
 
     def _append_telem(row: dict[str, Any]) -> None:
-        clean = {k: v for k, v in row.items() if not k.endswith("_b64") and k not in ("ply_gz", "splat_gz")}
+        clean = {
+            k: v
+            for k, v in row.items()
+            if not k.endswith("_b64")
+            and k not in ("ply_gz", "splat_gz", "proxy_glb_gz", "cameras_json")
+            and not isinstance(v, (bytes, bytearray))
+        }
         with open(telem_path, "a", encoding="utf-8") as tf:
             tf.write(json.dumps(clean) + "\n")
 

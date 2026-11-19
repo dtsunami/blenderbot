@@ -752,7 +752,11 @@ def op_camera_upsert(ctx: OpContext, params: dict[str, Any]) -> dict[str, Any]:
         cam_obj.location = (float(loc[0]), float(loc[1]), float(loc[2]))
 
     cam_aim = params.get("look_at") if params.get("look_at") is not None else params.get("target")
-    if params.get("rotation_deg") is not None:
+    if params.get("rotation_quaternion") is not None:
+        rq = params["rotation_quaternion"]
+        cam_obj.rotation_mode = "QUATERNION"
+        cam_obj.rotation_quaternion = tuple(float(q) for q in rq[:4])
+    elif params.get("rotation_deg") is not None:
         rot = params["rotation_deg"]
         cam_obj.rotation_mode = "XYZ"
         cam_obj.rotation_euler = tuple(math.radians(float(a)) for a in rot[:3])

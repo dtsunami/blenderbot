@@ -120,9 +120,21 @@ Live probes against `C:\Program Files\Blender Foundation\Blender 5.3\blender.exe
   - Farms full-rate H.264 MP4 rendering of the recreated original video trajectory (Catmull-Rom + hemisphere-continuous quaternion SLERP at exact source `fps` & `duration_sec`) or any Blender camera to Modal H100/L40S (`gsplat` CUDA, ~1–2s for 120 frames) alongside matching Blender 5.3 EEVEE playblasts.
   - Interactive Web Studio **Compare & Path** stage: lockstep side-by-side playback (Original Video vs. Modal Cloud 3DGS Render vs. Blender 5.3 Render) with solved-keyframe timeline markers, orbitable 3D camera trajectory + `Z=0` grid + live moving 3D frustum pyramid, and synchronized unwrapped `Yaw° / Pitch° / Roll° / Speed (m/s)` curves.
 
-### Remaining Optional Extensions
-- [ ] **Interactive 2D Brush Mask Painter & Vast/RunPod HTTP Pod Wrapper:** In-browser canvas mask brush writing directly to `/jobs/{job_id}/masks/` + `pod_server.py` (`BLENDERBOT_SPLAT_URL`).
-- [ ] **4D Dynamic Splat Sequence Playback:** Frame-indexed `.ply` sequence handler + foreground matting (`SAM2`/`BiRefNet`).
+### Phase 6 — Unified VS Code / Chrome Workbench, Minecraft FPS Splat Editor & Seedream 5.5 *(COMPLETE)*
+- [x] **VS Code / Chrome DevTools 3-Pane Studio Workbench (`ui/web/{index.html,app.css,app.js}`, `/` & `/fps`):**
+  - **Left Explorer Hierarchy Tree:** Multi-level nested folder & asset tree (`3D Stages` + `assets/splats`, `assets/seedance`, `assets/seedream`, `renders/`, etc.) with VS Code vertical indent guides, inline micro-thumbnails, role pills, right-aligned quick action buttons, keyboard navigation, search/filter tabs, and dynamic floating rich hover tooltips.
+  - **Resizable, Hidable & Scrollable Sidebars + Docked Agent Chat Drawer:** Pointer-captured Monaco-style resize splitters (`#sash-left`, `#sash-right`, `#sash-agent`) with snap-to-hide, double-click width reset, edge restore rails, expand-down `<details>` inspector accordions (`insp-section` / `insp-more`), and an always-present, hidden-by-default expandable **Agent Co-Pilot** bottom drawer (`Ctrl+J` / ``Ctrl+` ``).
+  - **Multi-Pass WebGL2 FPS Camera & Splat Engine:** Shaded solid 3D meshes + back-to-front sorted 3DGS splats (`u_flagTex` `R8UI` live bitmask), Minecraft Creative Flight (`Space × 2` / `G`), and live quaternion camera sync with Blender 5.3 (`/api/fps/camera_sync`, `/api/fps/camera_pull`).
+- [x] **Interactive 60fps 3DGS Gaussian Culling, Cropping, Painting & Lossless `.ply` Round-Trip (`splats/splat_edit.py`):**
+  - 8-slot Minecraft hotbar (`[1]` 3D Sphere Cull/Restore Brush + fixed Air Reach floater vacuum, `[2]` 3D AABB Crop/Keep Box, `[3]` Select/Tint RGB/Shrink/Soften Brush, `[4]` Live-Preview Smart Floater Cleaner for opacity/scale/needle-anisotropy/floor-Z, `[5–8]` Cam Rail, Subject, Solid Voxel, Spatial Ping), 40-step `Ctrl+Z`/`Ctrl+Y` Undo/Redo, `.ply`/`.splat` drag-drop upload, SH-preserving `.ply` + `.splat` save with `.orig.ply` backup, and 1-click Blender 5.3 re-import.
+- [x] **OpenRouter Seedream 5.5 Sibling Image Pipeline (`media_gen/seedream.py`, `gen.seedream`, `/seedream`, `🎨 Seedream 5.5` tab):**
+  - Full `POST /api/v1/images` (`bytedance-seed/seedream-5-5`) client supporting `1K`/`1.5K`/`2K` resolution tiers, all aspect ratios, `png`/`jpeg`, `transparent` RGBA auto-coercion, up to 10 `input_references`, `429` retry backoff, USD `usage.cost` accounting, `🎨 → Seedream` direct FPS camera frame handoff, and 1-click slotting into Seedance 2.5 `first_frame`.
+
+### Next Session Roadmap
+- [ ] **Rust-Style `F1` Console Keybinds & Shared `keys.cfg` Macro System:**
+  - Composable `bind <key> "<cmd1>;<cmd2>"` (`+` press/release actions like `bind mouse4 "+ads;+record_rail"`, `bind x "auto_run"`, `bind z "+crouch;fov 24"`) persisted in `~/.blenderbot/keys.cfg` and shared across the Web FPS Sandbox and the upcoming Unreal Engine (`EnhancedInput`) harness.
+- [ ] **Interactive 2D Brush Mask Painter, 4D Splat Sequences & Vast/RunPod HTTP Pod Wrapper:**
+  - In-browser canvas mask brush writing directly to `/jobs/{job_id}/masks/`, frame-indexed `.ply` 4D playback, and `pod_server.py` (`BLENDERBOT_SPLAT_URL`).
 
 ---
 

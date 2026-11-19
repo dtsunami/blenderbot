@@ -35,8 +35,7 @@ def _find_p0_and_video() -> tuple[Path, Path]:
             and (d / "cameras.json").is_file()
             and (d / "previews" / "gt_frame_00001.jpg").is_file()
         ),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
+        key=lambda p: (not p.name.startswith("seedance_20261117_212805_"), -p.stat().st_mtime),
     )
     if not candidates:
         pytest.skip("No P0 Seedance splat artifact found")

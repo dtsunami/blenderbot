@@ -159,6 +159,29 @@ def plan_batch(
                         )
             elif call.op in JOURNAL_OPS:
                 pass
+            elif call.op == "gen.seedream":
+                p = call.params
+                if not str(p.get("prompt") or "").strip():
+                    errors.append(
+                        {
+                            "index": call.index,
+                            "op": call.op,
+                            "message": "gen.seedream requires a non-empty 'prompt'",
+                        }
+                    )
+                if p.get("output_path"):
+                    sandbox.resolve_for_write(str(p["output_path"]))
+                for ref_img in p.get("reference_images") or []:
+                    if ref_img and not str(ref_img).startswith(("https://", "http://", "data:")):
+                        rf = sandbox.resolve_for_read(str(ref_img))
+                        if not rf.is_file():
+                            errors.append(
+                                {
+                                    "index": call.index,
+                                    "op": call.op,
+                                    "message": f"{sandbox.rel(rf)} does not exist",
+                                }
+                            )
             elif call.op == "gen.seedance":
                 p = call.params
                 has_cond = any(
@@ -527,8 +550,8 @@ def _collect_media_attachments(
     sandbox.allow_read_file(out_p)
     ext = out_p.suffix.lower()
 
-    # Default `attach_to_context` is True for viewport stills, contact sheets, and PNG/JPG `render.still`
-    default_attach = call.op in ("viewport.render_still", "viewport.contact_sheet") or (
+    # Default `attach_to_context` is True for viewport stills, contact sheets, Seedream images, and PNG/JPG `render.still`
+    default_attach = call.op in ("viewport.render_still", "viewport.contact_sheet", "gen.seedream") or (
         call.op == "render.still" and ext in (".png", ".jpg", ".jpeg", ".webp")
     )
     want_attach = bool(call.params.get("attach_to_context", default_attach))
@@ -606,6 +629,57 @@ async def execute_batch(
                     res = await journal.redo_next(
                         transport, steps=int(call.params.get("steps", 1))
                     )
+            elif call.op == "gen.seedream":
+                from blenderbot.media_gen.seedream import (
+                    default_seedream_output_path,
+                    generate_seedream_image,
+                )
+
+                or_key_sr = (cfg.keys.get("openrouter") if cfg else None) or os.environ.get(
+                    "OPENROUTER_API_KEY", ""
+                )
+                p = call.params
+                fmt_hint = str(p.get("output_format") or "png").strip().lower()
+                ext_sr = ".jpg" if fmt_hint in ("jpg", "jpeg") else ".png"
+                if p.get("output_path"):
+                    out_sr = sandbox.resolve_for_write(str(p["output_path"]))
+                else:
+                    out_sr = default_seedream_output_path(sandbox.cwd, ext=ext_sr)
+
+                refs_sr: list[str | Path] = []
+                for raw_r in p.get("reference_images") or []:
+                    if not raw_r:
+                        continue
+                    s_r = str(raw_r).strip()
+                    refs_sr.append(
+                        s_r
+                        if s_r.startswith(("https://", "http://", "data:"))
+                        else sandbox.resolve_for_read(s_r)
+                    )
+
+                bf_sr = journal.snapshot_file(out_sr)
+                res = await generate_seedream_image(
+                    api_key=or_key_sr,
+                    output_path=out_sr,
+                    model=str(
+                        p.get("model")
+                        or (cfg.image_model if cfg else "bytedance-seed/seedream-5-5")
+                    ),
+                    prompt=str(p["prompt"]),
+                    mode=str(p.get("mode") or "standard"),
+                    resolution=str(p["resolution"]) if p.get("resolution") else None,
+                    aspect_ratio=str(p["aspect_ratio"]) if p.get("aspect_ratio") else None,
+                    output_format=str(p["output_format"]) if p.get("output_format") else None,
+                    background=str(p["background"]) if p.get("background") else None,
+                    reference_images=refs_sr,
+                    seed=int(p["seed"]) if p.get("seed") is not None else None,
+                    timeout_sec=float(p.get("timeout_sec", 180.0)),
+                )
+                actual_out_sr = Path(str(res["output_path"]))
+                before_files.append(bf_sr)
+                after_files.append(journal.snapshot_file(actual_out_sr))
+                mutated_ops_names.append(f"gen.seedream({sandbox.rel(actual_out_sr)})")
+                attached_media.extend(_collect_media_attachments(call, res, sandbox))
             elif call.op == "gen.seedance":
                 from blenderbot.media_gen.seedance import (
                     default_seedance_output_path,

@@ -17,7 +17,7 @@ from typing import Any
 from fastapi import APIRouter, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from blenderbot.context.media import load_video_part
+from blenderbot.context.media import load_image_part, load_video_part
 from blenderbot.media_gen.seedance import (
     ESTIMATED_COST_PER_SEC_USD,
     SEEDANCE_ASPECT_RATIOS,
@@ -29,6 +29,18 @@ from blenderbot.media_gen.seedance import (
     fetch_openrouter_video_models,
     generate_seedance_video,
     probe_media_info,
+)
+from blenderbot.media_gen.seedream import (
+    ESTIMATED_COST_BY_RES_USD,
+    ESTIMATED_COST_PER_IMAGE_USD,
+    SEEDREAM_ASPECT_RATIOS,
+    SEEDREAM_BACKGROUNDS,
+    SEEDREAM_OUTPUT_FORMATS,
+    SEEDREAM_RESOLUTIONS,
+    SeedreamError,
+    default_seedream_output_path,
+    fetch_openrouter_image_models,
+    generate_seedream_image,
 )
 from blenderbot.providers.index import mask_key
 from blenderbot.session.keys_ctl import set_provider_key
@@ -73,10 +85,19 @@ async def api_get_state(req: Request) -> dict[str, Any]:
         "video_capable_agent": cfg.model.video,
         "vision_capable_agent": cfg.model.vision,
         "role": cfg.role,
+        "image_model": cfg.image_model,
         "video_model": cfg.video_model,
         "openrouter": {
             "configured": bool(or_key),
             "masked": mask_key(or_key),
+        },
+        "seedream_spec": {
+            "resolutions": list(SEEDREAM_RESOLUTIONS),
+            "aspect_ratios": list(SEEDREAM_ASPECT_RATIOS),
+            "output_formats": list(SEEDREAM_OUTPUT_FORMATS),
+            "backgrounds": list(SEEDREAM_BACKGROUNDS),
+            "cost_per_image_usd": ESTIMATED_COST_PER_IMAGE_USD,
+            "cost_by_res_usd": dict(ESTIMATED_COST_BY_RES_USD),
         },
         "seedance_spec": {
             "sizes": list(SEEDANCE_SIZES),
@@ -112,6 +133,162 @@ async def api_get_state(req: Request) -> dict[str, Any]:
         "jobs": [st.jobs[jid].to_dict() for jid in st.job_order[:30] if jid in st.jobs],
         "splat_jobs": await asyncio.to_thread(st.scan_splat_jobs),
     }
+
+
+@router.get("/seedream/models")
+async def api_seedream_models(req: Request) -> dict[str, Any]:
+    st = _get_state(req)
+    or_key = st.session.cfg.keys.get("openrouter")
+    models = await fetch_openrouter_image_models(api_key=or_key)
+    return {"models": models, "default": st.session.cfg.image_model}
+
+
+@router.post("/seedream/generate")
+async def api_seedream_generate(req: Request) -> JSONResponse:
+    """Generate a Seedream 5.5 image (`POST /api/v1/images`) with optional multi-reference conditioning."""
+    st = _get_state(req)
+    sess = st.session
+    cfg = sess.cfg
+
+    or_key = cfg.keys.get("openrouter")
+    if not or_key:
+        return JSONResponse(
+            {
+                "error": "OPENROUTER_API_KEY is not configured. Click 'OpenRouter' in the header or set OPENROUTER_API_KEY in ~/.blenderbot/.env."
+            },
+            status_code=401,
+        )
+
+    body = await req.json()
+    prompt = str(body.get("prompt") or "").strip()
+    if not prompt:
+        return JSONResponse({"error": "Seedream 5.5 requires a non-empty text prompt."}, status_code=400)
+
+    model = str(body.get("model") or cfg.image_model).strip() or cfg.image_model
+    mode = str(body.get("mode") or "standard").strip()
+    resolution = str(body.get("resolution") or "").strip() or None
+    aspect_ratio = str(body.get("aspect_ratio") or "").strip() or None
+    output_format = str(body.get("output_format") or "").strip() or None
+    background = str(body.get("background") or "").strip() or None
+    seed_raw = body.get("seed")
+    seed_val = int(seed_raw) if seed_raw not in (None, "") else None
+    attach_ctx = bool(body.get("attach_to_context", True))
+
+    try:
+        refs_resolved: list[str | Path] = []
+        for r_raw in (body.get("reference_images") or [])[:10]:
+            s_r = str(r_raw or "").strip()
+            if not s_r:
+                continue
+            if s_r.startswith(("https://", "http://", "data:")):
+                refs_resolved.append(s_r)
+            else:
+                refs_resolved.append(sess.sandbox.resolve_for_read(s_r))
+
+        ext_hint = ".jpg" if (output_format or "").lower() in ("jpg", "jpeg") else ".png"
+        if background and background.lower() == "transparent":
+            ext_hint = ".png"
+        custom_out = str(body.get("output_path") or "").strip()
+        if custom_out:
+            if Path(custom_out).suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+                custom_out += ext_hint
+            out_path = sess.sandbox.resolve_for_write(custom_out)
+        else:
+            out_path = default_seedream_output_path(cfg.cwd, ext=ext_hint)
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": str(err)}, status_code=400)
+
+    sess.history.add(prompt)
+    out_rel = sess.sandbox.rel(out_path).replace("\\", "/")
+    job_rec = st.new_job(prompt=prompt, model=model, mode=mode, output_rel=out_rel)
+    job_rec.local_id = job_rec.local_id.replace("sd-", "sr-", 1)
+    st.jobs.pop(st.job_order[0], None)
+    st.job_order[0] = job_rec.local_id
+    st.jobs[job_rec.local_id] = job_rec
+
+    async def _runner() -> None:
+        sess.log.flight.note("seedream:start", local_id=job_rec.local_id, model=model)
+        job_rec.stage = "generating"
+        sess.bus.publish("seedance-job", job_rec.to_dict())
+        try:
+            res = await generate_seedream_image(
+                api_key=or_key,
+                output_path=out_path,
+                model=model,
+                prompt=prompt,
+                mode=mode,
+                resolution=resolution,
+                aspect_ratio=aspect_ratio,
+                output_format=output_format,
+                background=background,
+                reference_images=refs_resolved,
+                seed=seed_val,
+                on_progress=lambda _p: sess.log.flight.touch(),
+                cancel_event=job_rec.cancel_ev,
+            )
+            final_p = Path(str(res["output_path"]))
+            final_rel = sess.sandbox.rel(final_p).replace("\\", "/")
+            cost = float(res.get("cost_usd") or 0.0)
+            job_rec.output_rel = final_rel
+            job_rec.stage = "completed"
+            job_rec.cost_usd = cost
+            job_rec.elapsed_sec = float(res.get("elapsed_sec") or 0.0)
+            job_rec.width = res.get("width")
+            job_rec.height = res.get("height")
+            job_rec.conditioning = dict(res.get("conditioning") or {})
+            job_rec.media_url = st.media_url_for(final_p)
+
+            sess.agent.run_cost += cost
+            sess.agent.stats["cost"] += cost
+            sess.log.record("seedream", {**job_rec.to_dict(), "output_path": str(final_p)})
+            sess.log.update_totals(
+                sess.agent.stats,
+                provider=cfg.provider,
+                model_id=cfg.model.id,
+                health=sess.agent.context_health(),
+            )
+
+            if attach_ctx and cfg.model.vision:
+                img_part = load_image_part(final_p)
+                sess.ledger.add(
+                    seg_type="media",
+                    label=f"seedream image ({final_p.name}, {res.get('width')}x{res.get('height')})",
+                    role="user",
+                    image=img_part,
+                )
+
+            sess.bus.publish("workspace-media-added", {"path": final_rel, "kind": "image"})
+            sess.bus.publish("seedance-job", job_rec.to_dict())
+            sess.bus.publish(
+                "transcript",
+                {
+                    "type": "notice",
+                    "origin": "web",
+                    "message": (
+                        f"Seedream 5.5 generated {final_rel} "
+                        f"({res.get('width')}x{res.get('height')}, ${cost:.4f})"
+                    ),
+                },
+            )
+        except asyncio.CancelledError:
+            job_rec.stage = "cancelled"
+            job_rec.error = "Cancelled by operator"
+            sess.bus.publish("seedance-job", job_rec.to_dict())
+        except SeedreamError as sr_err:
+            job_rec.stage = "failed"
+            job_rec.error = str(sr_err)
+            sess.bus.publish("seedance-job", job_rec.to_dict())
+            sess.bus.publish(
+                "transcript",
+                {"type": "warning", "origin": "web", "message": f"Seedream error: {sr_err}"},
+            )
+        except Exception as err:  # noqa: BLE001
+            job_rec.stage = "failed"
+            job_rec.error = f"{type(err).__name__}: {err}"
+            sess.bus.publish("seedance-job", job_rec.to_dict())
+
+    job_rec.task = asyncio.create_task(_runner())
+    return JSONResponse({"ok": True, "job": job_rec.to_dict()}, status_code=202)
 
 
 @router.get("/seedance/models")
@@ -273,6 +450,45 @@ async def api_upload_media(req: Request, filename: str = "") -> JSONResponse:
         "probe": info,
     }
     st.session.bus.publish("workspace-media-added", item)
+    return JSONResponse({"ok": True, "item": item})
+
+
+@router.post("/workspace/save_snapshot")
+async def api_save_viewport_snapshot(req: Request) -> JSONResponse:
+    """Save a clean base64 PNG captured from the Center WebGL2 3D/FPS Viewport into `renders/`."""
+    import base64 as _b64
+
+    st = _get_state(req)
+    sess = st.session
+    body = await req.json()
+    raw_url = str(body.get("data_url") or "").strip()
+    if not raw_url:
+        return JSONResponse({"error": "Missing data_url"}, status_code=400)
+    b64_part = raw_url.split(",", 1)[1] if "," in raw_url and raw_url.startswith("data:") else raw_url
+    try:
+        png_bytes = _b64.b64decode(b64_part)
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": f"Invalid base64 PNG: {err}"}, status_code=400)
+
+    prefix = _SAFE_FILENAME_RE.sub("_", str(body.get("prefix") or "fps_view").strip())[:24] or "fps_view"
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
+    renders_dir = sess.cfg.cwd / "renders"
+    renders_dir.mkdir(parents=True, exist_ok=True)
+    dst = renders_dir / f"{prefix}_{ts}.png"
+    await asyncio.to_thread(dst.write_bytes, png_bytes)
+
+    rel = sess.sandbox.rel(dst).replace("\\", "/")
+    item = {
+        "path": rel,
+        "folder": "renders",
+        "name": dst.name,
+        "kind": "image",
+        "ext": ".png",
+        "size_bytes": len(png_bytes),
+        "mtime": int(dst.stat().st_mtime),
+        "url": st.media_url_for(dst),
+    }
+    sess.bus.publish("workspace-media-added", item)
     return JSONResponse({"ok": True, "item": item})
 
 
@@ -1699,6 +1915,412 @@ async def api_shots_export(req: Request) -> JSONResponse:
             return JSONResponse({"error": f"Modal rail render failed: {err}", **out_payload}, status_code=400)
 
     return JSONResponse(out_payload)
+
+
+@router.get("/fps/default_splat")
+async def api_fps_default_splat(
+    variant: str = "courtyard",
+    fmt: str = "splat",
+) -> Response:
+    """Serve metric-calibrated Default Cube / Courtyard 3DGS `.splat` or `.ply` benchmark."""
+    from blenderbot.splats.splat_edit import build_default_cube_splat
+
+    v = "cube" if variant.strip().lower() == "cube" else "courtyard"
+    ply_b, splat_b, _meta = await asyncio.to_thread(build_default_cube_splat, v)
+    if fmt.strip().lower() == "ply":
+        return Response(
+            content=ply_b,
+            media_type="application/octet-stream",
+            headers={"Content-Disposition": f'inline; filename="default_{v}.ply"'},
+        )
+    return Response(
+        content=splat_b,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f'inline; filename="default_{v}.splat"'},
+    )
+
+
+@router.post("/splats/ensure_splat/{job_id}")
+async def api_splats_ensure_splat(req: Request, job_id: str) -> JSONResponse:
+    """Ensure `splat.splat` exists and is 1:1 vertex-index aligned with `splat.ply` for editing."""
+    from blenderbot.splats.splat_edit import ensure_aligned_splat_file
+
+    st = _get_state(req)
+    sess = st.session
+    try:
+        jdir = sess.sandbox.resolve_for_read(f"assets/splats/{job_id}")
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": str(err)}, status_code=400)
+    ply_p = jdir / "splat.ply"
+    if not ply_p.is_file():
+        return JSONResponse({"error": f"splat.ply not found in {job_id}"}, status_code=404)
+    splat_p = jdir / "splat.splat"
+    try:
+        info = await asyncio.to_thread(ensure_aligned_splat_file, ply_p, splat_p)
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": str(err)}, status_code=400)
+
+    return JSONResponse({
+        "ok": True,
+        "job_id": job_id,
+        "splat_url": st.media_url_for(splat_p),
+        "ply_url": st.media_url_for(ply_p),
+        "ply_rel": sess.sandbox.rel(ply_p).replace("\\", "/"),
+        **info,
+    })
+
+
+@router.post("/splats/upload")
+async def api_splats_upload(req: Request, filename: str = "") -> JSONResponse:
+    """Upload a local `.ply` or `.splat` file into `assets/splats/imported_<stem>_<ts>/` for FPS editing."""
+    from blenderbot.splats.splat_edit import (
+        parse_ply_gaussians,
+        ply_data_to_splat_bytes,
+        splat_bytes_to_ply_bytes,
+    )
+
+    st = _get_state(req)
+    sess = st.session
+    raw_name = filename.strip() or str(req.headers.get("X-Filename") or "uploaded.ply").strip()
+    clean_name = _SAFE_FILENAME_RE.sub("_", Path(raw_name).name)
+    ext = Path(clean_name).suffix.lower()
+    if ext not in (".ply", ".splat"):
+        return JSONResponse(
+            {"error": f"Unsupported splat file '{ext}'. Drop a binary 3DGS .ply or .splat file."},
+            status_code=400,
+        )
+
+    data = await req.body()
+    if not data:
+        return JSONResponse({"error": "Empty upload body"}, status_code=400)
+    if len(data) > 350 * 1024 * 1024:
+        return JSONResponse({"error": "Splat file exceeds 350 MB limit"}, status_code=413)
+
+    stem = _SAFE_FILENAME_RE.sub("_", Path(clean_name).stem)[:28].strip("_") or "splat"
+    stamp = datetime.datetime.now().strftime("%H%M%S")
+    h4 = hashlib.sha1(f"{stem}:{time.time()}".encode()).hexdigest()[:4]
+    job_id = f"imported_{stem}_{stamp}_{h4}"
+    out_dir = sess.cfg.cwd / "assets" / "splats" / job_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ply_p = out_dir / "splat.ply"
+    splat_p = out_dir / "splat.splat"
+
+    try:
+        if ext == ".ply":
+            parsed = await asyncio.to_thread(parse_ply_gaussians, data)
+            n_g = len(parsed["data"])
+            splat_b = await asyncio.to_thread(
+                ply_data_to_splat_bytes, parsed["props"], parsed["data"], max_gaussians=350_000
+            )
+            ply_p.write_bytes(data)
+            splat_p.write_bytes(splat_b)
+        else:
+            ply_b, n_g = await asyncio.to_thread(splat_bytes_to_ply_bytes, data)
+            ply_p.write_bytes(ply_b)
+            splat_p.write_bytes(data[: 350_000 * 32])
+    except Exception as err:  # noqa: BLE001
+        shutil.rmtree(out_dir, ignore_errors=True)
+        return JSONResponse({"error": f"Failed to parse {clean_name}: {err}"}, status_code=400)
+
+    rec = st.new_splat_job(
+        job_id=job_id,
+        source_mode="upload",
+        source_label=clean_name,
+        gpu="LOCAL",
+        iterations=0,
+    )
+    rec.stage = "completed"
+    rec.n_gaussians = n_g
+    rec.ply_rel = sess.sandbox.rel(ply_p).replace("\\", "/")
+    rec.splat_url = st.media_url_for(splat_p)
+    sess.bus.publish("splat-job", rec.to_dict())
+    return JSONResponse({"ok": True, "job": rec.to_dict()})
+
+
+@router.post("/splats/edit/apply")
+async def api_splats_edit_apply(req: Request) -> JSONResponse:
+    """Persist FPS Splat culling, AABB crop, smart-filter & paint edits to `.ply` + `.splat` (+ Blender)."""
+    from blenderbot.splats.splat_edit import (
+        apply_splat_edits,
+        build_default_cube_splat,
+    )
+
+    st = _get_state(req)
+    sess = st.session
+    body = await req.json()
+
+    raw_job_id = str(body.get("job_id") or "").strip()
+    save_as_name = str(body.get("save_as_name") or "").strip()
+    sync_bl = bool(body.get("sync_blender", False))
+    render_mode = str(body.get("render_mode") or "ellipsoids_viewport").strip().lower()
+
+    if save_as_name or not raw_job_id or raw_job_id.startswith("__default_"):
+        stem = _SAFE_FILENAME_RE.sub("_", save_as_name or raw_job_id.strip("_") or "edited_splat")[:26].strip("_")
+        stamp = datetime.datetime.now().strftime("%H%M%S")
+        h4 = hashlib.sha1(f"{stem}:{time.time()}".encode()).hexdigest()[:4]
+        target_job_id = f"{stem}_{stamp}_{h4}"
+        target_dir = sess.cfg.cwd / "assets" / "splats" / target_job_id
+        target_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        target_job_id = raw_job_id
+        target_dir = sess.cfg.cwd / "assets" / "splats" / target_job_id
+
+    if not raw_job_id or raw_job_id.startswith("__default_"):
+        variant = "cube" if "cube" in raw_job_id and "courtyard" not in raw_job_id else "courtyard"
+        ply_b, splat_b, _ = await asyncio.to_thread(build_default_cube_splat, variant)
+        src_ply = target_dir / "splat.ply"
+        src_splat = target_dir / "splat.splat"
+        src_ply.write_bytes(ply_b)
+        src_splat.write_bytes(splat_b)
+    else:
+        src_dir = sess.sandbox.resolve_for_read(f"assets/splats/{raw_job_id}")
+        src_ply = src_dir / "splat.ply"
+        src_splat = src_dir / "splat.splat"
+        if not src_ply.is_file():
+            return JSONResponse({"error": f"splat.ply not found for {raw_job_id}"}, status_code=404)
+        if target_dir != src_dir:
+            cam_src = src_dir / "cameras.json"
+            if cam_src.is_file():
+                shutil.copy2(cam_src, target_dir / "cameras.json")
+
+    dst_ply = target_dir / "splat.ply"
+    dst_splat = target_dir / "splat.splat"
+
+    try:
+        res = await asyncio.to_thread(
+            apply_splat_edits,
+            src_ply,
+            src_splat,
+            body,
+            out_ply_path=dst_ply,
+            out_splat_path=dst_splat,
+            backup_orig=(dst_ply == src_ply),
+        )
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": str(err)}, status_code=400)
+
+    rec = st.splat_jobs.get(target_job_id)
+    if rec is None:
+        rec = st.new_splat_job(
+            job_id=target_job_id,
+            source_mode="edited",
+            source_label=f"Edited {raw_job_id or 'Default Cube'}",
+            gpu="LOCAL",
+            iterations=0,
+        )
+        rec.stage = "completed"
+    rec.n_gaussians = int(res["n_after"])
+    rec.ply_rel = sess.sandbox.rel(dst_ply).replace("\\", "/")
+    rec.splat_url = st.media_url_for(dst_splat)
+    sess.bus.publish("splat-job", rec.to_dict())
+
+    bl_imported = None
+    if sync_bl:
+        if sess.transport is None:
+            await sess.maybe_auto_connect_blender()
+        if sess.transport is not None:
+            cam_p = target_dir / "cameras.json"
+            imp_params: dict[str, Any] = {
+                "filepath": str(dst_ply),
+                "name": f"Splat_{target_job_id[:20]}",
+                "render_mode": render_mode,
+                "max_points": 350_000,
+                "shadow_catcher_ground": False,
+            }
+            if cam_p.is_file():
+                imp_params["cameras_json"] = str(cam_p)
+            bl_imported = await sess.transport.call("splat.import", imp_params, timeout=180.0)
+            sess.bus.publish("blender-changed", bl_imported)
+
+    return JSONResponse({
+        "ok": True,
+        "job_id": target_job_id,
+        "ply_rel": rec.ply_rel,
+        "ply_url": st.media_url_for(dst_ply),
+        "splat_url": rec.splat_url,
+        "blender_imported": bl_imported,
+        **res,
+    })
+
+
+@router.post("/splats/edit/restore/{job_id}")
+async def api_splats_edit_restore(req: Request, job_id: str) -> JSONResponse:
+    """Restore unedited `splat.orig.ply` backup for `job_id`."""
+    from blenderbot.splats.splat_edit import restore_original_ply
+
+    st = _get_state(req)
+    sess = st.session
+    try:
+        jdir = sess.sandbox.resolve_for_read(f"assets/splats/{job_id}")
+        res = await asyncio.to_thread(restore_original_ply, jdir)
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": str(err)}, status_code=400)
+
+    splat_p = jdir / "splat.splat"
+    rec = st.splat_jobs.get(job_id)
+    if rec is not None:
+        rec.n_gaussians = int(res["restored_gaussians"])
+        rec.splat_url = st.media_url_for(splat_p)
+        sess.bus.publish("splat-job", rec.to_dict())
+
+    return JSONResponse({
+        "ok": True,
+        "job_id": job_id,
+        "splat_url": st.media_url_for(splat_p),
+        **res,
+    })
+
+
+@router.post("/fps/camera_sync")
+async def api_fps_camera_sync(req: Request) -> JSONResponse:
+    """Push current FPS camera pose (`eye`, `forward`, `roll_deg`, `lens_mm`) directly into Blender 5.3."""
+    from blenderbot.splats.shot_pack import _look_to_opencv_w2c
+    from blenderbot.splats.sim3 import opencv_w2c_to_blender_camera
+
+    st = _get_state(req)
+    sess = st.session
+    if sess.transport is None:
+        ok = await sess.maybe_auto_connect_blender()
+        if not ok or sess.transport is None:
+            return JSONResponse({"error": "Blender 5.3 is not connected."}, status_code=400)
+
+    body = await req.json()
+    eye_raw = body.get("eye") or [0.0, -4.5, 1.65]
+    fwd_raw = body.get("forward") or [0.0, 1.0, 0.0]
+    eye = (float(eye_raw[0]), float(eye_raw[1]), float(eye_raw[2]))
+    fwd = (float(fwd_raw[0]), float(fwd_raw[1]), float(fwd_raw[2]))
+    roll_deg = float(body.get("roll_deg") or 0.0)
+    lens_mm = max(10.0, min(300.0, float(body.get("lens_mm") or 35.0)))
+    cam_name = str(body.get("camera_name") or "FPSDirectorCam").strip() or "FPSDirectorCam"
+    set_active = bool(body.get("set_active", True))
+
+    r_w2c, t_w2c = _look_to_opencv_w2c(eye, fwd, roll_deg=roll_deg)
+    fx = lens_mm * 1280.0 / 36.0
+    bl = opencv_w2c_to_blender_camera(r_w2c, t_w2c, fx, fx, 640.0, 360.0, 1280, 720)
+
+    try:
+        res = await sess.transport.call(
+            "camera.upsert",
+            {
+                "name": cam_name,
+                "location": bl["location"],
+                "rotation_quaternion": bl["rotation_quaternion"],
+                "lens_mm": lens_mm,
+                "set_active": set_active,
+            },
+            timeout=15.0,
+        )
+        return JSONResponse({"ok": True, "camera": res})
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": str(err)}, status_code=400)
+
+
+@router.get("/fps/camera_pull")
+async def api_fps_camera_pull(req: Request, camera: str = "") -> JSONResponse:
+    """Pull active (or named) camera pose from Blender 5.3 into the WebGL2 FPS pawn."""
+    import math as _math
+
+    st = _get_state(req)
+    sess = st.session
+    if sess.transport is None:
+        ok = await sess.maybe_auto_connect_blender()
+        if not ok or sess.transport is None:
+            return JSONResponse({"error": "Blender 5.3 is not connected."}, status_code=400)
+
+    try:
+        pas = await sess.transport.call("scene.passport", {"max_objects": 8}, timeout=10.0)
+        f_cur = int(pas.get("frame_current") or 1)
+        exp = await sess.transport.call(
+            "splat.export_camera_path",
+            {"camera": camera.strip() or None, "frame_start": f_cur, "frame_end": f_cur},
+            timeout=15.0,
+        )
+        doc = exp.get("cameras_doc") or {}
+        cams = doc.get("cameras") or []
+        if not cams:
+            return JSONResponse({"error": "No camera frames returned from Blender."}, status_code=404)
+        c0 = cams[0]
+        r_w2c = c0["R_w2c"]
+        # Row 2 of OpenCV R_w2c is the camera optical forward ray in Blender world space
+        fwd = [float(r_w2c[2][0]), float(r_w2c[2][1]), float(r_w2c[2][2])]
+        yaw_rad = _math.atan2(fwd[0], fwd[1])
+        pitch_rad = _math.asin(max(-1.0, min(1.0, fwd[2])))
+        return JSONResponse({
+            "ok": True,
+            "camera": exp.get("camera"),
+            "eye": c0["location"],
+            "forward": fwd,
+            "yaw_rad": round(yaw_rad, 6),
+            "pitch_rad": round(pitch_rad, 6),
+            "lens_mm": c0["lens_mm"],
+        })
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": str(err)}, status_code=400)
+
+
+@router.get("/fps/blender_scene")
+async def api_fps_blender_scene(req: Request, max_triangles: int = 45000) -> JSONResponse:
+    """Pull live evaluated world-space triangles + colors from Blender 5.3 for FPS navigation."""
+    st = _get_state(req)
+    sess = st.session
+    if sess.transport is None:
+        ok = await sess.maybe_auto_connect_blender()
+        if not ok or sess.transport is None:
+            return JSONResponse({"error": "Blender 5.3 is not connected."}, status_code=400)
+
+    try:
+        res = await sess.transport.call(
+            "scene.viewport_triangles",
+            {"max_triangles": max_triangles},
+            timeout=30.0,
+        )
+        return JSONResponse({"ok": True, **res})
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": str(err)}, status_code=400)
+
+
+@router.post("/fps/spawn_default_cube_blender")
+async def api_fps_spawn_default_cube_blender(req: Request) -> JSONResponse:
+    """Ensure a metric `2m x 2m x 2m` Default Cube on `Z=0` + 3-point lighting exists in Blender 5.3."""
+    st = _get_state(req)
+    sess = st.session
+    if sess.transport is None:
+        ok = await sess.maybe_auto_connect_blender()
+        if not ok or sess.transport is None:
+            return JSONResponse({"error": "Blender 5.3 is not connected."}, status_code=400)
+
+    try:
+        cube = await sess.transport.call(
+            "mesh.primitive",
+            {
+                "name": "DefaultCube",
+                "shape": "cube",
+                "size": 2.0,
+                "location": [0.0, 0.0, 1.0],
+                "color": [0.76, 0.79, 0.84],
+            },
+            timeout=15.0,
+        )
+        await sess.transport.call(
+            "light.rig",
+            {"preset": "three_point", "target": "DefaultCube"},
+            timeout=15.0,
+        )
+        cam = await sess.transport.call(
+            "camera.upsert",
+            {
+                "name": "FPSDirectorCam",
+                "location": [0.0, -5.2, 1.65],
+                "look_at": [0.0, 0.0, 1.0],
+                "lens_mm": 35.0,
+                "set_active": True,
+            },
+            timeout=15.0,
+        )
+        sess.bus.publish("blender-changed", cube)
+        return JSONResponse({"ok": True, "cube": cube, "camera": cam})
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": str(err)}, status_code=400)
 
 
 @router.post("/chat/submit")

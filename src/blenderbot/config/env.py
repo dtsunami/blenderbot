@@ -230,7 +230,7 @@ class Config:
     agents_files: list[str] = field(default_factory=list)
     agents_budget: int | None = None
     role: str = "master"
-    image_model: str = "black-forest-labs/flux.2-pro"
+    image_model: str = "bytedance-seed/seedream-5-5"
     video_model: str = "bytedance/seedance-2.5"
     keys: dict[str, str | None] = field(default_factory=dict)
     key_origins: dict[str, dict[str, str | None]] = field(default_factory=dict)
@@ -481,8 +481,8 @@ def load_config(
         raise ValueError(f'Unknown BLENDERBOT_ROLE="{role}" (expected one of: {", ".join(ROLES)}).')
 
     image_model = (
-        merged.get("BLENDERBOT_IMAGE_MODEL", "black-forest-labs/flux.2-pro").strip()
-        or "black-forest-labs/flux.2-pro"
+        merged.get("BLENDERBOT_IMAGE_MODEL", "bytedance-seed/seedream-5-5").strip()
+        or "bytedance-seed/seedream-5-5"
     )
     video_model = (
         merged.get("BLENDERBOT_VIDEO_MODEL", "bytedance/seedance-2.5").strip()
