@@ -615,6 +615,11 @@ async def api_splats_train(req: Request) -> JSONResponse:
 
     out_dir = cfg.cwd / "assets" / "splats" / job_id
     out_dir.mkdir(parents=True, exist_ok=True)
+    if video_p is not None:
+        (out_dir / "job_source.json").write_text(
+            json.dumps({"video_rel": source_label, "created_at": time.time()}, indent=2),
+            encoding="utf-8",
+        )
     rec = st.new_splat_job(
         job_id=job_id,
         source_mode=source_mode,
@@ -624,28 +629,16 @@ async def api_splats_train(req: Request) -> JSONResponse:
     )
     sess.bus.publish("splat-job", rec.to_dict())
 
-    splat_cfg = SplatConfig()
+    splat_cfg = SplatConfig.from_dict(body)
     splat_cfg.gpu = gpu
     splat_cfg.train.iterations = iterations
     splat_cfg.train.sh_degree = sh_degree
-    if body.get("opa_reg") is not None:
-        splat_cfg.train.opa_reg = max(0.0, float(body["opa_reg"]))
-    if body.get("prune_opa") is not None:
-        splat_cfg.train.prune_opa = max(0.001, min(0.5, float(body["prune_opa"])))
-    if body.get("prune_scale3d") is not None:
-        splat_cfg.train.prune_scale3d = max(0.005, min(1.0, float(body["prune_scale3d"])))
-    if body.get("opacity_reset_every") is not None:
-        splat_cfg.train.opacity_reset_every = max(0, int(body["opacity_reset_every"]))
-    if body.get("densify_until") is not None and int(body["densify_until"]) > 0:
-        splat_cfg.train.densify_until = int(body["densify_until"])
-    else:
+    if body.get("densify_until") is None or int(body.get("densify_until") or 0) <= 0:
         splat_cfg.train.densify_until = max(600, int(iterations * 0.72))
-    if body.get("max_anisotropy") is not None:
-        splat_cfg.train.max_anisotropy = max(2.0, float(body["max_anisotropy"]))
-    if body.get("conf_percentile") is not None:
-        splat_cfg.pose.conf_percentile = max(0.0, min(90.0, float(body["conf_percentile"])))
-    if body.get("pose_backend") in ("vggt", "colmap"):
+    if body.get("pose_backend") in ("vggt", "colmap", "colmap_prior", "known_cameras"):
         splat_cfg.pose.backend = str(body["pose_backend"])
+
+    known_cams_job = str(body.get("known_cameras_job") or "").strip()
 
     def _on_splat_ev(ev: dict[str, Any]) -> None:
         sess.log.flight.touch()
@@ -661,8 +654,12 @@ async def api_splats_train(req: Request) -> JSONResponse:
             rec.total_steps = int(ev.get("total_steps") or rec.total_steps)
             rec.psnr = float(ev.get("psnr") or rec.psnr or 0.0)
             rec.loss = float(ev.get("loss") or rec.loss or 0.0)
+            rec.l1 = float(ev.get("l1") or rec.l1 or 0.0)
+            rec.ssim = float(ev.get("ssim") or rec.ssim or 0.0)
             rec.it_per_sec = float(ev.get("it_per_sec") or rec.it_per_sec or 0.0)
             rec.n_gaussians = int(ev.get("n_gaussians") or rec.n_gaussians)
+            if isinstance(ev.get("stage_timings"), dict):
+                rec.stage_timings = dict(ev["stage_timings"])
             prev_f = out_dir / "previews" / "latest_render.jpg"
             if prev_f.is_file():
                 rec.preview_url = f"{st.media_url_for(prev_f)}&s={rec.step}"
@@ -670,11 +667,37 @@ async def api_splats_train(req: Request) -> JSONResponse:
             if diff_f.is_file():
                 rec.diff_url = f"{st.media_url_for(diff_f)}&s={rec.step}"
         sess.bus.publish("splat-job", rec.to_dict())
+        if ev_kind in ("telemetry", "densify", "surgery", "checkpoint_saved"):
+            scalar_ev = {
+                k: v
+                for k, v in ev.items()
+                if not k.endswith("_b64") and k not in ("ply_gz", "splat_gz", "proxy_glb_gz")
+            }
+            sess.bus.publish("splat-telemetry", scalar_ev)
 
     async def _runner() -> None:
         sess.log.flight.note("splat:start", job_id=job_id, source=source_mode, gpu=gpu)
         try:
             bundle_p: Path | None = None
+            known_json_str: str | None = None
+
+            if source_mode == "video" and known_cams_job:
+                if known_cams_job == "__blender_active__":
+                    if sess.transport is None:
+                        await sess.maybe_auto_connect_blender()
+                    if sess.transport is not None:
+                        exp_c = await sess.transport.call("splat.export_camera_path", {}, timeout=60.0)
+                        known_json_str = json.dumps(exp_c["cameras_doc"])
+                elif known_cams_job.startswith("shot:"):
+                    sh_id = known_cams_job.split(":", 1)[1]
+                    kc_p = sess.sandbox.resolve_for_read(f"assets/shots/{sh_id}/cameras.json")
+                    if kc_p.is_file():
+                        known_json_str = kc_p.read_text(encoding="utf-8")
+                else:
+                    kc_p = sess.sandbox.resolve_for_read(f"assets/splats/{known_cams_job}/cameras.json")
+                    if kc_p.is_file():
+                        known_json_str = kc_p.read_text(encoding="utf-8")
+
             if source_mode == "blender":
                 rec.stage = "capture_views"
                 sess.bus.publish("splat-job", rec.to_dict())
@@ -702,6 +725,7 @@ async def api_splats_train(req: Request) -> JSONResponse:
                 job_id=job_id,
                 video_path=video_p,
                 views_bundle_path=bundle_p,
+                known_cameras_json=known_json_str,
                 cfg=splat_cfg,
                 on_event=_on_splat_ev,
             )
@@ -713,8 +737,12 @@ async def api_splats_train(req: Request) -> JSONResponse:
             rec.elapsed_sec = res.wall_s
             rec.ply_rel = sess.sandbox.rel(res.ply_path).replace("\\", "/")
             rec.cameras_rel = sess.sandbox.rel(res.cameras_path).replace("\\", "/")
+            rec.cameras_url = st.media_url_for(res.cameras_path)
             if res.splat_path and res.splat_path.is_file():
                 rec.splat_url = st.media_url_for(res.splat_path)
+            if res.proxy_glb_path and res.proxy_glb_path.is_file():
+                rec.proxy_glb_rel = sess.sandbox.rel(res.proxy_glb_path).replace("\\", "/")
+                rec.proxy_glb_url = st.media_url_for(res.proxy_glb_path)
             prev_f = out_dir / "previews" / "latest_render.jpg"
             if prev_f.is_file():
                 rec.preview_url = st.media_url_for(prev_f)
@@ -813,6 +841,7 @@ async def api_splats_import(req: Request) -> JSONResponse:
         "max_world_scale": float(body.get("max_world_scale", 0.25)),
         "max_anisotropy": float(body.get("max_anisotropy", 10.0)),
         "shadow_catcher_ground": bool(body.get("shadow_catcher_ground", False)),
+        "import_proxy_mesh": bool(body.get("import_proxy_mesh", False)),
     }
     if import_cameras and cam_p.is_file():
         params["cameras_json"] = str(cam_p)
@@ -891,9 +920,9 @@ async def api_splats_import_cameras(req: Request) -> JSONResponse:
 
 @router.post("/splats/resume")
 async def api_splats_resume(req: Request) -> JSONResponse:
-    """Resume & surgically clean an existing Modal 3DGS job (`prune_opa`, `max_world_scale`, `reset_opacities`)."""
+    """Resume & surgically clean an existing Modal 3DGS job (merging overrides onto saved config!)."""
     from blenderbot.splats.client import run_modal_splat_job
-    from blenderbot.splats.config import SplatConfig, SurgerySpec
+    from blenderbot.splats.config import SurgerySpec
 
     st = _get_state(req)
     sess = st.session
@@ -909,20 +938,27 @@ async def api_splats_resume(req: Request) -> JSONResponse:
     out_dir = cfg.cwd / "assets" / "splats" / job_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    surg = SurgerySpec.from_dict(
-        {
-            "prune_opa": body.get("prune_opa", 0.03),
-            "max_world_scale": body.get("max_world_scale", 0.25),
-            "clamp_log_scale": body.get("clamp_log_scale"),
-            "keep_radius": body.get("keep_radius"),
-            "reset_opacities": body.get("reset_opacities"),
-        }
-    )
+    surg_dict: dict[str, Any] = {}
+    for sk in (
+        "prune_opa",
+        "max_world_scale",
+        "clamp_log_scale",
+        "keep_aabb",
+        "drop_aabb",
+        "keep_radius",
+        "reset_opacities",
+        "densify_now",
+        "lr_scale",
+    ):
+        if body.get(sk) is not None:
+            surg_dict[sk] = body[sk]
+    surg = SurgerySpec.from_dict(surg_dict) if surg_dict else None
 
-    splat_cfg = SplatConfig()
-    splat_cfg.gpu = gpu
-    if body.get("opa_reg") is not None:
-        splat_cfg.train.opa_reg = float(body["opa_reg"])
+    # Only pass explicitly specified overrides so saved `meta.json` settings (e.g. `sh_degree`) survive!
+    cfg_overrides: dict[str, Any] = {"gpu": gpu}
+    for ck in ("opa_reg", "lambda_dssim", "scale_reg", "aniso_reg", "focus_camera", "rasterize_mode", "refine_poses"):
+        if body.get(ck) is not None:
+            cfg_overrides[ck] = body[ck]
 
     rec = st.new_splat_job(
         job_id=job_id,
@@ -936,25 +972,44 @@ async def api_splats_resume(req: Request) -> JSONResponse:
 
     def _on_ev(ev: dict[str, Any]) -> None:
         sess.log.flight.touch()
+        ev_kind = ev.get("event")
         rec.elapsed_sec = time.time() - rec.created_at
-        if ev.get("event") == "telemetry":
+        if ev_kind == "stage":
+            rec.stage = str(ev.get("stage") or rec.stage)
+        elif ev_kind == "telemetry":
             rec.stage = "train"
             rec.step = int(ev.get("step") or rec.step)
             rec.total_steps = int(ev.get("total_steps") or rec.total_steps)
             rec.psnr = float(ev.get("psnr") or rec.psnr)
+            rec.loss = float(ev.get("loss") or rec.loss)
+            rec.l1 = float(ev.get("l1") or rec.l1)
+            rec.ssim = float(ev.get("ssim") or rec.ssim)
             rec.n_gaussians = int(ev.get("n_gaussians") or rec.n_gaussians)
             rec.it_per_sec = float(ev.get("it_per_sec") or rec.it_per_sec)
+            if isinstance(ev.get("stage_timings"), dict):
+                rec.stage_timings = dict(ev["stage_timings"])
             prev_f = out_dir / "previews" / "latest_render.jpg"
             if prev_f.is_file():
                 rec.preview_url = f"{st.media_url_for(prev_f)}&s={rec.step}"
+            diff_f = out_dir / "previews" / "latest_diff.jpg"
+            if diff_f.is_file():
+                rec.diff_url = f"{st.media_url_for(diff_f)}&s={rec.step}"
         sess.bus.publish("splat-job", rec.to_dict())
+        if ev_kind in ("telemetry", "densify", "surgery", "checkpoint_saved"):
+            scalar_ev = {
+                k: v
+                for k, v in ev.items()
+                if not k.endswith("_b64") and k not in ("ply_gz", "splat_gz", "proxy_glb_gz")
+            }
+            sess.bus.publish("splat-telemetry", scalar_ev)
 
     async def _runner() -> None:
         try:
             res = await run_modal_splat_job(
                 output_dir=out_dir,
                 job_id=job_id,
-                cfg=splat_cfg,
+                cfg=None,
+                cfg_overrides=cfg_overrides,
                 add_steps=add_steps,
                 surgery=surg,
                 on_event=_on_ev,
@@ -968,11 +1023,18 @@ async def api_splats_resume(req: Request) -> JSONResponse:
             rec.ply_rel = sess.sandbox.rel(res.ply_path).replace("\\", "/")
             if res.splat_path and res.splat_path.is_file():
                 rec.splat_url = st.media_url_for(res.splat_path)
+            if res.proxy_glb_path and res.proxy_glb_path.is_file():
+                rec.proxy_glb_rel = sess.sandbox.rel(res.proxy_glb_path).replace("\\", "/")
+                rec.proxy_glb_url = st.media_url_for(res.proxy_glb_path)
             prev_f = out_dir / "previews" / "latest_render.jpg"
             if prev_f.is_file():
                 rec.preview_url = st.media_url_for(prev_f)
             sess.agent.run_cost += res.cost_usd
             sess.agent.stats["cost"] += res.cost_usd
+            sess.bus.publish("splat-job", rec.to_dict())
+        except asyncio.CancelledError:
+            rec.stage = "cancelled"
+            rec.error = "Cancelled by operator"
             sess.bus.publish("splat-job", rec.to_dict())
         except Exception as err:  # noqa: BLE001
             rec.stage = "failed"
@@ -981,6 +1043,662 @@ async def api_splats_resume(req: Request) -> JSONResponse:
 
     rec.task = asyncio.create_task(_runner())
     return JSONResponse({"ok": True, "job": rec.to_dict()}, status_code=202)
+
+
+@router.post("/splats/cancel/{job_id}")
+async def api_splats_cancel(req: Request, job_id: str) -> JSONResponse:
+    """Stop a running Modal 3DGS job cleanly (`stop_early` exports `.ply`) or cancel immediately."""
+    from blenderbot.splats.client import push_modal_splat_control
+
+    st = _get_state(req)
+    body = await req.json() if req.headers.get("content-type", "").startswith("application/json") else {}
+    hard = bool((body or {}).get("hard", False))
+    rec = st.splat_jobs.get(job_id)
+
+    try:
+        await push_modal_splat_control(job_id, {"stop_early": True, "paused": False})
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+    if rec is not None and (hard or rec.stage in ("queued", "capture_views", "starting_gpu")):
+        if rec.task and not rec.task.done():
+            rec.task.cancel()
+        rec.stage = "cancelled"
+        st.session.bus.publish("splat-job", rec.to_dict())
+    return JSONResponse({"ok": True, "job_id": job_id})
+
+
+@router.post("/splats/control/{job_id}")
+async def api_splats_control(req: Request, job_id: str) -> JSONResponse:
+    """Push mid-training live `tt-splat` parameter & surgery updates to Modal (`blenderbot-splat-ctl`)."""
+    from blenderbot.splats.client import push_modal_splat_control
+
+    st = _get_state(req)
+    body = await req.json()
+    allowed = {
+        "paused",
+        "stop_early",
+        "save_checkpoint",
+        "lambda_dssim",
+        "opa_reg",
+        "scale_reg",
+        "aniso_reg",
+        "lr_scale",
+        "focus_camera",
+        "prune_opa",
+        "clamp_log_scale",
+        "reset_opacities",
+        "max_world_scale",
+    }
+    updates = {k: v for k, v in body.items() if k in allowed}
+    if not updates:
+        return JSONResponse({"error": "No valid control fields provided"}, status_code=400)
+
+    merged = await push_modal_splat_control(job_id, updates)
+    rec = st.splat_jobs.get(job_id)
+    if rec is not None and "paused" in updates:
+        rec.stage = "paused" if updates["paused"] else "train"
+        st.session.bus.publish("splat-job", rec.to_dict())
+    return JSONResponse({"ok": True, "control": merged})
+
+
+@router.get("/splats/telemetry/{job_id}")
+async def api_splats_telemetry(req: Request, job_id: str) -> JSONResponse:
+    """Hydrate complete multi-burst `tt-splat` telemetry series, densify/surgery markers & snapshots."""
+    st = _get_state(req)
+    sess = st.session
+    try:
+        jdir = sess.sandbox.resolve_for_read(f"assets/splats/{job_id}")
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": str(err)}, status_code=400)
+    if not jdir.is_dir():
+        return JSONResponse({"error": f"Splat job not found: {job_id}"}, status_code=404)
+
+    telem_p = jdir / "telemetry.jsonl"
+    ticks: list[dict[str, Any]] = []
+    densify_events: list[dict[str, Any]] = []
+    surgery_events: list[dict[str, Any]] = []
+    stages: list[dict[str, Any]] = []
+
+    if telem_p.is_file():
+        for ln in telem_p.read_text(encoding="utf-8", errors="ignore").splitlines():
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                row = json.loads(ln)
+            except ValueError:
+                continue
+            ev_t = row.get("event")
+            if ev_t == "telemetry":
+                ticks.append(row)
+            elif ev_t == "densify":
+                densify_events.append(row)
+            elif ev_t == "surgery":
+                surgery_events.append(row)
+            elif ev_t in ("stage", "done", "checkpoint_saved"):
+                stages.append(row)
+
+    snap_dir = jdir / "snapshots"
+    snapshots: list[dict[str, Any]] = []
+    if snap_dir.is_dir():
+        for sp in sorted(snap_dir.glob("step_*.jpg")):
+            digits = "".join(c for c in sp.stem if c.isdigit())
+            s_num = int(digits) if digits else 0
+            snapshots.append({"step": s_num, "name": sp.name, "url": st.media_url_for(sp)})
+
+    cam_names: list[str] = []
+    cam_p = jdir / "cameras.json"
+    if cam_p.is_file():
+        try:
+            cdoc = json.loads(cam_p.read_text(encoding="utf-8"))
+            cam_names = [str(c.get("image_name") or "") for c in (cdoc.get("cameras") or []) if c.get("image_name")]
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+    proxy_p = jdir / "proxy_collision.glb"
+    return JSONResponse({
+        "job_id": job_id,
+        "ticks": ticks,
+        "densify_events": densify_events,
+        "surgery_events": surgery_events,
+        "stages": stages,
+        "snapshots": snapshots,
+        "cameras": cam_names,
+        "has_proxy_glb": proxy_p.is_file(),
+        "proxy_glb_url": st.media_url_for(proxy_p) if proxy_p.is_file() else None,
+    })
+
+
+@router.post("/splats/crop_box")
+async def api_splats_crop_box(req: Request) -> JSONResponse:
+    """Spawn or read `SplatCropBox` in Blender 5.3, or trigger 1-click surgical box cull/keep + heal."""
+    from blenderbot.splats.client import run_modal_splat_job
+    from blenderbot.splats.config import SurgerySpec
+
+    st = _get_state(req)
+    sess = st.session
+    if sess.transport is None:
+        ok = await sess.maybe_auto_connect_blender()
+        if not ok or sess.transport is None:
+            return JSONResponse({"error": "Blender 5.3 is not connected."}, status_code=400)
+
+    body = await req.json()
+    action = str(body.get("action") or "spawn").strip().lower()
+    box_name = str(body.get("name") or "SplatCropBox")
+
+    if action in ("spawn", "read"):
+        try:
+            res = await sess.transport.call(
+                "splat.crop_box",
+                {
+                    "action": action,
+                    "name": box_name,
+                    "location": body.get("location"),
+                    "dimensions": body.get("dimensions"),
+                },
+                timeout=30.0,
+            )
+            sess.bus.publish("blender-changed", res)
+            return JSONResponse({"ok": True, "crop_box": res})
+        except Exception as err:  # noqa: BLE001
+            return JSONResponse({"error": str(err)}, status_code=400)
+
+    # `cull_heal` (`drop_aabb`) or `keep_heal` (`keep_aabb`)
+    job_id = str(body.get("job_id") or "").strip()
+    if not job_id:
+        return JSONResponse({"error": "Select a splat job_id to surgically heal."}, status_code=400)
+
+    try:
+        box_info = await sess.transport.call(
+            "splat.crop_box", {"action": "read", "name": box_name}, timeout=30.0
+        )
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": f"Read SplatCropBox failed: {err}"}, status_code=400)
+
+    bmin, bmax = box_info["bounds_min"], box_info["bounds_max"]
+    add_steps = max(200, min(10_000, int(body.get("add_steps") or 1500)))
+    gpu = str(body.get("gpu") or "H100").upper()
+    out_dir = sess.cfg.cwd / "assets" / "splats" / job_id
+
+    surg_key = "keep_aabb" if action == "keep_heal" else "drop_aabb"
+    surg = SurgerySpec.from_dict({surg_key: [bmin, bmax], "prune_opa": body.get("prune_opa", 0.025)})
+
+    rec = st.new_splat_job(
+        job_id=job_id,
+        source_mode="resume",
+        source_label=f"CropBox {surg_key} {job_id} (+{add_steps})",
+        gpu=gpu,
+        iterations=add_steps,
+    )
+    rec.stage = "resuming"
+    sess.bus.publish("splat-job", rec.to_dict())
+
+    async def _box_runner() -> None:
+        try:
+            res = await run_modal_splat_job(
+                output_dir=out_dir,
+                job_id=job_id,
+                cfg=None,
+                cfg_overrides={"gpu": gpu},
+                add_steps=add_steps,
+                surgery=surg,
+                on_event=lambda ev: (
+                    sess.log.flight.touch(),
+                    setattr(rec, "step", int(ev.get("step") or rec.step)) if ev.get("event") == "telemetry" else None,
+                    setattr(rec, "psnr", float(ev.get("psnr") or rec.psnr)) if ev.get("event") == "telemetry" else None,
+                    setattr(rec, "n_gaussians", int(ev.get("n_gaussians") or rec.n_gaussians)) if ev.get("event") == "telemetry" else None,
+                    sess.bus.publish("splat-job", rec.to_dict()),
+                ),
+            )
+            rec.stage = "completed"
+            rec.step = res.step
+            rec.total_steps = res.step
+            rec.n_gaussians = res.n_gaussians
+            rec.cost_usd = res.cost_usd
+            rec.elapsed_sec = res.wall_s
+            if res.splat_path and res.splat_path.is_file():
+                rec.splat_url = st.media_url_for(res.splat_path)
+            sess.agent.run_cost += res.cost_usd
+            sess.agent.stats["cost"] += res.cost_usd
+            sess.bus.publish("splat-job", rec.to_dict())
+        except Exception as err:  # noqa: BLE001
+            rec.stage = "failed"
+            rec.error = str(err)
+            sess.bus.publish("splat-job", rec.to_dict())
+
+    rec.task = asyncio.create_task(_box_runner())
+    return JSONResponse({"ok": True, "crop_box": box_info, "job": rec.to_dict()}, status_code=202)
+
+
+@router.post("/splats/proxy/{job_id}")
+async def api_splats_proxy(req: Request, job_id: str) -> JSONResponse:
+    """Build `proxy_collision.glb` (Surface-Nets iso-mesh) from `splat.ply` and optionally import to Blender."""
+    from blenderbot.splats.proxy_mesh import extract_proxy_glb_from_ply
+
+    st = _get_state(req)
+    sess = st.session
+    body = await req.json() if req.headers.get("content-type", "").startswith("application/json") else {}
+    jdir = sess.sandbox.resolve_for_read(f"assets/splats/{job_id}")
+    ply_p = jdir / "splat.ply"
+    if not ply_p.is_file():
+        return JSONResponse({"error": f"splat.ply not found in {job_id}"}, status_code=404)
+
+    glb_p = jdir / "proxy_collision.glb"
+    grid_res = int((body or {}).get("grid_res") or 48)
+    stats: dict[str, Any] = {}
+    if not glb_p.is_file() or bool((body or {}).get("rebuild", False)):
+        stats = await asyncio.to_thread(
+            extract_proxy_glb_from_ply, ply_p, glb_p, grid_res=grid_res
+        )
+
+    imported = None
+    if bool((body or {}).get("import_blender", True)):
+        if sess.transport is None:
+            await sess.maybe_auto_connect_blender()
+        if sess.transport is not None:
+            imported = await sess.transport.call(
+                "asset.import",
+                {"filepath": str(glb_p), "collection": "SplatProxies"},
+                timeout=60.0,
+            )
+            sess.bus.publish("blender-changed", imported)
+
+    return JSONResponse({
+        "ok": True,
+        "job_id": job_id,
+        "proxy_glb_rel": sess.sandbox.rel(glb_p).replace("\\", "/"),
+        "proxy_glb_url": st.media_url_for(glb_p),
+        "stats": stats,
+        "imported": imported,
+    })
+
+
+@router.post("/splats/camera_prompt")
+async def api_splats_camera_prompt(req: Request) -> JSONResponse:
+    """Read active Blender 5.3 camera animation and compile an optical Seedance 2.5 prompt directive."""
+    st = _get_state(req)
+    sess = st.session
+    if sess.transport is None:
+        ok = await sess.maybe_auto_connect_blender()
+        if not ok or sess.transport is None:
+            return JSONResponse({"error": "Blender 5.3 is not connected."}, status_code=400)
+    body = await req.json() if req.headers.get("content-type", "").startswith("application/json") else {}
+    try:
+        res = await sess.transport.call(
+            "splat.export_camera_path",
+            {"camera": (body or {}).get("camera")},
+            timeout=45.0,
+        )
+        res.pop("cameras_doc", None)
+        return JSONResponse({"ok": True, **res})
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": str(err)}, status_code=400)
+
+
+def _build_job_trajectory_sync(st: WebState, job_id: str) -> tuple[dict[str, Any], Path | None]:
+    from blenderbot.media_gen.seedance import probe_media_info
+    from blenderbot.server.state import resolve_source_video_for_job
+    from blenderbot.splats.sim3 import interpolate_camera_trajectory
+
+    cwd = st.session.cfg.cwd
+    jdir = st.session.sandbox.resolve_for_read(f"assets/splats/{job_id}")
+    cam_p = jdir / "cameras.json"
+    if not cam_p.is_file():
+        raise FileNotFoundError(f"cameras.json not found for {job_id}")
+
+    cdoc = json.loads(cam_p.read_text(encoding="utf-8"))
+    src_vid = resolve_source_video_for_job(cwd, job_id)
+    fps_ov: float | None = None
+    dur_ov: float | None = None
+    w_ov: int | None = None
+    h_ov: int | None = None
+
+    if src_vid is not None and not cdoc.get("video_meta"):
+        vinfo = probe_media_info(src_vid)
+        fps_ov = float(vinfo["fps"]) if vinfo.get("fps") else 24.0
+        dur_ov = float(vinfo["duration_sec"]) if vinfo.get("duration_sec") else None
+        w_ov = int(vinfo["width"]) if vinfo.get("width") else None
+        h_ov = int(vinfo["height"]) if vinfo.get("height") else None
+
+    traj = interpolate_camera_trajectory(
+        cdoc,
+        fps=fps_ov,
+        duration_sec=dur_ov,
+        target_width=w_ov,
+        target_height=h_ov,
+    )
+    (jdir / "poses_timeline.json").write_text(json.dumps(traj), encoding="utf-8")
+    return traj, src_vid
+
+
+@router.get("/splats/trajectory/{job_id}")
+async def api_splats_trajectory(req: Request, job_id: str) -> JSONResponse:
+    """Return full-rate interpolated camera path, Yaw/Pitch/Roll/Speed telemetry, markers & synced clip URLs."""
+    st = _get_state(req)
+    sess = st.session
+    try:
+        traj, src_vid = await asyncio.to_thread(_build_job_trajectory_sync, st, job_id)
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": str(err)}, status_code=400)
+
+    jdir = sess.cfg.cwd / "assets" / "splats" / job_id
+    modal_mp4 = jdir / "renders" / "modal_recreated.mp4"
+    blender_mp4 = jdir / "renders" / "blender_recreated.mp4"
+
+    return JSONResponse({
+        "ok": True,
+        "job_id": job_id,
+        "trajectory": traj,
+        "source_video_url": st.media_url_for(src_vid) if src_vid and src_vid.is_file() else None,
+        "source_video_rel": sess.sandbox.rel(src_vid).replace("\\", "/") if src_vid and src_vid.is_file() else None,
+        "modal_render_url": st.media_url_for(modal_mp4) if modal_mp4.is_file() else None,
+        "blender_render_url": st.media_url_for(blender_mp4) if blender_mp4.is_file() else None,
+    })
+
+
+@router.post("/splats/render")
+async def api_splats_render(req: Request) -> JSONResponse:
+    """Render recreated video camera path (either farmed to Modal H100 `gsplat` OR via Blender 5.3 EEVEE)."""
+    from blenderbot.splats.client import run_modal_splat_render
+    from blenderbot.splats.sim3 import interpolate_camera_trajectory
+
+    st = _get_state(req)
+    sess = st.session
+    body = await req.json()
+    job_id = str(body.get("job_id") or "").strip()
+    if not job_id:
+        return JSONResponse({"error": "Missing job_id"}, status_code=400)
+
+    mode = str(body.get("mode") or "modal").strip().lower()
+    gpu = str(body.get("gpu") or "H100").strip().upper()
+    bl_cam_override = str(body.get("blender_camera") or "").strip()
+    jdir = sess.sandbox.resolve_for_read(f"assets/splats/{job_id}")
+    ply_p = jdir / "splat.ply"
+    renders_dir = jdir / "renders"
+    renders_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        if bl_cam_override:
+            if sess.transport is None:
+                await sess.maybe_auto_connect_blender()
+            if sess.transport is None:
+                return JSONResponse({"error": "Blender 5.3 is not connected."}, status_code=400)
+            exp_c = await sess.transport.call(
+                "splat.export_camera_path", {"camera": bl_cam_override}, timeout=60.0
+            )
+            traj = interpolate_camera_trajectory(exp_c["cameras_doc"])
+        else:
+            traj, _ = await asyncio.to_thread(_build_job_trajectory_sync, st, job_id)
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": str(err)}, status_code=400)
+
+    if mode == "modal":
+        out_mp4 = renders_dir / "modal_recreated.mp4"
+        sess.bus.publish(
+            "splat-render",
+            {"job_id": job_id, "mode": "modal", "stage": "starting", "total_frames": traj["total_frames"]},
+        )
+        try:
+            r_res = await run_modal_splat_render(
+                job_id=job_id,
+                output_mp4=out_mp4,
+                trajectory_doc=traj,
+                ply_fallback_path=ply_p if ply_p.is_file() else None,
+                gpu=gpu,
+                on_event=lambda ev: (
+                    sess.log.flight.touch(),
+                    sess.bus.publish("splat-render", {"job_id": job_id, "mode": "modal", **ev}),
+                ),
+            )
+            sess.agent.run_cost += r_res.cost_usd
+            sess.agent.stats["cost"] += r_res.cost_usd
+            url = st.media_url_for(out_mp4)
+            sess.bus.publish("workspace-media-added", {"path": sess.sandbox.rel(out_mp4)})
+            return JSONResponse({
+                "ok": True,
+                "mode": "modal",
+                "job_id": job_id,
+                "url": url,
+                "frames": r_res.frames,
+                "fps": r_res.fps,
+                "render_fps": r_res.render_fps,
+                "wall_s": r_res.wall_s,
+                "cost_usd": r_res.cost_usd,
+            })
+        except Exception as err:  # noqa: BLE001
+            return JSONResponse({"error": str(err)}, status_code=400)
+
+    # `mode == "blender"`: Render matching camera path clip directly inside Blender 5.3 (`BLENDER_EEVEE`)
+    if sess.transport is None:
+        ok = await sess.maybe_auto_connect_blender()
+        if not ok or sess.transport is None:
+            return JSONResponse({"error": "Blender 5.3 is not connected."}, status_code=400)
+
+    out_mp4 = renders_dir / "blender_recreated.mp4"
+    try:
+        # Write full-rate interpolated cameras doc so Blender's SeedanceSourceCam matches every single frame 1:1
+        synced_cam_json = renders_dir / "cameras_fullrate.json"
+        synced_cam_json.write_text(
+            json.dumps({
+                "job_id": job_id,
+                "coordinate_system": "BLENDER_RIGHT_HANDED_Z_UP",
+                "pose_backend": traj.get("pose_backend", "vggt"),
+                "video_meta": {
+                    "fps": traj["fps"],
+                    "duration_sec": traj["duration_sec"],
+                    "total_frames": traj["total_frames"],
+                    "width": traj["width"],
+                    "height": traj["height"],
+                },
+                "cameras": [
+                    {
+                        "frame_index": i,
+                        "timeline_frame": f["frame"],
+                        "pts_sec": f["pts_sec"],
+                        "location": f["location"],
+                        "rotation_quaternion": f["rotation_quaternion"],
+                        "lens_mm": f["lens_mm"],
+                        "sensor_width_mm": f["sensor_width_mm"],
+                        "width": f["width"],
+                        "height": f["height"],
+                        "fx": f["fx"],
+                        "fy": f["fy"],
+                        "cx": f["cx"],
+                        "cy": f["cy"],
+                    }
+                    for i, f in enumerate(traj["frames"])
+                ],
+            }),
+            encoding="utf-8",
+        )
+
+        if bool(body.get("ensure_imported", True)) and ply_p.is_file():
+            await sess.transport.call(
+                "splat.import",
+                {
+                    "filepath": str(ply_p),
+                    "cameras_json": str(synced_cam_json),
+                    "name": f"Splat_{job_id[:18]}",
+                    "render_mode": str(body.get("render_mode") or "ellipsoids"),
+                    "max_points": int(body.get("max_points") or 300_000),
+                    "shadow_catcher_ground": False,
+                },
+                timeout=180.0,
+            )
+        elif not bl_cam_override:
+            await sess.transport.call(
+                "splat.import_cameras",
+                {"cameras_json": str(synced_cam_json), "spawn_frustum_rig": False},
+                timeout=60.0,
+            )
+
+        t_bl_0 = time.perf_counter()
+        pb = await sess.transport.call(
+            "render.playblast",
+            {
+                "output_path": str(out_mp4),
+                "camera": bl_cam_override or "SeedanceSourceCam",
+                "engine": str(body.get("engine") or "BLENDER_EEVEE"),
+                "frame_start": 1,
+                "frame_end": int(traj["total_frames"]),
+                "resolution": [int(traj["width"]), int(traj["height"])],
+            },
+            timeout=600.0,
+        )
+        wall_bl = round(time.perf_counter() - t_bl_0, 2)
+        url = st.media_url_for(out_mp4)
+        sess.bus.publish("workspace-media-added", {"path": sess.sandbox.rel(out_mp4)})
+        return JSONResponse({
+            "ok": True,
+            "mode": "blender",
+            "job_id": job_id,
+            "url": url,
+            "frames": int(traj["total_frames"]),
+            "fps": traj["fps"],
+            "wall_s": wall_bl,
+            "playblast": pb,
+        })
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": str(err)}, status_code=400)
+
+
+@router.get("/shots/list")
+async def api_shots_list(req: Request) -> JSONResponse:
+    """List exported FPS Camera Rail & Spatial Brief packs (`assets/shots/*`)."""
+    st = _get_state(req)
+    shots_root = st.session.cfg.cwd / "assets" / "shots"
+    items: list[dict[str, Any]] = []
+    if shots_root.is_dir():
+        for d in sorted(shots_root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)[:40]:
+            bj = d / "brief.json"
+            if d.is_dir() and bj.is_file():
+                try:
+                    info = json.loads(bj.read_text(encoding="utf-8"))
+                    info["brief_rel"] = f"assets/shots/{d.name}/brief.md"
+                    info["usda_rel"] = f"assets/shots/{d.name}/shot.usda"
+                    items.append(info)
+                except Exception:  # noqa: BLE001, S110
+                    pass
+    return JSONResponse({"shots": items})
+
+
+@router.post("/shots/export")
+async def api_shots_export(req: Request) -> JSONResponse:
+    """Export an FPS / Minecraft Camera Rail + Subject Track + Voxel Blockout + Spatial Brief Pack."""
+    from blenderbot.splats.client import run_modal_splat_render
+    from blenderbot.splats.shot_pack import export_shot_collateral_pack, make_shot_id
+
+    st = _get_state(req)
+    sess = st.session
+    body = await req.json()
+
+    shot_id = str(body.get("shot_id") or "").strip() or make_shot_id(str(body.get("name") or "rail"))
+    shot_dir = sess.cfg.cwd / "assets" / "shots" / shot_id
+    splat_job_id = str(body.get("splat_job_id") or "").strip() or None
+
+    try:
+        brief_info = await asyncio.to_thread(
+            export_shot_collateral_pack,
+            shot_dir=shot_dir,
+            shot_id=shot_id,
+            cam_nodes=list(body.get("cam_nodes") or []),
+            subject_nodes=list(body.get("subject_nodes") or []),
+            track_subject=bool(body.get("track_subject", False)),
+            voxels=list(body.get("voxels") or []),
+            pings=list(body.get("pings") or []),
+            splat_job_id=splat_job_id,
+            task=str(body.get("task") or ""),
+            duration_sec=float(body.get("duration_sec") or 5.0),
+            fps=float(body.get("fps") or 24.0),
+            width=int(body.get("width") or 1280),
+            height=int(body.get("height") or 720),
+            grounded_walk=bool(body.get("grounded_walk", False)),
+            first_frame_b64=body.get("first_frame_b64"),
+            last_frame_b64=body.get("last_frame_b64"),
+        )
+    except Exception as err:  # noqa: BLE001
+        return JSONResponse({"error": str(err)}, status_code=400)
+
+    first_p = shot_dir / "first_frame.png"
+    last_p = shot_dir / "last_frame.png"
+    usda_p = shot_dir / "shot.usda"
+    cams_p = shot_dir / "cameras.json"
+    glb_p = shot_dir / "blockout.glb"
+    brief_p = shot_dir / "brief.md"
+
+    out_payload: dict[str, Any] = {
+        "ok": True,
+        "shot_id": shot_id,
+        "shot_dir_rel": f"assets/shots/{shot_id}",
+        "brief": brief_info,
+        "brief_rel": f"assets/shots/{shot_id}/brief.md",
+        "usda_rel": f"assets/shots/{shot_id}/shot.usda",
+        "usda_url": st.media_url_for(usda_p),
+        "cameras_rel": f"assets/shots/{shot_id}/cameras.json",
+        "first_frame_rel": f"assets/shots/{shot_id}/first_frame.png" if first_p.is_file() else None,
+        "first_frame_url": st.media_url_for(first_p) if first_p.is_file() else None,
+        "last_frame_rel": f"assets/shots/{shot_id}/last_frame.png" if last_p.is_file() else None,
+        "last_frame_url": st.media_url_for(last_p) if last_p.is_file() else None,
+    }
+    sess.bus.publish("workspace-media-added", {"path": f"assets/shots/{shot_id}"})
+
+    # Optional immediate action: `"sync_blender"` or `"render_modal"`
+    action = str(body.get("action") or "").strip().lower()
+    if action == "sync_blender":
+        if sess.transport is None:
+            await sess.maybe_auto_connect_blender()
+        if sess.transport is None:
+            return JSONResponse({"error": "Shot exported, but Blender 5.3 is not connected."}, status_code=400)
+        try:
+            imp_cam = await sess.transport.call(
+                "splat.import_cameras",
+                {"cameras_json": str(cams_p), "name": "DirectorRailCam", "spawn_frustum_rig": True},
+                timeout=60.0,
+            )
+            imp_glb = None
+            if glb_p.is_file():
+                imp_glb = await sess.transport.call(
+                    "asset.import",
+                    {"filepath": str(glb_p), "collection": f"Blockout_{shot_id[:14]}"},
+                    timeout=60.0,
+                )
+            sess.bus.publish("blender-changed", imp_cam)
+            out_payload["blender_synced"] = {"camera": imp_cam, "blockout": imp_glb}
+            if bool(body.get("send_brief_to_agent", False)):
+                prompt_msg = (
+                    f"Read the spatial shot brief @{sess.sandbox.rel(brief_p)} "
+                    f"(camera `DirectorRailCam` and voxel blockout are already imported into Blender 5.3) "
+                    "and execute the requested 3D scene tasks."
+                )
+                asyncio.create_task(st.submit_fn(prompt_msg, "web"))
+        except Exception as err:  # noqa: BLE001
+            return JSONResponse({"error": f"Blender sync failed: {err}", **out_payload}, status_code=400)
+
+    elif action == "render_modal" and splat_job_id:
+        traj = json.loads((shot_dir / "poses_timeline.json").read_text(encoding="utf-8"))
+        ply_fb = sess.cfg.cwd / "assets" / "splats" / splat_job_id / "splat.ply"
+        out_mp4 = shot_dir / "modal_rail_render.mp4"
+        try:
+            r_res = await run_modal_splat_render(
+                job_id=splat_job_id,
+                output_mp4=out_mp4,
+                trajectory_doc=traj,
+                ply_fallback_path=ply_fb if ply_fb.is_file() else None,
+                gpu=str(body.get("gpu") or "H100"),
+            )
+            sess.agent.run_cost += r_res.cost_usd
+            sess.agent.stats["cost"] += r_res.cost_usd
+            out_payload["modal_render_url"] = st.media_url_for(out_mp4)
+            out_payload["modal_render_rel"] = f"assets/shots/{shot_id}/modal_rail_render.mp4"
+            out_payload["render_fps"] = r_res.render_fps
+            out_payload["wall_s"] = r_res.wall_s
+            out_payload["cost_usd"] = r_res.cost_usd
+            sess.bus.publish("workspace-media-added", {"path": out_payload["modal_render_rel"]})
+        except Exception as err:  # noqa: BLE001
+            return JSONResponse({"error": f"Modal rail render failed: {err}", **out_payload}, status_code=400)
+
+    return JSONResponse(out_payload)
 
 
 @router.post("/chat/submit")

@@ -1053,6 +1053,14 @@ def _import_cameras_json(
     if not cams:
         return {"imported": False}
 
+    vmeta = doc.get("video_meta") or {}
+    native_fps = float(vmeta.get("fps") or 0.0)
+    total_vid_frames = int(vmeta.get("total_frames") or 0)
+    if native_fps > 0.0:
+        fps_int = max(1, round(native_fps))
+        sc.render.fps = fps_int
+        sc.render.fps_base = round(fps_int / native_fps, 6)
+
     # Replace stale camera / rig from prior re-imports cleanly
     old_cam = bpy.data.objects.get(name)
     if old_cam is not None:
@@ -1074,6 +1082,8 @@ def _import_cameras_json(
         sc.render.resolution_y = int(c0["height"])
         sc.render.resolution_percentage = 100
 
+    eff_span_frames = max(total_vid_frames, len(cams))
+
     # Attach GT video / image as semi-transparent Foreground Camera Overlay for instant alignment check!
     bg_attached = None
     if bg_media_path is not None and bg_media_path.is_file():
@@ -1090,7 +1100,10 @@ def _import_cameras_json(
             bg_slot.frame_method = "CROP"
             if is_vid and hasattr(bg_slot, "image_user"):
                 bg_slot.image_user.use_auto_refresh = True
-                bg_slot.image_user.frame_duration = max(len(cams), int(getattr(img, "frame_duration", len(cams)) or len(cams)))
+                bg_slot.image_user.frame_duration = max(
+                    eff_span_frames,
+                    int(getattr(img, "frame_duration", eff_span_frames) or eff_span_frames),
+                )
                 bg_slot.image_user.frame_start = 1
             bg_attached = bg_media_path.name
         except Exception:  # noqa: BLE001, S110
@@ -1113,7 +1126,7 @@ def _import_cameras_json(
     rot_dim = 4 if use_quat else 3
     rot_fcs = [_get_or_new_fc(rot_dp, i) for i in range(rot_dim)]
 
-    # Hemisphere-align consecutive quaternions (`dot(q_prev, q_cur) >= 0`) so LINEAR F-curves
+    # Hemisphere-align consecutive quaternions (`dot(q_prev, q_cur) >= 0`) so F-curves
     # NEVER suffer a 360-degree spin flip when Shepperd's sign flips (`q` vs `-q`)!
     prev_q: list[float] | None = None
     aligned_quats: list[list[float]] = []
@@ -1127,8 +1140,17 @@ def _import_cameras_json(
             prev_q = rq
             aligned_quats.append(rq)
 
+    max_keyed_frame = 1
+    has_timeline_frames = any(c.get("timeline_frame") is not None or c.get("pts_sec") is not None for c in cams)
+    use_fps = native_fps if native_fps > 0.0 else float(sc.render.fps)
     for i, c in enumerate(cams):
-        frame = int(c.get("frame_index", i)) + 1
+        if c.get("timeline_frame") is not None:
+            frame = max(1, int(c["timeline_frame"]))
+        elif c.get("pts_sec") is not None:
+            frame = max(1, round(float(c["pts_sec"]) * use_fps) + 1)
+        else:
+            frame = int(c.get("frame_index", i)) + 1
+        max_keyed_frame = max(max_keyed_frame, frame)
         loc = c["location"]
         if i == 0:
             cam_data.lens = float(c.get("lens_mm", 50.0))
@@ -1139,9 +1161,10 @@ def _import_cameras_json(
             else:
                 re = c["rotation_euler"]
                 cam_obj.rotation_euler = Euler((float(re[0]), float(re[1]), float(re[2])), "XYZ")
+        interp_kind = "BEZIER" if has_timeline_frames else "LINEAR"
         for ax in range(3):
             kp_l = loc_fcs[ax].keyframe_points.insert(frame, float(loc[ax]))
-            kp_l.interpolation = "LINEAR"
+            kp_l.interpolation = interp_kind
         rot_vals = aligned_quats[i] if use_quat else c["rotation_euler"]
         for ax in range(rot_dim):
             kp_r = rot_fcs[ax].keyframe_points.insert(frame, float(rot_vals[ax]))
@@ -1190,12 +1213,14 @@ def _import_cameras_json(
             rig_col.objects.link(fo)
 
     sc.frame_start = 1
-    sc.frame_end = max(sc.frame_end, len(cams))
+    sc.frame_end = max(total_vid_frames, max_keyed_frame, len(cams))
     sc.camera = cam_obj
     return {
         "imported": True,
         "camera": cam_obj.name,
-        "frames": len(cams),
+        "frames": int(sc.frame_end),
+        "solved_keyframes": len(cams),
+        "fps": round(native_fps if native_fps > 0 else float(sc.render.fps), 3),
         "pose_backend": doc.get("pose_backend", "vggt"),
         "frustum_collection": rig_col_name,
         "background_gt": bg_attached,
@@ -1413,6 +1438,27 @@ def op_splat_import(ctx: OpContext, params: dict[str, Any]) -> dict[str, Any]:
             g_obj.data.materials.append(g_mat)
             ground_name = g_obj.name
 
+    proxy_mesh_name = None
+    if bool(params.get("import_proxy_mesh", False)) or params.get("proxy_glb_path"):
+        proxy_cand = (
+            Path(str(params["proxy_glb_path"])).resolve()
+            if params.get("proxy_glb_path")
+            else (ply_path.parent / "proxy_collision.glb")
+        )
+        if proxy_cand.is_file():
+            old_names = {o.name for o in bpy.data.objects}
+            bpy.ops.import_scene.gltf(filepath=str(proxy_cand))
+            new_meshes = [o for o in bpy.data.objects if o.name not in old_names and o.type == "MESH"]
+            if new_meshes:
+                pm = new_meshes[0]
+                pm.name = f"{obj_name}_ProxyMesh"
+                pm.display_type = "WIRE"
+                if bool(params.get("proxy_shadow_catcher", True)) and hasattr(pm, "is_shadow_catcher"):
+                    pm.is_shadow_catcher = True
+                else:
+                    pm.hide_render = True
+                proxy_mesh_name = pm.name
+
     return {
         "object": obj.name,
         "render_mode": render_mode,
@@ -1422,6 +1468,7 @@ def op_splat_import(ctx: OpContext, params: dict[str, Any]) -> dict[str, Any]:
         "bounds_max": [round(v, 4) for v in parsed["bounds_max"]],
         "cameras": cam_info,
         "shadow_catcher": ground_name,
+        "proxy_mesh": proxy_mesh_name,
         "parse_ms": round((t_parsed - t0) * 1000.0, 2),
         "foreach_ms": round((t_foreach - t_parsed) * 1000.0, 2),
         "elapsed_s": round(time.perf_counter() - t0, 3),
@@ -1714,3 +1761,232 @@ def op_splat_import_cameras(ctx: OpContext, params: dict[str, Any]) -> dict[str,
         except Exception:  # noqa: BLE001, S110
             pass
     return res
+
+
+@blender_op(
+    "splat.crop_box",
+    tier="mutate",
+    summary=(
+        "Spawn or read an interactive 3D wireframe `SplatCropBox` in Blender 5.3 for surgical "
+        "cloud `drop_aabb` / `keep_aabb` culling & healing or local `splat.crop_clean`."
+    ),
+    params_doc={
+        "action": "`'spawn'` (create/reset wireframe box) or `'read'` (return current world AABB)",
+        "name": "Crop box object name (default `'SplatCropBox'`)",
+        "location": "Optional `[x, y, z]` center when spawning (default `[0, 0, 1.0]`)",
+        "dimensions": "Optional `[dx, dy, dz]` size in meters when spawning (default `[2.5, 2.5, 2.0]`)",
+    },
+)
+def op_splat_crop_box(ctx: OpContext, params: dict[str, Any]) -> dict[str, Any]:
+    bpy = ctx.bpy
+    sc = ctx.scene
+    action = str(params.get("action") or "read").strip().lower()
+    name = str(params.get("name") or "SplatCropBox")
+    box = bpy.data.objects.get(name)
+
+    if action == "spawn" or box is None:
+        if action != "spawn" and box is None:
+            raise OpError(
+                f"Crop box '{name}' does not exist yet (run splat.crop_box with action='spawn' first).",
+                code="OBJECT_NOT_FOUND",
+            )
+        loc = params.get("location") or [0.0, 0.0, 1.0]
+        dims = params.get("dimensions") or [2.5, 2.5, 2.0]
+        if box is None:
+            bpy.ops.mesh.primitive_cube_add(size=1.0, location=(float(loc[0]), float(loc[1]), float(loc[2])))
+            box = bpy.context.active_object
+            assert box is not None
+            box.name = name
+        else:
+            box.location = (float(loc[0]), float(loc[1]), float(loc[2]))
+        box.scale = (float(dims[0]), float(dims[1]), float(dims[2]))
+        box.display_type = "WIRE"
+        box.show_in_front = True
+        box.hide_render = True
+        if box.name not in sc.collection.objects:
+            try:
+                sc.collection.objects.link(box)
+            except RuntimeError:
+                pass
+        ctx.bpy.context.view_layer.update()
+
+    assert box is not None
+    ab = world_aabb(box, ctx.bpy.context.evaluated_depsgraph_get()) or {
+        "min": [0.0, 0.0, 0.0],
+        "max": [0.0, 0.0, 0.0],
+    }
+    bmin, bmax = ab["min"], ab["max"]
+    return {
+        "object": box.name,
+        "action": action,
+        "bounds_min": [round(float(v), 4) for v in bmin],
+        "bounds_max": [round(float(v), 4) for v in bmax],
+        "center": [round(0.5 * (bmin[i] + bmax[i]), 4) for i in range(3)],
+        "dimensions": [round(bmax[i] - bmin[i], 4) for i in range(3)],
+    }
+
+
+@blender_op(
+    "splat.export_camera_path",
+    tier="read",
+    summary=(
+        "Export an animated or static Blender 5.3 camera across `[frame_start..frame_end]` to a "
+        "`cameras.json` trajectory + auto-compiled Seedance 2.5 cinematography prompt telemetry."
+    ),
+    params_doc={
+        "camera": "Camera object name (defaults to active `scene.camera`)",
+        "output_path": "Optional file path to write `cameras.json`",
+        "frame_start": "Optional start frame (defaults to `scene.frame_start`)",
+        "frame_end": "Optional end frame (defaults to `scene.frame_end`)",
+        "frame_step": "Frame step (default `1`)",
+    },
+)
+def op_splat_export_camera_path(ctx: OpContext, params: dict[str, Any]) -> dict[str, Any]:
+    bpy = ctx.bpy
+    sc = ctx.scene
+    cam_name = params.get("camera")
+    cam_obj = bpy.data.objects.get(str(cam_name)) if cam_name else sc.camera
+    if cam_obj is None or cam_obj.type != "CAMERA":
+        raise OpError(f"Camera '{cam_name or '(scene.camera)'}' not found.", code="NO_CAMERA")
+
+    f_start = int(params.get("frame_start") or sc.frame_start)
+    f_end = max(f_start, int(params.get("frame_end") or sc.frame_end))
+    f_step = max(1, int(params.get("frame_step") or 1))
+    orig_frame = int(sc.frame_current)
+
+    fps = float(sc.render.fps) / max(1e-6, float(getattr(sc.render, "fps_base", 1.0) or 1.0))
+    res_w = int(sc.render.resolution_x)
+    res_h = int(sc.render.resolution_y)
+
+    cams_out: list[dict[str, Any]] = []
+    yaws: list[float] = []
+    pitches: list[float] = []
+
+    try:
+        for idx, f_num in enumerate(range(f_start, f_end + 1, f_step)):
+            sc.frame_set(f_num)
+            deps = bpy.context.evaluated_depsgraph_get()
+            ev_cam = cam_obj.evaluated_get(deps)
+            mw = ev_cam.matrix_world.copy()
+            cd = ev_cam.data
+
+            loc = mw.to_translation()
+            quat = mw.to_quaternion()
+            r_w2c, t_w2c = _cam_matrix_world_to_opencv_w2c(mw)
+
+            sensor_w = float(getattr(cd, "sensor_width", 36.0))
+            lens_mm = float(getattr(cd, "lens", 50.0))
+            sfit = str(getattr(cd, "sensor_fit", "HORIZONTAL"))
+            if sfit == "VERTICAL" or (sfit == "AUTO" and res_h > res_w):
+                fy = lens_mm * float(res_h) / max(1e-4, sensor_w)
+                fx = fy
+            else:
+                fx = lens_mm * float(res_w) / max(1e-4, sensor_w)
+                fy = fx
+            max_dim = float(max(res_w, res_h))
+            sh_x = float(getattr(cd, "shift_x", 0.0))
+            sh_y = float(getattr(cd, "shift_y", 0.0))
+            cx = 0.5 * res_w - sh_x * max_dim
+            cy = 0.5 * res_h + sh_y * max_dim
+            pts_s = (f_num - f_start) / max(1.0, fps)
+
+            fwd_x, fwd_y, fwd_z = -float(mw[0][2]), -float(mw[1][2]), -float(mw[2][2])
+            yaws.append(math.degrees(math.atan2(fwd_x, fwd_y)))
+            pitches.append(math.degrees(math.asin(max(-1.0, min(1.0, fwd_z)))))
+
+            cams_out.append({
+                "frame_index": idx,
+                "timeline_frame": f_num,
+                "pts_sec": round(pts_s, 5),
+                "image_name": f"frame_{f_num:05d}.png",
+                "location": [float(loc.x), float(loc.y), float(loc.z)],
+                "rotation_quaternion": [float(quat.w), float(quat.x), float(quat.y), float(quat.z)],
+                "matrix_world": [[float(mw[r][c]) for c in range(4)] for r in range(4)],
+                "lens_mm": round(lens_mm, 4),
+                "sensor_width_mm": round(sensor_w, 4),
+                "sensor_fit": sfit if sfit != "AUTO" else ("HORIZONTAL" if res_w >= res_h else "VERTICAL"),
+                "shift_x": round(sh_x, 6),
+                "shift_y": round(sh_y, 6),
+                "width": res_w,
+                "height": res_h,
+                "fx": round(fx, 4),
+                "fy": round(fy, 4),
+                "cx": round(cx, 4),
+                "cy": round(cy, 4),
+                "R_w2c": r_w2c,
+                "t_w2c": t_w2c,
+            })
+    finally:
+        sc.frame_set(orig_frame)
+
+    # Unwrap yaw & compile an explicit optical Seedance 2.5 prompt directive from exact 3D camera motion!
+    for k in range(1, len(yaws)):
+        while yaws[k] - yaws[k - 1] > 180.0:
+            yaws[k] -= 360.0
+        while yaws[k] - yaws[k - 1] < -180.0:
+            yaws[k] += 360.0
+
+    c_first = cams_out[0]
+    c_last = cams_out[-1]
+    dx = c_last["location"][0] - c_first["location"][0]
+    dy = c_last["location"][1] - c_first["location"][1]
+    dz = c_last["location"][2] - c_first["location"][2]
+    dist_m = math.sqrt(dx * dx + dy * dy + dz * dz)
+    yaw_delta = (yaws[-1] - yaws[0]) if len(yaws) > 1 else 0.0
+    pitch_delta = (pitches[-1] - pitches[0]) if len(pitches) > 1 else 0.0
+    lens_start = c_first["lens_mm"]
+    lens_end = c_last["lens_mm"]
+    dur_sec = round((f_end - f_start + 1) / max(1.0, fps), 3)
+
+    lens_clause = (
+        f"Locked {round(lens_start)}mm prime lens with zero optical focal-length zoom"
+        if abs(lens_end - lens_start) < 0.5
+        else f"Lens zoom from {round(lens_start)}mm to {round(lens_end)}mm"
+    )
+    orbit_dir = "clockwise" if yaw_delta > 2.0 else "counter-clockwise" if yaw_delta < -2.0 else "steady heading"
+    move_clause = (
+        f"smooth {dist_m:.2f}m 3D camera translation ({orbit_dir} {abs(yaw_delta):.1f}° yaw arc, "
+        f"{pitch_delta:+.1f}° pitch) at {c_first['location'][2]:.2f}m->{c_last['location'][2]:.2f}m elevation"
+        if dist_m >= 0.05
+        else f"stationary tripod pan ({yaw_delta:+.1f}° yaw, {pitch_delta:+.1f}° pitch)"
+    )
+    seedance_hint = (
+        f"{lens_clause}, {move_clause}, crisp multi-view motion parallax, rigid static scene geometry, "
+        "consistent exposure, zero motion blur."
+    )
+
+    doc = {
+        "job_id": f"blender_cam_{cam_obj.name}",
+        "coordinate_system": "BLENDER_RIGHT_HANDED_Z_UP",
+        "floor_z": 0.0,
+        "pose_backend": "blender_camera_export",
+        "video_meta": {
+            "fps": round(fps, 4),
+            "duration_sec": dur_sec,
+            "total_frames": (f_end - f_start) + 1,
+            "width": res_w,
+            "height": res_h,
+        },
+        "seedance_camera_prompt": seedance_hint,
+        "cameras": cams_out,
+    }
+
+    written_path: str | None = None
+    if params.get("output_path"):
+        out_p = Path(str(params["output_path"])).resolve()
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+        out_p.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+        written_path = str(out_p)
+
+    return {
+        "camera": cam_obj.name,
+        "frames_exported": len(cams_out),
+        "fps": round(fps, 4),
+        "duration_sec": dur_sec,
+        "distance_m": round(dist_m, 3),
+        "yaw_delta_deg": round(yaw_delta, 2),
+        "pitch_delta_deg": round(pitch_delta, 2),
+        "seedance_camera_prompt": seedance_hint,
+        "output_path": written_path,
+        "cameras_doc": doc if not written_path else None,
+    }

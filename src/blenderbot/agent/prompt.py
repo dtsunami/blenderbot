@@ -101,8 +101,8 @@ def _build_protocol_default(role: str = "master") -> str:
         (
             "splat.from_video",
             "mutate",
-            "`video_path`, `job_id`?, `iterations`?, `sh_degree`?, `pose_backend`?, `gpu`?, `auto_import`?",
-            "Reconstruct a Z=0 floor-aligned 3D Gaussian Splat (.ply/.splat) on Modal H100/L40S from an MP4 video",
+            "`video_path`, `known_cameras_path`?, `job_id`?, `iterations`?, `sh_degree`?, `pose_backend`? (`vggt`|`colmap`|`colmap_prior`), `refine_poses`?, `gpu`?, `auto_import`?",
+            "Reconstruct a Z=0 floor-aligned (or Blender camera-locked/prior-nudged) 3DGS (.ply/.splat/proxy_collision.glb) on Modal H100/L40S",
         ),
         (
             "splat.from_blender",
@@ -114,7 +114,13 @@ def _build_protocol_default(role: str = "master") -> str:
             "splat.resume",
             "mutate",
             "`job_id`, `add_steps`?, `surgery`?, `masks`?, `exclude_frames`?, `auto_import`?",
-            "Statefully resume a cloud 3DGS job with optional surgical edits (`prune_opa`, `drop_aabb`, `keep_aabb`, `clamp_log_scale`)",
+            "Statefully resume a cloud 3DGS job (merging onto saved config) with surgical edits (`prune_opa`, `drop_aabb`, `keep_aabb`, `clamp_log_scale`)",
+        ),
+        (
+            "splat.render_path",
+            "mutate",
+            "`job_id`, `cameras_json`?, `blender_camera`?, `output_path`?, `fps`?, `width`?, `height`?, `gpu`?",
+            "Farm full-rate H.264 MP4 rendering of the recreated original video trajectory (or any Blender camera) to Modal H100/L40S (`gsplat` CUDA)",
         ),
         (
             "shell",

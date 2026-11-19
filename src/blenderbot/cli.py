@@ -269,12 +269,17 @@ def _print_doctor(cfg: Config) -> int:
             f"  live gui bridge     standby ({live.get('reason')}) — will auto-spawn warm HeadlessTransport"
         )
 
+    modal_toml = Path.home() / ".modal.toml"
+    has_modal_auth = bool(os.environ.get("MODAL_TOKEN_ID") or modal_toml.is_file())
+    modal_status = "configured (~/.modal.toml / env)" if has_modal_auth else "not configured (run `modal setup`)"
+
     lines.extend(
         [
             "",
-            "Providers & Keys",
+            "Providers & Cloud Compute",
             f"  active              {cfg.provider} / {cfg.model.id} (effort={cfg.effort}, role={cfg.role}, vision={'yes' if cfg.model.vision else 'no'}, video={'yes' if cfg.model.video else 'no'})",
             f"  video generator     {cfg.video_model} (OpenRouter /api/v1/videos)",
+            f"  modal 3dgs cloud    {modal_status} (app: blenderbot-splat)",
         ]
     )
     for prov, key_val in cfg.keys.items():

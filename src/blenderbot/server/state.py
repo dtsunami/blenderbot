@@ -80,6 +80,40 @@ class SeedanceJobRecord:
         }
 
 
+def resolve_source_video_for_job(cwd: Path, job_id: str, source_label: str = "") -> Path | None:
+    """Locate the original source video corresponding to `job_id` (`job_source.json` or stem match)."""
+    jdir = cwd / "assets" / "splats" / job_id
+    src_meta = jdir / "job_source.json"
+    if src_meta.is_file():
+        try:
+            meta = json.loads(src_meta.read_text(encoding="utf-8"))
+            rel_v = str(meta.get("video_rel") or "")
+            if rel_v:
+                cand = (cwd / rel_v).resolve()
+                if cand.is_file():
+                    return cand
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+    if source_label and not source_label.startswith(("Blender", "Resume")):
+        cand_lbl = (cwd / source_label).resolve()
+        if cand_lbl.is_file():
+            return cand_lbl
+
+    # `make_job_id` builds `{video_stem}_{HHMMSS}_{6hex}`: strip trailing `_HHMMSS_hex6`
+    parts = job_id.split("_")
+    if len(parts) >= 3 and len(parts[-1]) == 6 and len(parts[-2]) == 6 and parts[-2].isdigit():
+        stem = "_".join(parts[:-2])
+        for folder in (cwd / "assets" / "seedance", cwd / "assets" / "inputs", cwd / "renders", cwd):
+            if not folder.is_dir():
+                continue
+            for ext in (".mp4", ".mov", ".webm", ".mkv", ".MP4", ".MOV"):
+                cand = folder / f"{stem}{ext}"
+                if cand.is_file():
+                    return cand
+    return None
+
+
 @dataclass
 class SplatJobRecord:
     job_id: str
@@ -93,6 +127,8 @@ class SplatJobRecord:
     total_steps: int = 0
     psnr: float = 0.0
     loss: float = 0.0
+    l1: float = 0.0
+    ssim: float = 0.0
     it_per_sec: float = 0.0
     n_gaussians: int = 0
     elapsed_sec: float = 0.0
@@ -100,9 +136,18 @@ class SplatJobRecord:
     error: str | None = None
     ply_rel: str | None = None
     splat_url: str | None = None
+    proxy_glb_rel: str | None = None
+    proxy_glb_url: str | None = None
     preview_url: str | None = None
     diff_url: str | None = None
+    gt_url: str | None = None
     cameras_rel: str | None = None
+    cameras_url: str | None = None
+    source_video_rel: str | None = None
+    source_video_url: str | None = None
+    modal_render_url: str | None = None
+    blender_render_url: str | None = None
+    stage_timings: dict[str, float] = field(default_factory=dict)
     imported_object: str | None = None
     task: asyncio.Task[Any] | None = field(default=None, repr=False)
 
@@ -119,6 +164,8 @@ class SplatJobRecord:
             "total_steps": self.total_steps or self.iterations,
             "psnr": round(self.psnr, 2),
             "loss": round(self.loss, 4),
+            "l1": round(self.l1, 4),
+            "ssim": round(self.ssim, 4),
             "it_per_sec": round(self.it_per_sec, 1),
             "n_gaussians": self.n_gaussians,
             "elapsed_sec": round(self.elapsed_sec, 1),
@@ -126,9 +173,18 @@ class SplatJobRecord:
             "error": self.error,
             "ply_rel": self.ply_rel,
             "splat_url": self.splat_url,
+            "proxy_glb_rel": self.proxy_glb_rel,
+            "proxy_glb_url": self.proxy_glb_url,
             "preview_url": self.preview_url,
             "diff_url": self.diff_url,
+            "gt_url": self.gt_url,
             "cameras_rel": self.cameras_rel,
+            "cameras_url": self.cameras_url,
+            "source_video_rel": self.source_video_rel,
+            "source_video_url": self.source_video_url,
+            "modal_render_url": self.modal_render_url,
+            "blender_render_url": self.blender_render_url,
+            "stage_timings": self.stage_timings,
             "imported_object": self.imported_object,
         }
 
@@ -182,6 +238,10 @@ class WebState:
             total_steps=iterations,
             created_at=time.time(),
         )
+        src_v = resolve_source_video_for_job(self.session.cfg.cwd, job_id, source_label)
+        if src_v is not None:
+            rec.source_video_rel = self.session.sandbox.rel(src_v).replace("\\", "/")
+            rec.source_video_url = self.media_url_for(src_v)
         self.splat_jobs[job_id] = rec
         if job_id not in self.splat_job_order:
             self.splat_job_order.insert(0, job_id)
@@ -191,14 +251,26 @@ class WebState:
         """Merge active in-memory splat jobs with persisted `assets/splats/*` artifacts on disk."""
         out: list[dict[str, Any]] = []
         seen: set[str] = set()
+        cwd = self.session.cfg.cwd
 
         for jid in self.splat_job_order:
             rec = self.splat_jobs.get(jid)
             if rec is not None:
+                d_live = cwd / "assets" / "splats" / jid
+                m_vid = d_live / "renders" / "modal_recreated.mp4"
+                b_vid = d_live / "renders" / "blender_recreated.mp4"
+                p_glb = d_live / "proxy_collision.glb"
+                if m_vid.is_file():
+                    rec.modal_render_url = self.media_url_for(m_vid)
+                if b_vid.is_file():
+                    rec.blender_render_url = self.media_url_for(b_vid)
+                if p_glb.is_file():
+                    rec.proxy_glb_rel = self.session.sandbox.rel(p_glb).replace("\\", "/")
+                    rec.proxy_glb_url = self.media_url_for(p_glb)
                 out.append(rec.to_dict())
                 seen.add(jid)
 
-        splats_root = self.session.cfg.cwd / "assets" / "splats"
+        splats_root = cwd / "assets" / "splats"
         if not splats_root.is_dir():
             return out[:max_items]
 
@@ -212,25 +284,33 @@ class WebState:
             if not ply_p.is_file():
                 continue
             splat_p = d / "splat.splat"
+            proxy_p = d / "proxy_collision.glb"
             cam_p = d / "cameras.json"
             prev_p = d / "previews" / "latest_render.jpg"
             diff_p = d / "previews" / "latest_diff.jpg"
             gt_files = sorted((d / "previews").glob("gt_*.jpg")) if (d / "previews").is_dir() else []
             gt_p = gt_files[0] if gt_files else None
+            modal_mp4 = d / "renders" / "modal_recreated.mp4"
+            blender_mp4 = d / "renders" / "blender_recreated.mp4"
+            src_vid = resolve_source_video_for_job(cwd, d.name)
             telem_p = d / "telemetry.jsonl"
 
             step = 0
             n_gauss = 0
             psnr = 0.0
+            loss_v = 0.0
+            l1_v = 0.0
+            ssim_v = 0.0
             cost_usd = 0.0
             wall_s = 0.0
             gpu_lbl = "H100"
             src_mode = "blender" if d.name.startswith("blender_") else "video"
+            st_timings: dict[str, float] = {}
 
             if telem_p.is_file():
                 try:
                     lines = telem_p.read_text(encoding="utf-8", errors="ignore").strip().splitlines()
-                    for ln in reversed(lines[-20:]):
+                    for ln in reversed(lines[-25:]):
                         row = json.loads(ln)
                         if row.get("event") == "done" and step == 0:
                             step = int(row.get("step") or 0)
@@ -241,6 +321,10 @@ class WebState:
                             gpu_lbl = "L40S" if "L40S" in dev else "H100"
                         elif row.get("event") == "telemetry" and psnr == 0.0:
                             psnr = float(row.get("psnr") or 0.0)
+                            loss_v = float(row.get("loss") or 0.0)
+                            l1_v = float(row.get("l1") or 0.0)
+                            ssim_v = float(row.get("ssim") or 0.0)
+                            st_timings = dict(row.get("stage_timings") or {})
                             if step == 0:
                                 step = int(row.get("step") or 0)
                             if n_gauss == 0:
@@ -252,7 +336,7 @@ class WebState:
                 {
                     "job_id": d.name,
                     "source_mode": src_mode,
-                    "source_label": d.name,
+                    "source_label": self.session.sandbox.rel(src_vid).replace("\\", "/") if src_vid else d.name,
                     "gpu": gpu_lbl,
                     "iterations": step,
                     "created_at": ply_p.stat().st_mtime,
@@ -260,7 +344,9 @@ class WebState:
                     "step": step,
                     "total_steps": step,
                     "psnr": round(psnr, 2),
-                    "loss": 0.0,
+                    "loss": round(loss_v, 4),
+                    "l1": round(l1_v, 4),
+                    "ssim": round(ssim_v, 4),
                     "it_per_sec": 0.0,
                     "n_gaussians": n_gauss,
                     "elapsed_sec": round(wall_s, 1),
@@ -268,11 +354,18 @@ class WebState:
                     "error": None,
                     "ply_rel": self.session.sandbox.rel(ply_p).replace("\\", "/"),
                     "splat_url": self.media_url_for(splat_p) if splat_p.is_file() else None,
+                    "proxy_glb_rel": self.session.sandbox.rel(proxy_p).replace("\\", "/") if proxy_p.is_file() else None,
+                    "proxy_glb_url": self.media_url_for(proxy_p) if proxy_p.is_file() else None,
                     "preview_url": self.media_url_for(prev_p) if prev_p.is_file() else None,
                     "diff_url": self.media_url_for(diff_p) if diff_p.is_file() else None,
                     "gt_url": self.media_url_for(gt_p) if gt_p is not None else None,
                     "cameras_url": self.media_url_for(cam_p) if cam_p.is_file() else None,
                     "cameras_rel": self.session.sandbox.rel(cam_p).replace("\\", "/") if cam_p.is_file() else None,
+                    "source_video_rel": self.session.sandbox.rel(src_vid).replace("\\", "/") if src_vid else None,
+                    "source_video_url": self.media_url_for(src_vid) if src_vid else None,
+                    "modal_render_url": self.media_url_for(modal_mp4) if modal_mp4.is_file() else None,
+                    "blender_render_url": self.media_url_for(blender_mp4) if blender_mp4.is_file() else None,
+                    "stage_timings": st_timings,
                     "imported_object": None,
                 }
             )

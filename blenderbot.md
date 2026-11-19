@@ -105,6 +105,69 @@ Live probes against `C:\Program Files\Blender Foundation\Blender 5.3\blender.exe
 - [x] **FastAPI SSE Web Studio & Embedded WebGL2 `.splat` 3D Viewer (`server/`, `ui/web/`, `--web --open`):**
   - Dual **Seedance 2.5 Composer** & **3DGS Splat Studio** (`127.0.0.1:7880`) with workspace media library, live headed Blender 5.3 GUI Bridge hot-connect (`blenderbot --install-addon`), editable training iterations + anti-floater/culling knobs, live SSE training telemetry + render/error triptychs, zero-dependency WebGL2 `.splat` interactive 3D orbit viewer, and 1-click `+2k Polish` & Blender import (`📥 Splat+Cams` / `🎥 Cams Only`).
 
-### Phase 5 — Interactive Studio Refinements & Domain Recipes *(OPTIONAL EXTENSIONS)*
-- [ ] **Advanced `arcgs` / `tt-splat` Studio Controls:** Interactive 2D dynamic-subject mask painter, live loss/PSNR chart timeline scrubber across `snapshots/`, and 3D Blender CropBox $\rightarrow$ Modal `drop_aabb` sync button.
-- [ ] **4D Dynamic Splat Playback & Motion-Arc Overlays:** Frame-indexed `.ply` sequence handler + `anim.motion_paths` viewport overlays.
+### Phase 5 — `tt-splat` Telemetry Workbench, Surgical CropBox, Proxy Mesh, Pose Priors & Synced Trajectory Comparator *(COMPLETE)*
+- [x] **`tt-splat` Live Telemetry Plots, GPU Stage Bar & Mid-Train Controls (`server/routes.py`, `ui/web/`, `modal_app.py`):**
+  - Full multi-burst Loss / L1 / SSIM & PSNR dual-axis chart + Gaussian count curve with `densify` & `surgery` vertical markers (`/api/splats/telemetry/{job_id}`).
+  - CUDA Event kernel stage breakdown bar (`fwd_raster_ms`, `loss_ssim_ms`, `bwd_ms`, `adam_ms`, `densify_ms`, `host_ms`), `snapshots/` timeline scrubber, Mip-Splatting `rasterize_mode="antialiased"`, and live mid-run controls via `blenderbot-splat-ctl` `modal.Dict` (`Pause/Resume`, `Save Checkpoint`, `Stop & Export`, `Focus Camera`, live `lambda_dssim`/`opa_reg` push, `Reset Opacities`, `Clamp Scale`).
+  - Hardened stateful burst resume: preserves `alphas_gpu` across 90s HBM warm hits and merges overrides onto `meta.json["config"]` without clobbering saved SH/loss settings.
+- [x] **3D Blender `SplatCropBox` $\rightarrow$ Cloud Surgical Cull & Heal (`splat.crop_box`, `/api/splats/crop_box`):**
+  - Spawns/reads a wireframe `SplatCropBox` in Blender 5.3 world space and dispatches 1-click `drop_aabb` (*Cull Inside Box & Heal*) or `keep_aabb` (*Keep Inside Box & Polish*) bursts on Modal while slicing Adam momentum & strategy state cleanly.
+- [x] **Coarse Surface-Nets Proxy Mesh Extractor (`splats/proxy_mesh.py`, `proxy_collision.glb`):**
+  - Pure-NumPy 3D Surface-Nets iso-surface extractor (`<45 ms`) emitting spec-valid Binary glTF 2.0 `proxy_collision.glb` (aligned 1:1 with Blender `+Z` up via `Rx(-90°)` `det=+1`) both on Modal Stage 4 and on-demand locally (`/api/splats/proxy/{job_id}`, `splat.import(import_proxy_mesh=True)`), ready for Cycles shadow-catching, `splat.project_video`, and rigid-body/Chaos collisions.
+- [x] **Camera-Pose Priors, Differentiable `se(3)` Refinement & Seedance Optical Directives (`core_worker.py`, `splat_ops.py`):**
+  - Exact FFmpeg `showinfo` per-frame `pts_sec` + `video_meta` capture (`extract_frames_with_meta`), `known_cameras` zero-drift hard lock, `colmap_prior` (`PINHOLE` intrinsic lock + closed-form Umeyama `det(R)=+1` Sim(3) alignment onto Blender camera priors), differentiable `6D+3D` `se(3)` sub-pixel camera pose optimization (`refine_poses=True`) inside `gsplat`, and `splat.export_camera_path` compiling Blender camera moves into explicit Seedance 2.5 optical prompts (`🎥 Pull Blender Cam`).
+- [x] **Modal-Farmed Trajectory Renderer & Side-by-Side Synced Clip / 3D Camera Path Comparator (`splat.render_path`, `/api/splats/render`, `/api/splats/trajectory/{job_id}`):**
+  - Farms full-rate H.264 MP4 rendering of the recreated original video trajectory (Catmull-Rom + hemisphere-continuous quaternion SLERP at exact source `fps` & `duration_sec`) or any Blender camera to Modal H100/L40S (`gsplat` CUDA, ~1–2s for 120 frames) alongside matching Blender 5.3 EEVEE playblasts.
+  - Interactive Web Studio **Compare & Path** stage: lockstep side-by-side playback (Original Video vs. Modal Cloud 3DGS Render vs. Blender 5.3 Render) with solved-keyframe timeline markers, orbitable 3D camera trajectory + `Z=0` grid + live moving 3D frustum pyramid, and synchronized unwrapped `Yaw° / Pitch° / Roll° / Speed (m/s)` curves.
+
+### Remaining Optional Extensions
+- [ ] **Interactive 2D Brush Mask Painter & Vast/RunPod HTTP Pod Wrapper:** In-browser canvas mask brush writing directly to `/jobs/{job_id}/masks/` + `pod_server.py` (`BLENDERBOT_SPLAT_URL`).
+- [ ] **4D Dynamic Splat Sequence Playback:** Frame-indexed `.ply` sequence handler + foreground matting (`SAM2`/`BiRefNet`).
+
+---
+
+## 5. Camera-Pose Conditioning & SfM Priors (Seedance 2.5 ↔ COLMAP / VGGT / `gsplat` Findings)
+
+1. **Feed COLMAP Mathematical Priors, Never Clay Renders Mixed into SIFT:**
+   - Mixing untextured Blender clay/Workbench frames with photoreal Seedance frames in SIFT fails to cross-match descriptors and splits into disconnected sub-models.
+   - Instead, **lock `PINHOLE` intrinsics** (`k1=k2=0`; Seedance has zero radial lens distortion, whereas 8-param `OPENCV` suffers focal-length / Z-dolly collinearity on modest moves) and pass Blender camera priors via either **`known_cameras`** (hard `0px` lock when video stays frame-locked) or **`colmap_prior`** (locked Blender `(fx, fy, cx, cy)` during SIFT BA + closed-form proper `det(R)=+1` Umeyama Sim(3) alignment onto the Blender camera arc so interior Seedance speed/easing adapts to SIFT while scale, floor `Z=0`, and world framing stay locked to Blender).
+2. **Sub-Pixel Photometric `se(3)` Pose Refinement Inside `gsplat` (`refine_poses=True`):**
+   - VGGT operates at `518px` resolution, leaving `~1–3 px` angular pose jitter at `1080p`. Optimizing per-camera continuous `6D` rotation + `3D` translation deltas (`pose_opt_lr=5e-5`, anchored by soft L2 tether `pose_prior_reg=1e-2`) snaps cameras to sub-pixel edge alignment during 3DGS training and bakes refined poses back into `cameras.json`.
+3. **Seedance 2.5 Generation-Side Camera Discipline:**
+   - `frame_images` (`first_frame`, `last_frame`) are strict temporal pixel endpoints, whereas `input_references` (`video_mid_frames`) are **unordered** identity/style cues (on wide `>35°` orbits, middle viewpoints in `input_references` can cause perspective rubber-banding; prefer piecewise `first_frame -> last_frame` segments chained on shared keyframes with `video_mid_frames=0`).
+   - Compiling exact Blender camera telemetry (`splat.export_camera_path` / `🎥 Pull Blender Cam`: locked prime `lens_mm` with zero optical zoom, metric translation distance, yaw/pitch arc, eye height) into the prompt suppresses Seedance's 2D zoom-for-dolly substitution.
+
+---
+
+## 6. Cross-Harness Coordination Plane Notes (`blenderbot` ↔ `unrealbot` ↔ `davag`)
+
+Captured architectural notes for a sibling **Unreal Engine 5.5–5.7+** harness (`unrealbot`) and inter-agent delegation:
+
+1. **Shared Sibling Harness Architecture:**
+   - `unrealbot` mirrors `blenderbot` & `davag`: single fenced `ue_ops` + transactional `ue.tx` (`with unreal.ScopedEditorTransaction(...)`), `BridgeTransport` (`127.0.0.1:18767`, `~/.unrealbot/bridge.json` drained on the Game/Slate main thread via `unreal.register_slate_post_tick_callback`) + UE Remote Control API (`:30010`), and `HeadlessTransport` (`UnrealEditor-Cmd.exe`).
+2. **Coordinate System & Anisotropic Splat Handedness Contract (Critical Seam):**
+   - **Blender (`BLENDER_RH_ZUP_M`):** Right-handed, `+X` right, `+Y` forward, `+Z` up, **meters** (`1.0 = 1m`).
+   - **Unreal Engine (`UNREAL_LH_ZUP_CM`):** Left-handed, `+X` forward, `+Y` right, `+Z` up, **centimeters** (`100.0 = 1m`).
+   - Mapping `(X_bl, Y_bl, Z_bl) -> (100 * Y_bl, 100 * X_bl, 100 * Z_bl)` (X↔Y axis swap) is an **improper reflection (`det = -1`)** plus `×100` uniform scale. Any `.ply` / `.splat` handoff must transform **means**, **log-scales (`+ ln(100)`)**, **quaternion handedness** under the reflection basis `P`, and **SH1 directional lobes** together so anisotropic splats never mirror or turn spiky.
+3. **Canonical Shot Pack (`assets/shots/<shot_id>/shot.json`) & Shared Cloud Splat Service:**
+   - Bundle `splat.ply`, `proxy_collision.glb` (Chaos physics + Lumen contact-shadow receiver in UE; Cycles shadow-catcher + `splat.project_video` hull in Blender), `hero_assets.usd`/`.glb` (modeled/UV'd/rigged in Blender -> UE Interchange), and dual-convention `cameras.json` (Blender `matrix_world` + UE `CineCameraActor` / Sequencer track).
+   - Keep `splats/` (Modal `blenderbot-splat`) + `media_gen/` (Seedance 2.5) as a shared local/cloud studio service consumed by both `blenderbot` and `unrealbot`.
+4. **Lightweight Peer Delegation (`peer.delegate` via `-p --json` / Local Bridge):**
+   - **`unrealbot` $\rightarrow$ `blenderbot`:** Delegate procedural/hard-surface `bmesh` modeling, UV unwrapping, boolean beveling, and `scene.audit` manifold verification -> emit `.glb`/`.usd`.
+   - **`blenderbot` $\rightarrow$ `unrealbot`:** Delegate Lumen real-time lighting, Niagara VFX, Chaos sims, Sequencer assembly, and Movie Render Queue (MRQ) 4K60 rendering.
+   - **`blenderbot` / `unrealbot` $\rightarrow$ `davag`:** Delegate DaVinci Resolve timeline assembly, Fairlight `-14 LUFS` VO mastering, `.drx`/CDL grading, and final master delivery.
+
+---
+
+## 7. Rust / ARK / Minecraft FPS Camera-Rail, Subject-Track & Spatial Brief Sandbox (`splats/shot_pack.py`, `ui/web/`)
+
+Combines **MuleCreate's Brief-as-Product (`shot.usda` + `brief.md` + Hero Cameras + Raycast Pings)** with **FPS survival-builder muscle memory** directly inside the WebGL2 3DGS Splat & Voxel Stage (`🎮 FPS Rail Sandbox` / `F` key):
+
+1. **Authentic Rust / FPS Movement & Decoupled Gimbal Controls:**
+   - **Body Movement (`WASD` + `Shift` sprint + `Left Ctrl` silent slow-walk creep):** Moves along `bodyYaw`.
+   - **`T` Auto-Run + `Hold Alt` Over-the-Shoulder Free-Look (`CapsLock` gimbal-lock):** `T` cruises along a dead-straight dolly vector while holding `Alt` decouples head-look (`±175°` yaw / `±80°` pitch) to pan smoothly across landmarks without curving the dolly track — springing back forward on `Alt` release (or recording live via `Hold R`).
+   - **Stances & Cover Reveals:** Grounded `1.65m` walk (`G` toggles Drone Free-Fly), **`C` Crouch (`0.95m` waist hero angle)**, **`Z` Prone (`0.32m` worms-eye dolly)**, **`Space` jump/crane**, and **`Q` / `E` Corner Peek/Lean (`±0.42m` lateral offset + `±6.5°` roll)** for foreground-occlusion parallax reveals.
+   - **Optics, Target-Lock & Tactical Pings:** `Hold RMB` raycast-locks look-at onto any 3D splat/voxel landmark while circle-strafing; `Scroll` cycles prime lenses (`18mm..135mm`); `Hold B` = `135mm` binocular spotter; `MMB` = instant tactical landmark ping from any slot; `V` = push-to-callout ping; `Shift+F1..F4` / `F1..F4` = POV bookmarks; live **Top-Right Tactical Radar Minimap** displays body heading vs. `Alt` sight-cone, rails, subject track, voxels, and pings.
+2. **4-Slot Survival Hotbar (`Keys 1–4`) $\rightarrow$ 1-Click Shot Collateral Pack (`assets/shots/<shot_id>/`):**
+   - `[1] 🎥 Cam Node` (places frustum nodes on Catmull-Rom rail; `P` rides rail), `[2] 🏃 Subject Track` (places moving player/actor `1.75m` capsule waypoints relative to landmarks; `K` auto-tracks subject), `[3] 🧱 Voxel Block` (`[`/`]` `0.5m/1m/2m` snap-building; `X` breaks), `[4] 📍 Spatial Ping` (raycast beacon + Hero PNG + agent note).
+   - Exports `cameras.json`, ASCII OpenUSD `shot.usda` (`DirectorRailCam` + `SubjectActor` + `Voxel_###` + `Ping_##`), `blockout.glb`, clean `first_frame.png` / `last_frame.png`, `optical_prompt.txt`, and `brief.md` — with 1-click dispatch to **Seedance 2.5** (`🎬 → Seedance` + locked Camera Prior), **Modal H100** (`☁️ Modal Render`), and **Blender 5.3 + Agent Co-Pilot** (`🧊 → Blender+Brief`).

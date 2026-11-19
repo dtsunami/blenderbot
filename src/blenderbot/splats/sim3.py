@@ -572,3 +572,409 @@ def estimate_floor_aligned_sim3(
         floor_inlier_ratio=floor_inlier_ratio,
         baseline_ratio=baseline_ratio,
     )
+
+
+# ─── Camera Inverse Mapping, SLERP/Spline Trajectory & Pose Telemetry ─────────
+
+
+def blender_camera_to_opencv_w2c(
+    cam: dict[str, Any],
+    target_width: int | None = None,
+    target_height: int | None = None,
+) -> dict[str, Any]:
+    """Exact inverse of `opencv_w2c_to_blender_camera`.
+
+    Converts a `cameras.json` camera dict (`matrix_world` or `location` + `rotation_quaternion`)
+    into OpenCV `(R_w2c, t_w2c, fx, fy, cx, cy, width, height)` for `gsplat` rasterization or
+    known-pose video training.
+    """
+    if cam.get("matrix_world"):
+        mw = cam["matrix_world"]
+        r_bl: Mat3 = (
+            (float(mw[0][0]), float(mw[0][1]), float(mw[0][2])),
+            (float(mw[1][0]), float(mw[1][1]), float(mw[1][2])),
+            (float(mw[2][0]), float(mw[2][1]), float(mw[2][2])),
+        )
+        loc: Vec3 = (float(mw[0][3]), float(mw[1][3]), float(mw[2][3]))
+    else:
+        q = cam.get("rotation_quaternion") or [1.0, 0.0, 0.0, 0.0]
+        r_bl = quat_to_rotmat([float(x) for x in q])
+        raw_loc = cam.get("location") or [0.0, 0.0, 0.0]
+        loc = (float(raw_loc[0]), float(raw_loc[1]), float(raw_loc[2]))
+
+    # r_c2w = r_bl @ diag(1, -1, -1); r_w2c = r_c2w^T
+    r_w2c: Mat3 = (
+        (r_bl[0][0], r_bl[1][0], r_bl[2][0]),
+        (-r_bl[0][1], -r_bl[1][1], -r_bl[2][1]),
+        (-r_bl[0][2], -r_bl[1][2], -r_bl[2][2]),
+    )
+    rt_loc = mat3_vec(r_w2c, loc)
+    t_w2c: Vec3 = (-rt_loc[0], -rt_loc[1], -rt_loc[2])
+
+    src_w = int(cam.get("width") or target_width or 1280)
+    src_h = int(cam.get("height") or target_height or 720)
+    out_w = int(target_width or src_w)
+    out_h = int(target_height or src_h)
+
+    if cam.get("fx") and cam.get("fy"):
+        sx = out_w / float(max(1, src_w))
+        sy = out_h / float(max(1, src_h))
+        fx = float(cam["fx"]) * sx
+        fy = float(cam["fy"]) * sy
+        cx = float(cam.get("cx", src_w * 0.5)) * sx
+        cy = float(cam.get("cy", src_h * 0.5)) * sy
+    else:
+        lens_mm = float(cam.get("lens_mm", 50.0))
+        sensor_w = float(cam.get("sensor_width_mm", 36.0))
+        sfit = str(cam.get("sensor_fit", "HORIZONTAL" if out_w >= out_h else "VERTICAL"))
+        if sfit == "VERTICAL":
+            fy = lens_mm * float(out_h) / max(1e-4, sensor_w)
+            fx = fy
+        else:
+            fx = lens_mm * float(out_w) / max(1e-4, sensor_w)
+            fy = fx
+        max_dim = float(max(out_w, out_h))
+        shift_x = float(cam.get("shift_x", 0.0))
+        shift_y = float(cam.get("shift_y", 0.0))
+        cx = 0.5 * out_w - shift_x * max_dim
+        cy = 0.5 * out_h + shift_y * max_dim
+
+    return {
+        "R_w2c": [list(row) for row in r_w2c],
+        "t_w2c": list(t_w2c),
+        "fx": fx,
+        "fy": fy,
+        "cx": cx,
+        "cy": cy,
+        "width": out_w,
+        "height": out_h,
+    }
+
+
+def quat_slerp(q0: Sequence[float], q1: Sequence[float], t: float) -> QuatWXYZ:
+    """Shortest-arc spherical linear interpolation on unit `(w, x, y, z)` quaternions."""
+    qa = quat_normalize(q0)
+    qb = quat_normalize(q1)
+    dot = qa[0] * qb[0] + qa[1] * qb[1] + qa[2] * qb[2] + qa[3] * qb[3]
+    if dot < 0.0:
+        qb = (-qb[0], -qb[1], -qb[2], -qb[3])
+        dot = -dot
+    u = max(0.0, min(1.0, float(t)))
+    if dot > 0.9995:
+        return quat_normalize((
+            qa[0] + u * (qb[0] - qa[0]),
+            qa[1] + u * (qb[1] - qa[1]),
+            qa[2] + u * (qb[2] - qa[2]),
+            qa[3] + u * (qb[3] - qa[3]),
+        ))
+    theta_0 = math.acos(min(1.0, dot))
+    sin_0 = math.sin(theta_0)
+    theta = theta_0 * u
+    s0 = math.cos(theta) - dot * math.sin(theta) / sin_0
+    s1 = math.sin(theta) / sin_0
+    return quat_normalize((
+        s0 * qa[0] + s1 * qb[0],
+        s0 * qa[1] + s1 * qb[1],
+        s0 * qa[2] + s1 * qb[2],
+        s0 * qa[3] + s1 * qb[3],
+    ))
+
+
+def catmull_rom_vec3(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: float) -> Vec3:
+    """C1-smooth cubic Catmull-Rom spline between `p1` (`t=0`) and `p2` (`t=1`)."""
+    u = max(0.0, min(1.0, float(t)))
+    u2 = u * u
+    u3 = u2 * u
+    out = []
+    for k in range(3):
+        v = 0.5 * (
+            (2.0 * p1[k])
+            + (-p0[k] + p2[k]) * u
+            + (2.0 * p0[k] - 5.0 * p1[k] + 4.0 * p2[k] - p3[k]) * u2
+            + (-p0[k] + 3.0 * p1[k] - 3.0 * p2[k] + p3[k]) * u3
+        )
+        out.append(v)
+    return (out[0], out[1], out[2])
+
+
+def camera_orientation_angles_deg(quat_bl_wxyz: Sequence[float]) -> dict[str, Any]:
+    """Compute intuitive world-space camera basis + Yaw / Pitch / Roll (degrees) in Blender Z-up space.
+
+    - `forward`: optical look ray (`-Z_cam` in world)
+    - `yaw_deg`: horizontal heading relative to `+Y` forward (`+90°` = looking right `+X`)
+    - `pitch_deg`: elevation angle (`+` looking up `+Z`, `-` looking down)
+    - `roll_deg`: bank/tilt around optical axis relative to world horizon (`0°` = level)
+    """
+    r_bl = quat_to_rotmat(quat_bl_wxyz)
+    right: Vec3 = (r_bl[0][0], r_bl[1][0], r_bl[2][0])
+    up: Vec3 = (r_bl[0][1], r_bl[1][1], r_bl[2][1])
+    fwd: Vec3 = vec3_normalize((-r_bl[0][2], -r_bl[1][2], -r_bl[2][2]), fallback=(0.0, 1.0, 0.0))
+
+    yaw = math.degrees(math.atan2(fwd[0], fwd[1]))
+    pitch = math.degrees(math.asin(max(-1.0, min(1.0, fwd[2]))))
+
+    world_up: Vec3 = (0.0, 0.0, 1.0)
+    horiz_right_raw = vec3_cross(fwd, world_up)
+    if vec3_norm(horiz_right_raw) < 1e-5:
+        roll = 0.0
+    else:
+        h_right = vec3_normalize(horiz_right_raw)
+        h_up = vec3_normalize(vec3_cross(h_right, fwd))
+        roll = math.degrees(math.atan2(vec3_dot(right, h_up), vec3_dot(right, h_right)))
+
+    return {
+        "forward": [round(fwd[0], 5), round(fwd[1], 5), round(fwd[2], 5)],
+        "right": [round(right[0], 5), round(right[1], 5), round(right[2], 5)],
+        "up": [round(up[0], 5), round(up[1], 5), round(up[2], 5)],
+        "yaw_deg": yaw,
+        "pitch_deg": pitch,
+        "roll_deg": roll,
+    }
+
+
+def interpolate_camera_trajectory(
+    cameras_doc: dict[str, Any],
+    *,
+    fps: float | None = None,
+    duration_sec: float | None = None,
+    total_frames: int | None = None,
+    target_width: int | None = None,
+    target_height: int | None = None,
+) -> dict[str, Any]:
+    """Build a full-rate frame-accurate camera trajectory + orientation/velocity telemetry.
+
+    Recreates exact original video timing (`fps`, `duration_sec`, `total_frames`) from solved
+    keyframes (`pts_sec` or `frame_index`) using C1 Catmull-Rom positions and hemisphere-aligned
+    quaternion SLERP, marking exact solved keyframes (`is_keyframe: True`).
+    """
+    raw_cams = list(cameras_doc.get("cameras") or [])
+    if not raw_cams:
+        raise ValueError("cameras_doc contains no cameras.")
+
+    vmeta = cameras_doc.get("video_meta") or {}
+    eff_fps = float(fps or vmeta.get("fps") or 24.0)
+    eff_fps = max(1.0, min(240.0, eff_fps))
+
+    c0 = raw_cams[0]
+    out_w = int(target_width or vmeta.get("width") or c0.get("width") or 1280)
+    out_h = int(target_height or vmeta.get("height") or c0.get("height") or 720)
+    # Ensure even dimensions for H.264 yuv420p encoding
+    out_w = max(16, out_w - (out_w % 2))
+    out_h = max(16, out_h - (out_h % 2))
+
+    has_pts = any(c.get("pts_sec") is not None for c in raw_cams)
+    if duration_sec is not None:
+        eff_dur = max(0.0, float(duration_sec))
+    elif vmeta.get("duration_sec") is not None:
+        eff_dur = max(0.0, float(vmeta["duration_sec"]))
+    elif has_pts:
+        max_pts = max(float(c.get("pts_sec") or 0.0) for c in raw_cams)
+        eff_dur = max(max_pts + 1.0 / eff_fps, len(raw_cams) / eff_fps)
+    else:
+        eff_dur = max(0.0, (len(raw_cams) - 1) / eff_fps)
+
+    if total_frames is not None:
+        n_out = max(1, int(total_frames))
+    elif vmeta.get("total_frames"):
+        n_out = max(1, int(vmeta["total_frames"]))
+    elif has_pts or duration_sec is not None or vmeta.get("duration_sec") is not None:
+        n_out = max(1, round(eff_dur * eff_fps))
+    else:
+        n_out = len(raw_cams)
+
+    # Normalize & sort keyframes by timestamp `t_sec`
+    k_times: list[float] = []
+    k_locs: list[Vec3] = []
+    k_quats: list[QuatWXYZ] = []
+    k_intr: list[dict[str, float]] = []
+    k_names: list[str] = []
+
+    span_dur = max(1e-6, (n_out - 1) / eff_fps)
+    n_k = len(raw_cams)
+    prev_q: QuatWXYZ | None = None
+
+    for idx, c in enumerate(raw_cams):
+        if c.get("pts_sec") is not None:
+            tk = float(c["pts_sec"])
+        elif n_k > 1:
+            tk = (idx / float(n_k - 1)) * span_dur
+        else:
+            tk = 0.0
+        # Ensure strictly non-decreasing timestamps
+        if k_times and tk <= k_times[-1]:
+            tk = k_times[-1] + 1e-4
+        k_times.append(tk)
+
+        loc_c = c.get("location")
+        if loc_c is None and c.get("matrix_world"):
+            mw = c["matrix_world"]
+            loc_c = [mw[0][3], mw[1][3], mw[2][3]]
+        loc_v: Vec3 = (float(loc_c[0]), float(loc_c[1]), float(loc_c[2])) if loc_c else (0.0, 0.0, 0.0)
+        k_locs.append(loc_v)
+
+        if c.get("rotation_quaternion"):
+            rq = quat_normalize([float(x) for x in c["rotation_quaternion"]])
+        elif c.get("matrix_world"):
+            mw = c["matrix_world"]
+            rq = rotmat_to_quat((
+                (float(mw[0][0]), float(mw[0][1]), float(mw[0][2])),
+                (float(mw[1][0]), float(mw[1][1]), float(mw[1][2])),
+                (float(mw[2][0]), float(mw[2][1]), float(mw[2][2])),
+            ))
+        else:
+            rq = (1.0, 0.0, 0.0, 0.0)
+
+        if prev_q is not None and (prev_q[0] * rq[0] + prev_q[1] * rq[1] + prev_q[2] * rq[2] + prev_q[3] * rq[3]) < 0.0:
+            rq = (-rq[0], -rq[1], -rq[2], -rq[3])
+        prev_q = rq
+        k_quats.append(rq)
+
+        cv_info = blender_camera_to_opencv_w2c(c, target_width=out_w, target_height=out_h)
+        k_intr.append({
+            "fx": cv_info["fx"],
+            "fy": cv_info["fy"],
+            "cx": cv_info["cx"],
+            "cy": cv_info["cy"],
+            "lens_mm": float(c.get("lens_mm", 50.0)),
+            "sensor_width_mm": float(c.get("sensor_width_mm", 36.0)),
+        })
+        k_names.append(str(c.get("image_name") or f"key_{idx:04d}"))
+
+    # Map each solved keyframe to its closest output frame index for clean timeline markers
+    keyframe_At_out: dict[int, dict[str, Any]] = {}
+    for ki, tk in enumerate(k_times):
+        out_fi = max(0, min(n_out - 1, round(tk * eff_fps)))
+        if out_fi not in keyframe_At_out:
+            keyframe_At_out[out_fi] = {"key_index": ki, "image_name": k_names[ki], "pts_sec": round(tk, 4)}
+
+    frames_out: list[dict[str, Any]] = []
+    seg_i = 0
+    prev_yaw: float | None = None
+    prev_loc: Vec3 | None = None
+    prev_q_out: QuatWXYZ | None = None
+    dt_frame = 1.0 / eff_fps
+
+    for fi in range(n_out):
+        t_cur = fi * dt_frame if n_out > 1 else 0.0
+        if n_k == 1 or t_cur <= k_times[0]:
+            loc_f = k_locs[0]
+            q_f = k_quats[0]
+            intr_f = dict(k_intr[0])
+        elif t_cur >= k_times[-1]:
+            loc_f = k_locs[-1]
+            q_f = k_quats[-1]
+            intr_f = dict(k_intr[-1])
+        else:
+            while seg_i + 1 < n_k - 1 and k_times[seg_i + 1] < t_cur:
+                seg_i += 1
+            t0, t1 = k_times[seg_i], k_times[seg_i + 1]
+            u = (t_cur - t0) / max(1e-8, t1 - t0)
+            p0 = k_locs[max(0, seg_i - 1)]
+            p1 = k_locs[seg_i]
+            p2 = k_locs[seg_i + 1]
+            p3 = k_locs[min(n_k - 1, seg_i + 2)]
+            loc_f = catmull_rom_vec3(p0, p1, p2, p3, u)
+            q_f = quat_slerp(k_quats[seg_i], k_quats[seg_i + 1], u)
+            i0, i1 = k_intr[seg_i], k_intr[seg_i + 1]
+            intr_f = {
+                k: i0[k] + u * (i1[k] - i0[k])
+                for k in ("fx", "fy", "cx", "cy", "lens_mm", "sensor_width_mm")
+            }
+
+        if prev_q_out is not None and (
+            prev_q_out[0] * q_f[0] + prev_q_out[1] * q_f[1] + prev_q_out[2] * q_f[2] + prev_q_out[3] * q_f[3]
+        ) < 0.0:
+            q_f = (-q_f[0], -q_f[1], -q_f[2], -q_f[3])
+
+        angles = camera_orientation_angles_deg(q_f)
+        yaw = angles["yaw_deg"]
+        if prev_yaw is not None:
+            while yaw - prev_yaw > 180.0:
+                yaw -= 360.0
+            while yaw - prev_yaw < -180.0:
+                yaw += 360.0
+        prev_yaw = yaw
+
+        if prev_loc is not None:
+            speed = vec3_norm(vec3_sub(loc_f, prev_loc)) / dt_frame
+        else:
+            speed = 0.0
+        if prev_q_out is not None:
+            dq_dot = min(1.0, abs(
+                prev_q_out[0] * q_f[0] + prev_q_out[1] * q_f[1] + prev_q_out[2] * q_f[2] + prev_q_out[3] * q_f[3]
+            ))
+            ang_vel = math.degrees(2.0 * math.acos(dq_dot)) / dt_frame
+        else:
+            ang_vel = 0.0
+
+        prev_loc = loc_f
+        prev_q_out = q_f
+
+        bl_cam_tmp = {
+            "location": list(loc_f),
+            "rotation_quaternion": list(q_f),
+            "fx": intr_f["fx"],
+            "fy": intr_f["fy"],
+            "cx": intr_f["cx"],
+            "cy": intr_f["cy"],
+            "width": out_w,
+            "height": out_h,
+        }
+        cv_w2c = blender_camera_to_opencv_w2c(bl_cam_tmp, target_width=out_w, target_height=out_h)
+        kf_meta = keyframe_At_out.get(fi)
+
+        frames_out.append({
+            "frame": fi + 1,
+            "pts_sec": round(t_cur, 4),
+            "is_keyframe": kf_meta is not None,
+            "keyframe_index": kf_meta["key_index"] if kf_meta else None,
+            "image_name": kf_meta["image_name"] if kf_meta else None,
+            "location": [round(loc_f[0], 5), round(loc_f[1], 5), round(loc_f[2], 5)],
+            "rotation_quaternion": [round(q_f[0], 6), round(q_f[1], 6), round(q_f[2], 6), round(q_f[3], 6)],
+            "forward": angles["forward"],
+            "right": angles["right"],
+            "up": angles["up"],
+            "yaw_deg": round(yaw, 2),
+            "pitch_deg": round(angles["pitch_deg"], 2),
+            "roll_deg": round(angles["roll_deg"], 2),
+            "speed_m_s": round(speed, 4),
+            "ang_vel_deg_s": round(ang_vel, 2),
+            "lens_mm": round(intr_f["lens_mm"], 3),
+            "sensor_width_mm": round(intr_f["sensor_width_mm"], 2),
+            "width": out_w,
+            "height": out_h,
+            "fx": round(cv_w2c["fx"], 4),
+            "fy": round(cv_w2c["fy"], 4),
+            "cx": round(cv_w2c["cx"], 4),
+            "cy": round(cv_w2c["cy"], 4),
+            "R_w2c": cv_w2c["R_w2c"],
+            "t_w2c": cv_w2c["t_w2c"],
+        })
+
+    # Path summary bounds & total travel distance
+    xs = [f["location"][0] for f in frames_out]
+    ys = [f["location"][1] for f in frames_out]
+    zs = [f["location"][2] for f in frames_out]
+    total_dist = sum(
+        vec3_norm(vec3_sub(frames_out[i]["location"], frames_out[i - 1]["location"]))
+        for i in range(1, len(frames_out))
+    )
+
+    return {
+        "job_id": cameras_doc.get("job_id", ""),
+        "fps": round(eff_fps, 4),
+        "duration_sec": round((n_out - 1) / eff_fps if n_out > 1 else eff_dur, 4),
+        "total_frames": n_out,
+        "solved_keyframes": n_k,
+        "width": out_w,
+        "height": out_h,
+        "pose_backend": cameras_doc.get("pose_backend", "vggt"),
+        "path_length_m": round(total_dist, 4),
+        "bounds_min": [round(min(xs), 4), round(min(ys), 4), round(min(zs), 4)],
+        "bounds_max": [round(max(xs), 4), round(max(ys), 4), round(max(zs), 4)],
+        "keyframe_markers": [
+            {"frame": fi + 1, **meta}
+            for fi, meta in sorted(keyframe_At_out.items())
+        ],
+        "frames": frames_out,
+    }

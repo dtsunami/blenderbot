@@ -1,8 +1,9 @@
 """Modal Serverless H100 / L40S 3DGS Worker (`modal deploy src/blenderbot/splats/modal_app.py`).
 
-Compiles `gsplat.csrc` directly into `site-packages` (`--no-binary gsplat` on 16 vCPUs, so runtime
+Compiles `gsplat.csrc` directly into `site-packages` (`--no-binary gsplat` on 32 vCPUs, so runtime
 never invokes `cpp_extension.load` / `ninja`), pre-caches `facebook/VGGT-1B` in `blenderbot-splat-models`,
-and stores resumable burst checkpoints on `blenderbot-splat-jobs`.
+stores resumable burst checkpoints on `blenderbot-splat-jobs`, polls live mid-train controls via
+`blenderbot-splat-ctl`, and farms full-rate trajectory MP4 renders (`render_trajectory_stream`).
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import modal
 APP_NAME = "blenderbot-splat"
 MODELS_VOL_NAME = "blenderbot-splat-models"
 JOBS_VOL_NAME = "blenderbot-splat-jobs"
+CTL_DICT_NAME = "blenderbot-splat-ctl"
 
 GPU_HOURLY_USD: dict[str, float] = {
     "H100": 3.95,
@@ -28,6 +30,7 @@ GPU_HOURLY_USD: dict[str, float] = {
 
 models_vol = modal.Volume.from_name(MODELS_VOL_NAME, create_if_missing=True)
 jobs_vol = modal.Volume.from_name(JOBS_VOL_NAME, create_if_missing=True)
+ctl_dict = modal.Dict.from_name(CTL_DICT_NAME, create_if_missing=True)
 
 
 def _bake_csrc() -> None:
@@ -140,7 +143,9 @@ class _BaseSplatWorker:
         job_id: str,
         mp4_bytes: bytes | None = None,
         views_tar_gz: bytes | None = None,
+        known_cameras_json: str | None = None,
         cfg_dict: dict[str, Any] | None = None,
+        cfg_overrides: dict[str, Any] | None = None,
         add_steps: int | None = None,
         surgery_dict: dict[str, Any] | None = None,
         masks_b64: dict[str, str] | None = None,
@@ -150,9 +155,25 @@ class _BaseSplatWorker:
         from blenderbot.splats.core_worker import run_splat_job_stream
 
         jobs_vol.reload()
+        # Clear any stale live-control entry from a prior run on this job_id
+        try:
+            ctl_dict.pop(job_id, None)
+        except Exception:  # noqa: BLE001, S110
+            pass
+
+        def _poll_ctl() -> dict[str, Any] | None:
+            try:
+                val = ctl_dict.get(job_id)
+                return val if isinstance(val, dict) else None
+            except Exception:  # noqa: BLE001
+                return None
+
         cfg = SplatConfig.from_dict(cfg_dict) if cfg_dict else None
         surgery = SurgerySpec.from_dict(surgery_dict) if surgery_dict else None
-        gpu_name = (cfg.gpu if cfg else "H100").upper()
+        gpu_name = str(
+            (cfg_overrides or {}).get("gpu")
+            or (cfg.gpu if cfg else "H100")
+        ).upper()
         rate = GPU_HOURLY_USD.get(gpu_name, 3.95)
 
         for ev in run_splat_job_stream(
@@ -161,17 +182,46 @@ class _BaseSplatWorker:
             models_dir=Path("/models"),
             mp4_bytes=mp4_bytes,
             views_tar_gz=views_tar_gz,
+            known_cameras_json=known_cameras_json,
             cfg=cfg,
+            cfg_overrides=cfg_overrides,
             add_steps=add_steps,
             surgery=surgery,
             masks_b64=masks_b64,
             exclude_frames=exclude_frames,
+            control_poll_fn=_poll_ctl,
             gpu_hourly_usd=rate,
             ram_cache=self._ram_cache,
         ):
-            if ev.get("event") == "done":
+            if ev.get("event") in ("done", "checkpoint_saved"):
                 jobs_vol.commit()
             yield ev
+
+    @modal.method()
+    def render_trajectory_stream(
+        self,
+        *,
+        job_id: str,
+        trajectory_doc: dict[str, Any],
+        ply_gz: bytes | None = None,
+        gpu: str = "H100",
+        rasterize_mode: str = "antialiased",
+        bg_rgb: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    ) -> Iterator[dict[str, Any]]:
+        from blenderbot.splats.core_worker import render_splat_trajectory_stream
+
+        jobs_vol.reload()
+        rate = GPU_HOURLY_USD.get(gpu.upper(), 3.95)
+        yield from render_splat_trajectory_stream(
+            job_id=job_id,
+            jobs_root=Path("/jobs"),
+            trajectory_doc=trajectory_doc,
+            ply_gz=ply_gz,
+            rasterize_mode=rasterize_mode,
+            bg_rgb=bg_rgb,
+            gpu_hourly_usd=rate,
+            ram_cache=self._ram_cache,
+        )
 
 
 @app.cls(

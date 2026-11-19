@@ -45,6 +45,7 @@ WRITE_PATH_PARAM_OPS: dict[str, str] = {
     "render.still": "output_path",
     "render.animation": "output_path",
     "splat.capture_views": "output_path",
+    "splat.export_camera_path": "output_path",
 }
 
 READ_PATH_PARAM_OPS: dict[str, str] = {
@@ -52,6 +53,7 @@ READ_PATH_PARAM_OPS: dict[str, str] = {
     "asset.import": "filepath",
     "asset.blend_append": "filepath",
     "splat.import": "filepath",
+    "splat.import_cameras": "cameras_json",
     "splat.project_video": "video_path",
 }
 
@@ -207,8 +209,34 @@ def plan_batch(
                         errors.append(
                             {"index": call.index, "op": call.op, "message": f"{sandbox.rel(vf)} does not exist"}
                         )
+                if p.get("known_cameras_path"):
+                    kf = sandbox.resolve_for_read(str(p["known_cameras_path"]))
+                    if not kf.is_file():
+                        errors.append(
+                            {"index": call.index, "op": call.op, "message": f"{sandbox.rel(kf)} does not exist"}
+                        )
                 if p.get("output_dir"):
                     sandbox.resolve_for_write(str(p["output_dir"]))
+            elif call.op == "splat.render_path":
+                p = call.params
+                if not p.get("job_id") and not p.get("ply_path"):
+                    errors.append(
+                        {"index": call.index, "op": call.op, "message": "splat.render_path requires 'job_id' or 'ply_path'"}
+                    )
+                if p.get("ply_path"):
+                    pf = sandbox.resolve_for_read(str(p["ply_path"]))
+                    if not pf.is_file():
+                        errors.append(
+                            {"index": call.index, "op": call.op, "message": f"{sandbox.rel(pf)} does not exist"}
+                        )
+                if p.get("cameras_json"):
+                    cf = sandbox.resolve_for_read(str(p["cameras_json"]))
+                    if not cf.is_file():
+                        errors.append(
+                            {"index": call.index, "op": call.op, "message": f"{sandbox.rel(cf)} does not exist"}
+                        )
+                if p.get("output_path"):
+                    sandbox.resolve_for_write(str(p["output_path"]))
             elif call.op == "splat.from_blender":
                 p = call.params
                 if p.get("views_bundle_path"):
@@ -467,8 +495,13 @@ def _normalize_blender_params(call: OpCall, sandbox: Sandbox) -> dict[str, Any]:
         key = READ_PATH_PARAM_OPS[call.op]
         if params.get(key):
             params[key] = str(sandbox.resolve_for_read(str(params[key])))
-    if call.op == "splat.import" and params.get("cameras_json"):
-        params["cameras_json"] = str(sandbox.resolve_for_read(str(params["cameras_json"])))
+    if call.op == "splat.import":
+        if params.get("cameras_json"):
+            params["cameras_json"] = str(sandbox.resolve_for_read(str(params["cameras_json"])))
+        if params.get("proxy_glb_path"):
+            params["proxy_glb_path"] = str(sandbox.resolve_for_read(str(params["proxy_glb_path"])))
+    if call.op == "splat.import_cameras" and params.get("overlay_path"):
+        params["overlay_path"] = str(sandbox.resolve_for_read(str(params["overlay_path"])))
 
     return params
 
@@ -633,20 +666,20 @@ async def execute_batch(
                 from blenderbot.splats.config import SplatConfig, SurgerySpec
 
                 p = call.params
-                splat_cfg = SplatConfig.from_dict(p.get("config") or p)
-                if p.get("gpu"):
-                    splat_cfg.gpu = str(p["gpu"]).upper()
-                if p.get("iterations") is not None:
-                    splat_cfg.train.iterations = int(p["iterations"])
-                if p.get("sh_degree") is not None:
-                    splat_cfg.train.sh_degree = int(p["sh_degree"])
-                if p.get("pose_backend"):
-                    splat_cfg.pose.backend = str(p["pose_backend"])
+                is_res_op = call.op == "splat.resume"
+                raw_overrides = dict(p.get("config") or {})
+                for fk, fv in p.items():
+                    if fk not in ("config", "surgery", "masks", "exclude_frames") and fv is not None:
+                        raw_overrides.setdefault(fk, fv)
+                splat_cfg = None if is_res_op else SplatConfig.from_dict(raw_overrides)
 
                 video_p: Path | None = None
                 bundle_p: Path | None = None
+                known_cams_p: Path | None = None
                 if call.op == "splat.from_video":
                     video_p = sandbox.resolve_for_read(str(p["video_path"]))
+                    if p.get("known_cameras_path"):
+                        known_cams_p = sandbox.resolve_for_read(str(p["known_cameras_path"]))
                     job_id = str(p.get("job_id") or make_job_id(video_p))
                 elif call.op == "splat.from_blender":
                     job_id = str(p.get("job_id") or make_job_id(Path("blender_scene")))
@@ -702,7 +735,9 @@ async def execute_batch(
                     job_id=job_id,
                     video_path=video_p,
                     views_bundle_path=bundle_p,
+                    known_cameras_path=known_cams_p,
                     cfg=splat_cfg,
+                    cfg_overrides=raw_overrides if is_res_op else None,
                     add_steps=int(p["add_steps"]) if p.get("add_steps") is not None else None,
                     surgery=surg_spec,
                     masks_paths=masks_map,
@@ -716,6 +751,7 @@ async def execute_batch(
                         "cameras_json": str(splat_res.cameras_path),
                         "render_mode": str(p.get("render_mode") or "pointcloud"),
                         "max_points": int(p.get("max_points", 250_000)),
+                        "import_proxy_mesh": bool(p.get("import_proxy_mesh", False)),
                     }
                     if p.get("name"):
                         imp_params["name"] = str(p["name"])
@@ -737,11 +773,73 @@ async def execute_batch(
                     "macro_timings": splat_res.macro_timings,
                     "ply_path": sandbox.rel(splat_res.ply_path),
                     "splat_path": sandbox.rel(splat_res.splat_path) if splat_res.splat_path else None,
+                    "proxy_glb_path": sandbox.rel(splat_res.proxy_glb_path) if splat_res.proxy_glb_path else None,
                     "cameras_path": sandbox.rel(splat_res.cameras_path),
                     "views_bundle_path": sandbox.rel(bundle_p) if bundle_p else None,
                     "imported": imported_info,
                 }
                 mutated_ops_names.append(f"{call.op}({splat_res.job_id})")
+            elif call.op == "splat.render_path":
+                from blenderbot.splats.client import run_modal_splat_render
+                from blenderbot.splats.sim3 import interpolate_camera_trajectory
+
+                p = call.params
+                job_id = str(p.get("job_id") or "")
+                if p.get("ply_path"):
+                    ply_fb = sandbox.resolve_for_read(str(p["ply_path"]))
+                    if not job_id:
+                        job_id = ply_fb.parent.name
+                else:
+                    jdir = sandbox.resolve_for_read(f"assets/splats/{job_id}")
+                    ply_fb = jdir / "splat.ply"
+
+                if p.get("cameras_json"):
+                    cams_p = sandbox.resolve_for_read(str(p["cameras_json"]))
+                    cams_doc = json.loads(cams_p.read_text(encoding="utf-8"))
+                elif p.get("blender_camera") and transport is not None:
+                    exp_c = await transport.call(
+                        "splat.export_camera_path",
+                        {"camera": str(p["blender_camera"])},
+                        timeout=60.0,
+                    )
+                    cams_doc = exp_c["cameras_doc"]
+                else:
+                    cams_p = ply_fb.parent / "cameras.json"
+                    cams_doc = json.loads(cams_p.read_text(encoding="utf-8"))
+
+                traj_doc = interpolate_camera_trajectory(
+                    cams_doc,
+                    fps=float(p["fps"]) if p.get("fps") is not None else None,
+                    duration_sec=float(p["duration_sec"]) if p.get("duration_sec") is not None else None,
+                    total_frames=int(p["total_frames"]) if p.get("total_frames") is not None else None,
+                    target_width=int(p["width"]) if p.get("width") is not None else None,
+                    target_height=int(p["height"]) if p.get("height") is not None else None,
+                )
+                out_mp4 = (
+                    sandbox.resolve_for_write(str(p["output_path"]))
+                    if p.get("output_path")
+                    else (ply_fb.parent / "renders" / "modal_recreated.mp4")
+                )
+                r_res = await run_modal_splat_render(
+                    job_id=job_id,
+                    output_mp4=out_mp4,
+                    trajectory_doc=traj_doc,
+                    ply_fallback_path=ply_fb if ply_fb.is_file() else None,
+                    gpu=str(p.get("gpu") or "H100"),
+                )
+                res = {
+                    "job_id": job_id,
+                    "output_path": sandbox.rel(r_res.output_mp4),
+                    "frames": r_res.frames,
+                    "fps": r_res.fps,
+                    "resolution": [r_res.width, r_res.height],
+                    "render_fps": r_res.render_fps,
+                    "wall_s": r_res.wall_s,
+                    "cost_usd": r_res.cost_usd,
+                }
+                if bool(p.get("attach_to_context", False)):
+                    attached_media.extend(_collect_media_attachments(call, {"output_path": str(r_res.output_mp4)}, sandbox))
+                mutated_ops_names.append(f"splat.render_path({sandbox.rel(r_res.output_mp4)})")
             else:
                 assert transport is not None
                 call_params = _normalize_blender_params(call, sandbox)

@@ -10,9 +10,10 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from blenderbot.agent.sandbox import Sandbox
+if TYPE_CHECKING:
+    from blenderbot.agent.sandbox import Sandbox
 
 from .tokens import VIDEO_TOKENS_PER_SECOND, estimate_image_tokens, estimate_video_tokens
 

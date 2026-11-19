@@ -64,6 +64,7 @@ BUILDER_EXTRA_OPS = READ_ONLY_EXTRA_OPS | frozenset(
         "splat.from_video",
         "splat.from_blender",
         "splat.resume",
+        "splat.render_path",
     }
 )
 

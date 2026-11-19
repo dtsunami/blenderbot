@@ -13,12 +13,13 @@ import json
 import math
 import os
 import random
+import re
 import shutil
 import struct
 import subprocess
 import tarfile
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -29,10 +30,12 @@ import torch.nn.functional as F
 from PIL import Image
 
 from .config import ExtractConfig, PoseConfig, SplatConfig, SurgerySpec
+from .proxy_mesh import build_proxy_glb_bytes
 from .sim3 import (
     Sim3Transform,
     apply_sim3_to_camera_w2c,
     estimate_floor_aligned_sim3,
+    interpolate_camera_trajectory,
     opencv_w2c_to_blender_camera,
 )
 
@@ -45,32 +48,58 @@ _VGGT_CACHE: dict[str, Any] = {}
 # ─── Stage 1: Fast FFmpeg Frame Extraction ────────────────────────────────────
 
 
-def _probe_video_duration_fps(video_path: Path) -> tuple[float, float]:
+def _probe_video_meta(video_path: Path) -> dict[str, Any]:
     cmd = [
         "ffprobe",
         "-v", "error",
         "-select_streams", "v:0",
-        "-show_entries", "stream=r_frame_rate:format=duration",
+        "-show_entries", "stream=width,height,r_frame_rate,nb_frames:format=duration",
         "-of", "json",
         str(video_path),
     ]
     res = subprocess.run(cmd, capture_output=True, text=True, check=False)
     dur = 5.0
     fps = 24.0
+    width = 1280
+    height = 720
+    nb_frames = 0
     try:
         info = json.loads(res.stdout or "{}")
         dur = float((info.get("format") or {}).get("duration") or 5.0)
-        rate_str = ((info.get("streams") or [{}])[0]).get("r_frame_rate", "24/1")
+        st0 = (info.get("streams") or [{}])[0]
+        rate_str = str(st0.get("r_frame_rate") or "24/1")
         num, den = rate_str.split("/")
         fps = float(num) / max(float(den), 1.0)
+        width = int(st0.get("width") or width)
+        height = int(st0.get("height") or height)
+        if st0.get("nb_frames") and str(st0["nb_frames"]).isdigit():
+            nb_frames = int(st0["nb_frames"])
     except Exception:  # noqa: BLE001, S110
         pass
-    return dur, fps
+    if nb_frames <= 0:
+        nb_frames = max(1, round(dur * fps))
+    return {
+        "duration_sec": round(dur, 4),
+        "fps": round(fps, 4),
+        "total_frames": nb_frames,
+        "width": width,
+        "height": height,
+    }
 
 
-def extract_frames(video_path: Path, frames_dir: Path, cfg: ExtractConfig) -> list[Path]:
+def _probe_video_duration_fps(video_path: Path) -> tuple[float, float]:
+    m = _probe_video_meta(video_path)
+    return float(m["duration_sec"]), float(m["fps"])
+
+
+def extract_frames_with_meta(
+    video_path: Path, frames_dir: Path, cfg: ExtractConfig
+) -> tuple[list[Path], dict[str, float], dict[str, Any]]:
+    """Extract sharp keyframes AND capture exact per-frame `pts_sec` + native `video_meta`."""
     frames_dir.mkdir(parents=True, exist_ok=True)
-    dur, _native_fps = _probe_video_duration_fps(video_path)
+    vmeta = _probe_video_meta(video_path)
+    dur = float(vmeta["duration_sec"])
+    native_fps = float(vmeta["fps"])
     sample_fps = cfg.fps
     if dur > 0 and cfg.max_frames > 0 and (dur * sample_fps) > cfg.max_frames:
         sample_fps = cfg.max_frames / dur
@@ -80,6 +109,7 @@ def extract_frames(video_path: Path, frames_dir: Path, cfg: ExtractConfig) -> li
         vf_parts.append("mpdecimate=hi=64*8:lo=64*3:frac=0.25")
     if cfg.max_width > 0:
         vf_parts.append(f"scale='min({cfg.max_width},iw)':-2:flags=lanczos")
+    vf_parts.append("showinfo")
 
     qscale = max(1, min(10, 32 - cfg.quality // 3))
     out_pat = str(frames_dir / "frame_%05d.jpg")
@@ -89,25 +119,39 @@ def extract_frames(video_path: Path, frames_dir: Path, cfg: ExtractConfig) -> li
         "-vf", ",".join(vf_parts),
         "-vsync", "vfr" if cfg.dedup_frames else "passthrough",
         "-q:v", str(qscale),
-        "-hide_banner", "-loglevel", "error",
+        "-hide_banner", "-loglevel", "info",
         out_pat,
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg extract failed: {proc.stderr[-600:]}")
 
+    raw_pts = [float(x) for x in re.findall(r"pts_time:([0-9.]+)", proc.stderr or "")]
     frames = sorted(frames_dir.glob("frame_*.jpg"))
+    if len(raw_pts) == len(frames):
+        pts_list = raw_pts
+    else:
+        span_end = max(0.0, dur - 1.0 / max(1.0, native_fps))
+        pts_list = np.linspace(0.0, span_end, max(1, len(frames))).tolist()
+
+    pts_by_name: dict[str, float] = {fp.name: round(float(pt), 5) for fp, pt in zip(frames, pts_list)}
+
     if cfg.max_frames > 0 and len(frames) > cfg.max_frames:
-        # Uniform subsample if mpdecimate kept more than max_frames
         idxs = np.linspace(0, len(frames) - 1, cfg.max_frames, dtype=int)
         keep_set = {frames[i] for i in idxs}
         for f in frames:
             if f not in keep_set:
+                pts_by_name.pop(f.name, None)
                 f.unlink(missing_ok=True)
         frames = sorted(frames_dir.glob("frame_*.jpg"))
 
     if len(frames) < 3:
         raise RuntimeError(f"Too few frames extracted ({len(frames)}). Need at least 3 frames.")
+    return frames, pts_by_name, vmeta
+
+
+def extract_frames(video_path: Path, frames_dir: Path, cfg: ExtractConfig) -> list[Path]:
+    frames, _, _ = extract_frames_with_meta(video_path, frames_dir, cfg)
     return frames
 
 
@@ -279,12 +323,41 @@ _COLMAP_CAMERA_MODELS: dict[int, tuple[str, int]] = {
 }
 
 
+def _estimate_umeyama_sim3(src_pts: np.ndarray, dst_pts: np.ndarray) -> Sim3Transform:
+    """Closed-form proper `det(R)=+1` Umeyama Sim(3) aligning COLMAP camera centers onto Blender priors."""
+    if len(src_pts) < 3 or len(src_pts) != len(dst_pts):
+        return Sim3Transform.identity()
+    mu_s = src_pts.mean(axis=0)
+    mu_d = dst_pts.mean(axis=0)
+    xs = src_pts - mu_s
+    xd = dst_pts - mu_d
+    var_s = float((xs * xs).sum() / len(src_pts))
+    if var_s < 1e-10:
+        return Sim3Transform(scale=1.0, R=((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0)), t=tuple((mu_d - mu_s).tolist()))  # type: ignore[arg-type]
+
+    cov = (xd.T @ xs) / float(len(src_pts))
+    u_m, s_v, vt_m = np.linalg.svd(cov)
+    d_sign = np.eye(3, dtype=np.float64)
+    if np.linalg.det(u_m @ vt_m) < 0.0:
+        d_sign[2, 2] = -1.0
+    r_mat = u_m @ d_sign @ vt_m
+    scale = max(1e-3, min(1e3, float(np.sum(s_v * np.diag(d_sign)) / var_s)))
+    t_vec = mu_d - scale * (r_mat @ mu_s)
+    r_tup = (
+        (float(r_mat[0, 0]), float(r_mat[0, 1]), float(r_mat[0, 2])),
+        (float(r_mat[1, 0]), float(r_mat[1, 1]), float(r_mat[1, 2])),
+        (float(r_mat[2, 0]), float(r_mat[2, 1]), float(r_mat[2, 2])),
+    )
+    return Sim3Transform(scale=scale, R=r_tup, t=(float(t_vec[0]), float(t_vec[1]), float(t_vec[2])))
+
+
 def solve_poses_colmap(
     frames_dir: Path,
     work_dir: Path,
     cfg: PoseConfig,
+    prior_intrinsics: tuple[float, float, float, float] | None = None,
 ) -> tuple[list[dict[str, Any]], np.ndarray, np.ndarray]:
-    """Run COLMAP sequential SfM + undistort and parse `cameras.bin`, `images.bin`, `points3D.bin`."""
+    """Run COLMAP sequential SfM (`PINHOLE` + optional Blender `K` lock) and parse binary outputs."""
     sfm_dir = work_dir / "colmap"
     db_path = sfm_dir / "database.db"
     sparse_dir = sfm_dir / "sparse"
@@ -301,15 +374,21 @@ def solve_poses_colmap(
             tail = (proc.stdout + "\n" + proc.stderr)[-800:]
             raise RuntimeError(f"COLMAP {step_name} failed:\n{tail}")
 
-    _colmap([
+    cam_model = "PINHOLE" if getattr(cfg, "lock_pinhole_intrinsics", True) or prior_intrinsics else "OPENCV"
+    feat_args = [
         "feature_extractor",
         "--database_path", str(db_path),
         "--image_path", str(frames_dir),
         "--ImageReader.single_camera", "1",
-        "--ImageReader.camera_model", "OPENCV",
+        "--ImageReader.camera_model", cam_model,
         "--SiftExtraction.use_gpu", "0",
         "--SiftExtraction.num_threads", "16",
-    ], "feature_extractor")
+    ]
+    if prior_intrinsics is not None:
+        fx_p, fy_p, cx_p, cy_p = prior_intrinsics
+        feat_args.extend(["--ImageReader.camera_params", f"{fx_p:.4f},{fy_p:.4f},{cx_p:.4f},{cy_p:.4f}"])
+    _colmap(feat_args, "feature_extractor")
+
     _colmap([
         "sequential_matcher",
         "--database_path", str(db_path),
@@ -317,12 +396,19 @@ def solve_poses_colmap(
         "--SiftMatching.use_gpu", "0",
         "--SiftMatching.num_threads", "16",
     ], "sequential_matcher")
-    _colmap([
+
+    mapper_args = [
         "mapper",
         "--database_path", str(db_path),
         "--image_path", str(frames_dir),
         "--output_path", str(sparse_dir),
-    ], "mapper")
+    ]
+    if prior_intrinsics is not None:
+        mapper_args.extend([
+            "--Mapper.ba_refine_focal_length", "0",
+            "--Mapper.ba_refine_extra_params", "0",
+        ])
+    _colmap(mapper_args, "mapper")
 
     sub_models = sorted(
         (p for p in sparse_dir.iterdir() if p.is_dir() and (p / "images.bin").is_file()),
@@ -423,6 +509,141 @@ def solve_poses_colmap(
         sel = np.random.default_rng(42).choice(len(xyz), size=cfg.max_init_points, replace=False)
         xyz, rgb = xyz[sel], rgb[sel]
     return cam_records, xyz, rgb
+
+
+# ─── Stage 2C: Known-Pose Seedance Video Re-Polish (Locked Blender Cameras!) ──
+
+
+def solve_known_cameras_video(
+    frame_paths: list[Path],
+    pts_by_name: dict[str, float],
+    video_meta: dict[str, Any],
+    known_cameras_doc: dict[str, Any],
+    cfg: PoseConfig,
+    device: torch.device,
+    models_dir: Path | None = None,
+) -> tuple[list[dict[str, Any]], np.ndarray, np.ndarray]:
+    """Lock extracted Seedance video frames onto exact known Blender camera poses (zero Sim3 drift).
+
+    Uses VGGT metric depth maps unprojected directly through the known `(R_w2c, t_w2c, K)` when
+    available, falling back to frustum-ray multi-depth surface seeding if VGGT is unavailable.
+    """
+    with Image.open(frame_paths[0]) as im0:
+        orig_w, orig_h = im0.width, im0.height
+
+    traj = interpolate_camera_trajectory(
+        known_cameras_doc,
+        fps=float(video_meta.get("fps") or 24.0),
+        duration_sec=float(video_meta.get("duration_sec") or 5.0),
+        total_frames=int(video_meta.get("total_frames") or len(frame_paths)),
+        target_width=orig_w,
+        target_height=orig_h,
+    )
+    t_frames = traj["frames"]
+    eff_fps = float(traj["fps"])
+
+    cam_records: list[dict[str, Any]] = []
+    for idx, fp in enumerate(frame_paths):
+        pts_s = pts_by_name.get(fp.name, idx / max(1.0, eff_fps))
+        fi = max(0, min(len(t_frames) - 1, round(pts_s * eff_fps)))
+        tf = t_frames[fi]
+        cam_records.append({
+            "frame_index": idx,
+            "pts_sec": round(float(pts_s), 5),
+            "timeline_frame": int(tf["frame"]),
+            "image_name": fp.name,
+            "image_path": str(fp),
+            "width": orig_w,
+            "height": orig_h,
+            "fx": float(tf["fx"]),
+            "fy": float(tf["fy"]),
+            "cx": float(tf["cx"]),
+            "cy": float(tf["cy"]),
+            "R_w2c": tf["R_w2c"],
+            "t_w2c": tf["t_w2c"],
+        })
+
+    # Seed 3D points strictly inside the locked Blender world frame by unprojecting rays
+    rng = np.random.default_rng(42)
+    pts_chunks: list[np.ndarray] = []
+    rgb_chunks: list[np.ndarray] = []
+
+    try:
+        from vggt.utils.load_fn import load_and_preprocess_images
+
+        sel_paths = (
+            [frame_paths[int(i)] for i in np.linspace(0, len(frame_paths) - 1, min(len(frame_paths), 24), dtype=int)]
+        )
+        sel_map = {p.name: c for c in cam_records for p in [Path(c["image_path"])] if p.name == c["image_name"]}
+        model = _get_vggt_model(device, models_dir=models_dir)
+        amp_dtype = torch.bfloat16 if _VGGT_CACHE.get("bf16", True) else torch.float16
+        imgs = load_and_preprocess_images([str(p) for p in sel_paths], mode="pad").to(device)
+        imgs_b = imgs.unsqueeze(0) if imgs.ndim == 4 else imgs
+        _, _, _, vh, vw = imgs_b.shape
+        with torch.no_grad(), torch.amp.autocast("cuda", dtype=amp_dtype):
+            preds = model(imgs_b)
+        if "depth" in preds:
+            depth_np = preds["depth"][0].float().cpu().numpy().squeeze(-1) if preds["depth"].ndim == 5 else preds["depth"][0].float().cpu().numpy()
+            rgb_v = (imgs_b[0].permute(0, 2, 3, 1).float().cpu().numpy().clip(0.0, 1.0) * 255.0).astype(np.uint8)
+            scale_px = max(orig_w, orig_h) / float(max(vw, vh))
+            pad_x = max(0.0, (float(vw) - orig_w / scale_px) * 0.5)
+            pad_y = max(0.0, (float(vh) - orig_h / scale_px) * 0.5)
+            uu, vv = np.meshgrid(np.arange(vw, dtype=np.float64), np.arange(vh, dtype=np.float64))
+            u_orig = (uu - pad_x) * scale_px
+            v_orig = (vv - pad_y) * scale_px
+            valid_uv = (u_orig >= 0) & (u_orig < orig_w) & (v_orig >= 0) & (v_orig < orig_h)
+
+            for si, sp in enumerate(sel_paths):
+                c = sel_map[sp.name]
+                d_s = depth_np[si]
+                med_d = float(np.median(d_s[valid_uv & (d_s > 1e-3)])) if np.any(d_s > 1e-3) else 1.0
+                # Rescale VGGT depth to camera-to-origin distance so metric scale matches known rig
+                r_c = np.array(c["R_w2c"], dtype=np.float64)
+                t_c = np.array(c["t_w2c"], dtype=np.float64)
+                cam_pos = -r_c.T @ t_c
+                rig_depth = max(0.8, float(np.linalg.norm(cam_pos)))
+                d_metric = d_s * (rig_depth / max(med_d, 1e-3))
+                mask = valid_uv & np.isfinite(d_metric) & (d_metric > 0.15) & (d_metric < rig_depth * 4.0)
+                ys_i, xs_i = np.nonzero(mask)
+                if len(xs_i) > 6000:
+                    pick = rng.choice(len(xs_i), size=6000, replace=False)
+                    ys_i, xs_i = ys_i[pick], xs_i[pick]
+                zc = d_metric[ys_i, xs_i]
+                xc = (u_orig[ys_i, xs_i] - c["cx"]) * zc / c["fx"]
+                yc = (v_orig[ys_i, xs_i] - c["cy"]) * zc / c["fy"]
+                pts_cam = np.stack([xc, yc, zc], axis=-1)
+                pts_world = (pts_cam - t_c[None, :]) @ r_c
+                pts_chunks.append(pts_world)
+                rgb_chunks.append(rgb_v[ys_i, xs_i])
+    except Exception:  # noqa: BLE001, S110
+        pass
+
+    if not pts_chunks:
+        # Pure multi-depth frustum unprojection fallback (works offline/CPU with zero VGGT weights!)
+        per_cam = max(400, min(4000, cfg.max_init_points // max(1, len(cam_records))))
+        for c in cam_records:
+            with Image.open(c["image_path"]) as im:
+                arr = np.asarray(im.convert("RGB"), dtype=np.uint8)
+            r_c = np.array(c["R_w2c"], dtype=np.float64)
+            t_c = np.array(c["t_w2c"], dtype=np.float64)
+            cam_pos = -r_c.T @ t_c
+            base_d = max(1.0, float(np.linalg.norm(cam_pos)))
+            us = rng.integers(0, orig_w, size=per_cam)
+            vs = rng.integers(0, orig_h, size=per_cam)
+            zc = rng.uniform(base_d * 0.45, base_d * 1.65, size=per_cam)
+            xc = (us.astype(np.float64) - c["cx"]) * zc / c["fx"]
+            yc = (vs.astype(np.float64) - c["cy"]) * zc / c["fy"]
+            pts_cam = np.stack([xc, yc, zc], axis=-1)
+            pts_world = (pts_cam - t_c[None, :]) @ r_c
+            pts_chunks.append(pts_world)
+            rgb_chunks.append(arr[vs, us])
+
+    xyz = np.concatenate(pts_chunks, axis=0)
+    rgb = np.concatenate(rgb_chunks, axis=0)
+    if cfg.max_init_points > 0 and len(xyz) > cfg.max_init_points:
+        sel = rng.choice(len(xyz), size=cfg.max_init_points, replace=False)
+        xyz, rgb = xyz[sel], rgb[sel]
+    return cam_records, xyz.astype(np.float64), rgb.astype(np.uint8)
 
 
 # ─── Stage 3: VRAM-Preloaded CUDA `gsplat` Trainer + Surgical Resume ──────────
@@ -789,11 +1010,14 @@ def run_splat_job_stream(
     models_dir: Path | None = None,
     mp4_bytes: bytes | None = None,
     views_tar_gz: bytes | None = None,
+    known_cameras_json: str | None = None,
     cfg: SplatConfig | None = None,
+    cfg_overrides: dict[str, Any] | None = None,
     add_steps: int | None = None,
     surgery: SurgerySpec | None = None,
     masks_b64: dict[str, str] | None = None,
     exclude_frames: list[str] | None = None,
+    control_poll_fn: Callable[[], dict[str, Any] | None] | None = None,
     gpu_hourly_usd: float = 3.95,
     ram_cache: dict[str, Any] | None = None,
 ) -> Iterator[dict[str, Any]]:
@@ -864,14 +1088,16 @@ def run_splat_job_stream(
                 "elapsed_s": macro_timings["extract_s"],
             }
         else:
-            # ── Video Reconstruction Mode: Stage 1 (Extract) + Stage 2 (Pose + Floor Z=0 Sim3) ──
+            # ── Video Reconstruction Mode: Stage 1 (Extract + Exact PTS) + Stage 2 (Pose / Known-Lock) ──
             has_alpha = False
             mp4_path = work_shm / "source.mp4"
             mp4_path.write_bytes(mp4_bytes)  # type: ignore[arg-type]
 
             t0 = time.perf_counter()
             frames_dir = work_shm / "frames"
-            frame_paths = extract_frames(mp4_path, frames_dir, eff_cfg.extract)
+            frame_paths, pts_by_name, video_meta = extract_frames_with_meta(
+                mp4_path, frames_dir, eff_cfg.extract
+            )
             macro_timings["extract_s"] = round(time.perf_counter() - t0, 3)
             yield {
                 "event": "stage",
@@ -879,45 +1105,109 @@ def run_splat_job_stream(
                 "job_id": job_id,
                 "device": dev_name,
                 "frames": len(frame_paths),
+                "video_meta": video_meta,
                 "elapsed_s": macro_timings["extract_s"],
             }
 
             t0 = time.perf_counter()
-            pose_backend_label = eff_cfg.pose.backend
-            if eff_cfg.pose.backend == "colmap":
-                try:
-                    cam_records, raw_xyz, raw_rgb = solve_poses_colmap(frames_dir, work_shm, eff_cfg.pose)
-                    if len(cam_records) < max(3, len(frame_paths) // 4):
-                        raise RuntimeError(f"COLMAP registered only {len(cam_records)}/{len(frame_paths)} frames")
-                except Exception as col_err:  # noqa: BLE001
-                    # Graceful fallback to VGGT-1B if AI video is non-rigid / low-parallax for SIFT
-                    pose_backend_label = "vggt (colmap_fallback)"
-                    yield {
-                        "event": "stage",
-                        "stage": "pose_fallback",
-                        "job_id": job_id,
-                        "reason": str(col_err)[:240],
-                    }
+            known_doc_parsed = json.loads(known_cameras_json) if known_cameras_json else None
+            use_hard_known = known_doc_parsed is not None and eff_cfg.pose.backend not in ("colmap_prior", "colmap")
+
+            if use_hard_known and known_doc_parsed is not None:
+                # Opportunity #4A: Hard Known-Pose Seedance Re-Polish (exact Blender camera lock, 0 Sim3 drift)
+                pose_backend_label = "known_cameras"
+                cam_records, xyz_bl, raw_rgb = solve_known_cameras_video(
+                    frame_paths,
+                    pts_by_name,
+                    video_meta,
+                    known_doc_parsed,
+                    eff_cfg.pose,
+                    device,
+                    models_dir=models_dir,
+                )
+                sim3 = Sim3Transform.identity()
+                macro_timings["pose_s"] = round(time.perf_counter() - t0, 3)
+            else:
+                # Check for Blender camera prior (`colmap_prior` or COLMAP + `known_cameras_json`):
+                # Locks exact PINHOLE intrinsics `(fx, fy, cx, cy)` during SIFT BA + Umeyama-aligns
+                # solved COLMAP poses onto the Blender scene frame so interior easing adapts to SIFT!
+                prior_traj: dict[str, Any] | None = None
+                prior_intr: tuple[float, float, float, float] | None = None
+                if known_doc_parsed is not None:
+                    with Image.open(frame_paths[0]) as im_p0:
+                        pw, ph = im_p0.width, im_p0.height
+                    prior_traj = interpolate_camera_trajectory(
+                        known_doc_parsed,
+                        fps=float(video_meta.get("fps") or 24.0),
+                        duration_sec=float(video_meta.get("duration_sec") or 5.0),
+                        total_frames=int(video_meta.get("total_frames") or len(frame_paths)),
+                        target_width=pw,
+                        target_height=ph,
+                    )
+                    pf0 = prior_traj["frames"][0]
+                    prior_intr = (float(pf0["fx"]), float(pf0["fy"]), float(pf0["cx"]), float(pf0["cy"]))
+
+                pose_backend_label = eff_cfg.pose.backend
+                if eff_cfg.pose.backend in ("colmap", "colmap_prior"):
+                    try:
+                        cam_records, raw_xyz, raw_rgb = solve_poses_colmap(
+                            frames_dir, work_shm, eff_cfg.pose, prior_intrinsics=prior_intr
+                        )
+                        if len(cam_records) < max(3, len(frame_paths) // 4):
+                            raise RuntimeError(f"COLMAP registered only {len(cam_records)}/{len(frame_paths)} frames")
+                        if prior_intr is not None:
+                            pose_backend_label = "colmap_prior"
+                    except Exception as col_err:  # noqa: BLE001
+                        pose_backend_label = "vggt (colmap_fallback)"
+                        yield {
+                            "event": "stage",
+                            "stage": "pose_fallback",
+                            "job_id": job_id,
+                            "reason": str(col_err)[:240],
+                        }
+                        cam_records, raw_xyz, raw_rgb = solve_poses_vggt(
+                            frame_paths, eff_cfg.pose, device, models_dir=models_dir
+                        )
+                else:
                     cam_records, raw_xyz, raw_rgb = solve_poses_vggt(
                         frame_paths, eff_cfg.pose, device, models_dir=models_dir
                     )
-            else:
-                cam_records, raw_xyz, raw_rgb = solve_poses_vggt(
-                    frame_paths, eff_cfg.pose, device, models_dir=models_dir
-                )
-            macro_timings["pose_s"] = round(time.perf_counter() - t0, 3)
+                macro_timings["pose_s"] = round(time.perf_counter() - t0, 3)
 
-            t0 = time.perf_counter()
-            sim3 = estimate_floor_aligned_sim3(
-                [c["R_w2c"] for c in cam_records],
-                [c["t_w2c"] for c in cam_records],
-                raw_xyz.tolist() if len(raw_xyz) <= 15_000 else raw_xyz[:: max(1, len(raw_xyz) // 15_000)].tolist(),
-                align_floor=eff_cfg.pose.align_floor_z0,
-                target_cam_height_m=eff_cfg.pose.target_cam_height_m,
-            )
-            r_np = np.array(sim3.R, dtype=np.float64)
-            t_np = np.array(sim3.t, dtype=np.float64)
-            xyz_bl = sim3.scale * (raw_xyz @ r_np.T) + t_np[None, :]
+                # Attach exact source video PTS & 1-indexed timeline frame to every solved camera!
+                native_fps_v = float(video_meta.get("fps") or 24.0)
+                for c in cam_records:
+                    pt_s = pts_by_name.get(c["image_name"])
+                    if pt_s is not None:
+                        c["pts_sec"] = round(float(pt_s), 5)
+                        c["timeline_frame"] = max(1, round(float(pt_s) * native_fps_v) + 1)
+
+                t0 = time.perf_counter()
+                if prior_traj is not None and len(cam_records) >= 3:
+                    # Opportunity #4B: Align solved SIFT/VGGT trajectory onto Blender prior via proper Umeyama Sim(3)!
+                    src_c_list = []
+                    dst_c_list = []
+                    t_frames_p = prior_traj["frames"]
+                    p_fps = float(prior_traj["fps"])
+                    for c in cam_records:
+                        rc_arr = np.array(c["R_w2c"], dtype=np.float64)
+                        tc_arr = np.array(c["t_w2c"], dtype=np.float64)
+                        src_c_list.append(-rc_arr.T @ tc_arr)
+                        pt_s = float(c.get("pts_sec") or 0.0)
+                        fi_p = max(0, min(len(t_frames_p) - 1, round(pt_s * p_fps)))
+                        dst_c_list.append(np.array(t_frames_p[fi_p]["location"], dtype=np.float64))
+                    sim3 = _estimate_umeyama_sim3(np.stack(src_c_list, 0), np.stack(dst_c_list, 0))
+                else:
+                    sim3 = estimate_floor_aligned_sim3(
+                        [c["R_w2c"] for c in cam_records],
+                        [c["t_w2c"] for c in cam_records],
+                        raw_xyz.tolist() if len(raw_xyz) <= 15_000 else raw_xyz[:: max(1, len(raw_xyz) // 15_000)].tolist(),
+                        align_floor=eff_cfg.pose.align_floor_z0,
+                        target_cam_height_m=eff_cfg.pose.target_cam_height_m,
+                    )
+                r_np = np.array(sim3.R, dtype=np.float64)
+                t_np = np.array(sim3.t, dtype=np.float64)
+                xyz_bl = sim3.scale * (raw_xyz @ r_np.T) + t_np[None, :]
 
         # Build aligned OpenCV viewmats/Ks & Blender `cameras.json`
         t_align = time.perf_counter()
@@ -941,17 +1231,23 @@ def run_splat_job_stream(
             )
             bl_cam["frame_index"] = c["frame_index"]
             bl_cam["image_name"] = c["image_name"]
+            if c.get("pts_sec") is not None:
+                bl_cam["pts_sec"] = c["pts_sec"]
+            if c.get("timeline_frame") is not None:
+                bl_cam["timeline_frame"] = c["timeline_frame"]
             bl_cameras_list.append(bl_cam)
 
-        cameras_doc = {
+        cameras_doc: dict[str, Any] = {
             "job_id": job_id,
             "coordinate_system": "BLENDER_RIGHT_HANDED_Z_UP",
             "floor_z": 0.0,
             "pose_backend": pose_backend_label,
             "sim3": sim3.to_dict(),
-            "low_parallax_warning": (views_tar_gz is None) and (sim3.baseline_ratio < 0.03),
+            "low_parallax_warning": (views_tar_gz is None) and (not known_cameras_json) and (sim3.baseline_ratio < 0.03),
             "cameras": bl_cameras_list,
         }
+        if views_tar_gz is None and "video_meta" in locals():
+            cameras_doc["video_meta"] = video_meta
         cams_json_path.write_text(json.dumps(cameras_doc, indent=2), encoding="utf-8")
 
         frames_u8_cpu, alphas_u8_cpu = _preload_frames_u8(cam_records, load_alpha=has_alpha)
@@ -976,6 +1272,7 @@ def run_splat_job_stream(
                 "event": "stage",
                 "stage": "pose",
                 "job_id": job_id,
+                "pose_backend": pose_backend_label,
                 "cameras": len(cam_records),
                 "init_points": len(xyz_bl),
                 "floor_inlier_ratio": round(sim3.floor_inlier_ratio, 3),
@@ -1037,7 +1334,13 @@ def run_splat_job_stream(
         t0 = time.perf_counter()
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         saved_cfg = SplatConfig.from_dict(meta.get("config"))
-        eff_cfg = cfg if cfg is not None else saved_cfg
+        # Merge only caller-specified overrides onto `saved_cfg` so SH degree / loss settings never reset!
+        if cfg_overrides:
+            eff_cfg = saved_cfg.merge_overrides(cfg_overrides)
+        elif cfg is not None:
+            eff_cfg = cfg
+        else:
+            eff_cfg = saved_cfg
         scene_scale = float(meta.get("scene_scale", 2.5))
 
         if ram_cache is not None and ram_cache.get("job_id") == job_id:
@@ -1162,6 +1465,9 @@ def run_splat_job_stream(
     min_preview_dt = 1.0 / max(0.25, eff_cfg.train.preview_hz)
     sent_gt_cams: set[str] = set()
     rng_py = random.Random(1337 + burst_id)
+    live_lr_mult = 1.0
+    actual_final_step = target_step
+    last_ctl_seq = -1
 
     use_cuda_ev = device.type == "cuda"
     if use_cuda_ev:
@@ -1172,19 +1478,129 @@ def run_splat_job_stream(
         ev_opt = torch.cuda.Event(enable_timing=True)
         ev_end = torch.cuda.Event(enable_timing=True)
 
-    focus_idx: int | None = None
-    if eff_cfg.train.focus_camera:
+    def _resolve_focus_idx(fc_name: str | None) -> int | None:
+        if not fc_name:
+            return None
         for i, nm in enumerate(image_names):
-            if nm == eff_cfg.train.focus_camera:
-                focus_idx = i
-                break
+            if nm == fc_name:
+                return i
+        return None
+
+    focus_idx = _resolve_focus_idx(eff_cfg.train.focus_camera)
+    rast_mode = str(getattr(eff_cfg.train, "rasterize_mode", "antialiased") or "antialiased")
+    if rast_mode not in ("classic", "antialiased"):
+        rast_mode = "antialiased"
+
+    # Differentiable `se(3)` sub-pixel camera pose refinement (`6D` continuous rotation + `3D` translation)
+    n_cams_total = int(viewmats_gpu.shape[0])
+    use_pose_opt = bool(getattr(eff_cfg.train, "refine_poses", False))
+    pose_rot6d = torch.tensor([[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]], dtype=torch.float32, device=device).repeat(
+        n_cams_total, 1
+    ).requires_grad_(True)
+    pose_trans = torch.zeros((n_cams_total, 3), dtype=torch.float32, device=device, requires_grad=True)
+    pose_lr_init = float(getattr(eff_cfg.train, "pose_opt_lr", 5e-5) or 5e-5)
+    pose_opt = torch.optim.Adam([pose_rot6d, pose_trans], lr=pose_lr_init, eps=1e-15)
+    eye3_gpu = torch.eye(3, dtype=torch.float32, device=device)
+
+    def _compose_pose_delta(base_vm: torch.Tensor, idx_c: int) -> tuple[torch.Tensor, torch.Tensor]:
+        r6 = pose_rot6d[idx_c]
+        a1 = F.normalize(r6[0:3], dim=0)
+        b2 = r6[3:6] - (a1 * r6[3:6]).sum() * a1
+        a2 = F.normalize(b2, dim=0)
+        a3 = torch.linalg.cross(a1, a2)
+        r_del = torch.stack([a1, a2, a3], dim=0)
+        t_del = pose_trans[idx_c]
+        r_base = base_vm[0, :3, :3]
+        t_base = base_vm[0, :3, 3]
+        r_new_t = r_del @ r_base
+        t_new_t = (r_del @ t_base) + t_del
+        row4 = torch.tensor([[0.0, 0.0, 0.0, 1.0]], dtype=torch.float32, device=device)
+        top3 = torch.cat([r_new_t, t_new_t.unsqueeze(1)], dim=1)
+        vm_out = torch.cat([top3, row4], dim=0).unsqueeze(0)
+        reg_t = ((t_del ** 2).sum() + ((r_del - eye3_gpu) ** 2).sum())
+        return vm_out, reg_t
 
     for step in range(start_step, target_step):
         is_log = (step == start_step) or ((step + 1) % max(1, eff_cfg.train.log_every) == 0) or (step == target_step - 1)
+
+        # ── Mid-Train Live Control Poll (`tt-splat` style: Pause, Save Ckpt, Stop, Live Params/Surgeries) ──
+        if is_log and control_poll_fn is not None:
+            ctl = control_poll_fn()
+            if isinstance(ctl, dict):
+                c_seq = int(ctl.get("seq", 0))
+                if c_seq > last_ctl_seq:
+                    last_ctl_seq = c_seq
+                    if ctl.get("lambda_dssim") is not None:
+                        eff_cfg.train.lambda_dssim = max(0.0, min(1.0, float(ctl["lambda_dssim"])))
+                    if ctl.get("opa_reg") is not None:
+                        eff_cfg.train.opa_reg = max(0.0, float(ctl["opa_reg"]))
+                    if ctl.get("scale_reg") is not None:
+                        eff_cfg.train.scale_reg = max(0.0, float(ctl["scale_reg"]))
+                    if ctl.get("aniso_reg") is not None:
+                        eff_cfg.train.aniso_reg = max(0.0, float(ctl["aniso_reg"]))
+                    if ctl.get("lr_scale") is not None:
+                        live_lr_mult = max(0.05, min(10.0, float(ctl["lr_scale"])))
+                    if "focus_camera" in ctl:
+                        fc_v = str(ctl["focus_camera"] or "").strip() or None
+                        eff_cfg.train.focus_camera = fc_v
+                        focus_idx = _resolve_focus_idx(fc_v)
+
+                    # Mid-run surgical actions (`prune_opa`, `clamp_log_scale`, `reset_opacities`)
+                    mid_surg_keys = ("prune_opa", "clamp_log_scale", "reset_opacities", "max_world_scale")
+                    if any(ctl.get(mk) is not None for mk in mid_surg_keys):
+                        mspec = SurgerySpec.from_dict({mk: ctl[mk] for mk in mid_surg_keys if ctl.get(mk) is not None})
+                        sres = apply_surgeries(params, optimizers, strategy_state, mspec)
+                        sev = {"event": "surgery", "job_id": job_id, "burst_id": burst_id, "step": step, **sres}
+                        _append_telem(sev)
+                        yield sev
+
+                    if ctl.get("save_checkpoint"):
+                        torch.save(
+                            {
+                                "step": step,
+                                "params": {k: v.detach().cpu() for k, v in params.items()},
+                                "opt_states": {k: opt.state_dict() for k, opt in optimizers.items()},
+                                "strategy_state": {
+                                    k: (v.detach().cpu() if torch.is_tensor(v) else v)
+                                    for k, v in strategy_state.items()
+                                },
+                            },
+                            ckpt_path,
+                        )
+                        ck_ev = {"event": "checkpoint_saved", "job_id": job_id, "step": step}
+                        _append_telem(ck_ev)
+                        yield ck_ev
+
+                    if ctl.get("stop_early"):
+                        actual_final_step = step
+                        break
+
+                if ctl.get("paused"):
+                    yield {"event": "stage", "stage": "paused", "job_id": job_id, "step": step}
+                    t_pause_0 = time.perf_counter()
+                    while (time.perf_counter() - t_pause_0) < 120.0:
+                        time.sleep(0.25)
+                        ctl_p = control_poll_fn() or {}
+                        if ctl_p.get("stop_early"):
+                            actual_final_step = step
+                            break
+                        if not ctl_p.get("paused"):
+                            break
+                    if actual_final_step == step and (control_poll_fn() or {}).get("stop_early"):
+                        break
+                    yield {"event": "stage", "stage": "train", "job_id": job_id, "step": step}
+
         t_step_cpu = time.perf_counter() if is_log else 0.0
 
         cam_i = focus_idx if focus_idx is not None else rng_py.choice(active_indices)
-        viewmat = viewmats_gpu[cam_i : cam_i + 1]
+        base_viewmat = viewmats_gpu[cam_i : cam_i + 1]
+        if use_pose_opt:
+            viewmat, pose_reg_raw = _compose_pose_delta(base_viewmat, cam_i)
+            pose_prior_w = float(getattr(eff_cfg.train, "pose_prior_reg", 1e-2))
+            pose_reg_term: torch.Tensor | float = pose_prior_w * pose_reg_raw
+        else:
+            viewmat = base_viewmat
+            pose_reg_term = 0.0
         k_mat = ks_gpu[cam_i : cam_i + 1]
         fg_img = frames_gpu[cam_i].float() * (1.0 / 255.0)
         gt_alpha = (alphas_gpu[cam_i].float() * (1.0 / 255.0)) if alphas_gpu is not None else None
@@ -1222,6 +1638,7 @@ def run_splat_job_stream(
             backgrounds=bg_col,
             packed=True,
             absgrad=True,
+            rasterize_mode=rast_mode,
         )
         render_img = renders[0]
 
@@ -1250,13 +1667,15 @@ def run_splat_job_stream(
             aniso_term = aniso_w * F.relu(aniso_ratio - max_aniso).mean()
         else:
             aniso_term = 0.0
-        loss = photo_loss + alpha_sil_loss + opa_reg_term + scale_reg_term + aniso_term
+        loss = photo_loss + alpha_sil_loss + opa_reg_term + scale_reg_term + aniso_term + pose_reg_term
 
         if is_log and use_cuda_ev:
             ev_loss.record()
 
         for opt in optimizers.values():
             opt.zero_grad(set_to_none=True)
+        if use_pose_opt:
+            pose_opt.zero_grad(set_to_none=True)
 
         strategy.step_pre_backward(params, optimizers, strategy_state, step, info)
         loss.backward()
@@ -1264,14 +1683,18 @@ def run_splat_job_stream(
         if is_log and use_cuda_ev:
             ev_bwd.record()
 
-        # Exponential position LR decay
+        # Exponential position LR decay * live LR multiplier
         t_prog = min(1.0, step / float(max(1, target_step)))
-        pos_lr = 1.6e-4 * ((1.6e-6 / 1.6e-4) ** t_prog)
+        pos_lr = 1.6e-4 * ((1.6e-6 / 1.6e-4) ** t_prog) * live_lr_mult
         for pg in optimizers["means"].param_groups:
             pg["lr"] = pos_lr
 
         for opt in optimizers.values():
             opt.step()
+        if use_pose_opt and step >= 150:
+            for pg in pose_opt.param_groups:
+                pg["lr"] = pose_lr_init * ((0.1) ** t_prog) * live_lr_mult
+            pose_opt.step()
 
         if is_log and use_cuda_ev:
             ev_opt.record()
@@ -1366,6 +1789,9 @@ def run_splat_job_stream(
                 "n_gaussians": n_post_dens,
                 "sh_degree_cur": sh_cur,
                 "pos_lr": round(pos_lr, 7),
+                "lambda_dssim": round(eff_cfg.train.lambda_dssim, 4),
+                "opa_reg": round(eff_cfg.train.opa_reg, 6),
+                "focus_camera": eff_cfg.train.focus_camera,
                 "camera_name": cam_name,
                 "stage_timings": stage_timings,
             }
@@ -1397,11 +1823,50 @@ def run_splat_job_stream(
 
     macro_timings["train_s"] = round(time.perf_counter() - t_train_start, 3)
 
+    # Bake differentiable `se(3)` camera refinements back into `viewmats_gpu`, `frames.pt`, & `cameras.json`!
+    if use_pose_opt and cams_json_path.is_file():
+        with torch.no_grad():
+            new_vms = []
+            for ci in range(n_cams_total):
+                vm_ci, _ = _compose_pose_delta(viewmats_gpu[ci : ci + 1], ci)
+                new_vms.append(vm_ci[0])
+            viewmats_gpu = torch.stack(new_vms, dim=0)
+            mean_shift_mm = float(pose_trans.detach().norm(dim=-1).mean().item() * 1000.0)
+
+        try:
+            cdoc_upd = json.loads(cams_json_path.read_text(encoding="utf-8"))
+            vms_cpu = viewmats_gpu.detach().cpu().numpy()
+            ks_cpu = ks_gpu.detach().cpu().numpy()
+            for ci, c_entry in enumerate(cdoc_upd.get("cameras") or []):
+                if ci >= len(vms_cpu):
+                    break
+                rc_f = vms_cpu[ci, :3, :3].tolist()
+                tc_f = vms_cpu[ci, :3, 3].tolist()
+                bl_upd = opencv_w2c_to_blender_camera(
+                    rc_f, tc_f,
+                    float(ks_cpu[ci, 0, 0]), float(ks_cpu[ci, 1, 1]),
+                    float(ks_cpu[ci, 0, 2]), float(ks_cpu[ci, 1, 2]),
+                    img_w, img_h,
+                )
+                for keep_k in ("frame_index", "image_name", "pts_sec", "timeline_frame"):
+                    if keep_k in c_entry:
+                        bl_upd[keep_k] = c_entry[keep_k]
+                cdoc_upd["cameras"][ci] = bl_upd
+            cdoc_upd["pose_refined"] = True
+            cdoc_upd["mean_pose_shift_mm"] = round(mean_shift_mm, 3)
+            cams_json_path.write_text(json.dumps(cdoc_upd, indent=2), encoding="utf-8")
+            if frames_pt_path.is_file():
+                pack_u = torch.load(frames_pt_path, map_location="cpu", weights_only=False)
+                pack_u["viewmats"] = viewmats_gpu.detach().cpu()
+                torch.save(pack_u, frames_pt_path)
+        except Exception:  # noqa: BLE001, S110
+            pass
+
     # ── Save Resumable Checkpoint + Update In-VRAM Cache ──
     t_exp = time.perf_counter()
     torch.save(
         {
-            "step": target_step,
+            "step": actual_final_step,
             "params": {k: v.detach().cpu() for k, v in params.items()},
             "opt_states": {k: opt.state_dict() for k, opt in optimizers.items()},
             "strategy_state": {
@@ -1416,6 +1881,7 @@ def run_splat_job_stream(
         ram_cache.update({
             "job_id": job_id,
             "frames_gpu": frames_gpu,
+            "alphas_gpu": alphas_gpu,
             "viewmats_gpu": viewmats_gpu,
             "ks_gpu": ks_gpu,
             "image_names": image_names,
@@ -1424,14 +1890,14 @@ def run_splat_job_stream(
             "params": params,
             "optimizers": optimizers,
             "strategy_state": strategy_state,
-            "step": target_step,
+            "step": actual_final_step,
         })
 
     total_cum_gpu = cum_gpu_sec_prev + macro_timings["train_s"] + macro_timings.get("pose_s", 0.0)
     meta.update({
         "config": eff_cfg.to_dict(),
         "burst_id": burst_id,
-        "step": target_step,
+        "step": actual_final_step,
         "cum_gpu_sec": round(total_cum_gpu, 3),
         "n_gaussians": int(params["means"].shape[0]),
         "excluded": sorted(excluded_set),
@@ -1439,7 +1905,7 @@ def run_splat_job_stream(
     })
     meta_path.write_text(json.dumps(meta, indent=2), encoding="utf-8")
 
-    # ── Stage 4: Export `.ply` + `.splat` + `cameras.json` ──
+    # ── Stage 4: Export `.ply` + `.splat` + `proxy_collision.glb` + `cameras.json` ──
     ply_bytes, n_exported = export_ply_bytes(
         params,
         max_gaussians=eff_cfg.export.max_gaussians,
@@ -1450,6 +1916,25 @@ def run_splat_job_stream(
         if eff_cfg.export.export_splat
         else b""
     )
+    proxy_glb_bytes = b""
+    if getattr(eff_cfg.export, "export_proxy_glb", True):
+        try:
+            with torch.no_grad():
+                m_np = params["means"].detach().float().cpu().numpy()
+                o_np = torch.sigmoid(params["opacities"].detach().float()).cpu().numpy()
+                s_np = torch.exp(params["scales"].detach().float()).cpu().numpy()
+                c_np = np.clip(0.5 + _SH_C0 * params["sh0"].detach().float().cpu().numpy().reshape(-1, 3), 0.0, 1.0)
+            proxy_glb_bytes, _ = build_proxy_glb_bytes(
+                m_np,
+                o_np,
+                s_np,
+                c_np,
+                grid_res=int(getattr(eff_cfg.export, "proxy_grid_res", 48)),
+                mesh_name=f"{job_id}_Proxy",
+            )
+        except Exception:  # noqa: BLE001
+            proxy_glb_bytes = b""
+
     macro_timings["export_s"] = round(time.perf_counter() - t_exp, 3)
 
     wall_s = round(time.perf_counter() - t_job_start, 3)
@@ -1460,7 +1945,7 @@ def run_splat_job_stream(
         "event": "done",
         "job_id": job_id,
         "burst_id": burst_id,
-        "step": target_step,
+        "step": actual_final_step,
         "n_gaussians": n_exported,
         "device": dev_name,
         "wall_s": wall_s,
@@ -1469,8 +1954,238 @@ def run_splat_job_stream(
         "cameras_json": cams_text,
         "ply_gz": gzip.compress(ply_bytes, compresslevel=2),
         "splat_gz": gzip.compress(splat_bytes, compresslevel=2) if splat_bytes else b"",
+        "proxy_glb_gz": gzip.compress(proxy_glb_bytes, compresslevel=2) if proxy_glb_bytes else b"",
         "ply_raw_bytes": len(ply_bytes),
         "splat_raw_bytes": len(splat_bytes),
+        "proxy_glb_raw_bytes": len(proxy_glb_bytes),
     }
     _append_telem(done_ev)
     yield done_ev
+
+
+# ─── Cloud Farmed Splat Trajectory Renderer (`gsplat` CUDA -> H.264 MP4) ──────
+
+
+def _load_params_from_ply_bytes(ply_bytes: bytes, device: torch.device) -> tuple[dict[str, torch.Tensor], int]:
+    """Parse binary little-endian 3DGS `.ply` directly into CUDA tensors (`<30 ms` for 300k splats)."""
+    end_m = b"end_header\n"
+    idx = ply_bytes.find(end_m)
+    if idx < 0:
+        end_m = b"end_header\r\n"
+        idx = ply_bytes.find(end_m)
+    if idx < 0:
+        raise ValueError("Invalid PLY header for cloud trajectory render.")
+
+    hdr = ply_bytes[:idx].decode("ascii", errors="ignore")
+    offset = idx + len(end_m)
+    n_verts = 0
+    props: list[str] = []
+    for ln in hdr.splitlines():
+        parts = ln.strip().split()
+        if len(parts) >= 3 and parts[0] == "element" and parts[1] == "vertex":
+            n_verts = int(parts[2])
+        elif len(parts) >= 3 and parts[0] == "property":
+            props.append(parts[-1])
+
+    stride = len(props)
+    arr = np.frombuffer(ply_bytes, dtype="<f4", count=n_verts * stride, offset=offset).reshape(n_verts, stride)
+    pmap = {nm: i for i, nm in enumerate(props)}
+
+    means = torch.from_numpy(np.ascontiguousarray(arr[:, [pmap["x"], pmap["y"], pmap["z"]]])).to(device)
+    scales = torch.from_numpy(np.ascontiguousarray(arr[:, [pmap["scale_0"], pmap["scale_1"], pmap["scale_2"]]])).to(device)
+    quats = torch.from_numpy(
+        np.ascontiguousarray(arr[:, [pmap["rot_0"], pmap["rot_1"], pmap["rot_2"], pmap["rot_3"]]])
+    ).to(device)
+    opacities = torch.from_numpy(np.ascontiguousarray(arr[:, pmap["opacity"]])).to(device)
+    sh0 = torch.from_numpy(
+        np.ascontiguousarray(arr[:, [pmap["f_dc_0"], pmap["f_dc_1"], pmap["f_dc_2"]]])
+    ).unsqueeze(1).to(device)
+
+    rest_cols = [pmap[f"f_rest_{k}"] for k in range(45) if f"f_rest_{k}" in pmap]
+    k_rest = len(rest_cols) // 3
+    if k_rest > 0:
+        shn = torch.from_numpy(
+            np.ascontiguousarray(arr[:, rest_cols[: k_rest * 3]]).reshape(n_verts, k_rest, 3)
+        ).to(device)
+        sh_deg = max(0, round(math.sqrt(k_rest + 1)) - 1)
+    else:
+        shn = torch.zeros((n_verts, 0, 3), dtype=torch.float32, device=device)
+        sh_deg = 0
+
+    return {"means": means, "scales": scales, "quats": quats, "opacities": opacities, "sh0": sh0, "shN": shn}, sh_deg
+
+
+def render_splat_trajectory_stream(
+    *,
+    job_id: str,
+    jobs_root: Path,
+    trajectory_doc: dict[str, Any],
+    ply_gz: bytes | None = None,
+    rasterize_mode: str = "antialiased",
+    bg_rgb: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    gpu_hourly_usd: float = 3.95,
+    ram_cache: dict[str, Any] | None = None,
+) -> Iterator[dict[str, Any]]:
+    """Farm full-rate 3DGS camera path rendering to Modal GPU (`gsplat` CUDA + FFmpeg H.264 MP4)."""
+    from gsplat import rasterization
+
+    t0 = time.perf_counter()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dev_name = torch.cuda.get_device_name(device) if device.type == "cuda" else "cpu"
+
+    ckpt_path = jobs_root / job_id / "ckpt_latest.pt"
+    if ram_cache is not None and ram_cache.get("job_id") == job_id and "params" in ram_cache:
+        p_raw = ram_cache["params"]
+        params = {k: v.detach() for k, v in p_raw.items()}
+        k_total = 1 + int(params["shN"].shape[1])
+        sh_deg = max(0, round(math.sqrt(k_total)) - 1)
+        source_kind = "vram_cache"
+    elif ckpt_path.is_file():
+        ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+        params = {k: v.to(device) for k, v in ckpt["params"].items()}
+        k_total = 1 + int(params["shN"].shape[1])
+        sh_deg = max(0, round(math.sqrt(k_total)) - 1)
+        source_kind = "nvme_ckpt"
+    elif ply_gz:
+        ply_raw = gzip.decompress(ply_gz)
+        params, sh_deg = _load_params_from_ply_bytes(ply_raw, device)
+        source_kind = "uploaded_ply"
+    else:
+        raise FileNotFoundError(
+            f"No checkpoint in /jobs/{job_id} and no fallback PLY uploaded for '{job_id}'."
+        )
+
+    frames_spec = list(trajectory_doc.get("frames") or [])
+    if not frames_spec:
+        raise ValueError("trajectory_doc contains zero frames to render.")
+
+    fps = float(trajectory_doc.get("fps") or 24.0)
+    out_w = int(trajectory_doc.get("width") or frames_spec[0].get("width") or 1280)
+    out_h = int(trajectory_doc.get("height") or frames_spec[0].get("height") or 720)
+    out_w = max(16, out_w - (out_w % 2))
+    out_h = max(16, out_h - (out_h % 2))
+    n_frames = len(frames_spec)
+
+    yield {
+        "event": "render_start",
+        "job_id": job_id,
+        "device": dev_name,
+        "source": source_kind,
+        "total_frames": n_frames,
+        "fps": fps,
+        "width": out_w,
+        "height": out_h,
+    }
+
+    work_dir = Path("/dev/shm") / f"render_{job_id}_{int(time.time() * 1000)}" if Path("/dev/shm").is_dir() else (jobs_root / job_id / "tmp_render")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    mp4_out = work_dir / "recreated.mp4"
+
+    ff_cmd = [
+        "ffmpeg", "-y",
+        "-f", "rawvideo",
+        "-vcodec", "rawvideo",
+        "-pix_fmt", "rgb24",
+        "-s", f"{out_w}x{out_h}",
+        "-r", f"{fps:.4f}",
+        "-i", "-",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", "fast",
+        "-crf", "18",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        "-hide_banner", "-loglevel", "error",
+        str(mp4_out),
+    ]
+
+    with torch.no_grad():
+        means = params["means"]
+        quats = F.normalize(params["quats"], dim=-1)
+        scales_lin = torch.exp(params["scales"])
+        opa_sig = torch.sigmoid(params["opacities"])
+        k_use = (sh_deg + 1) ** 2
+        colors = torch.cat([params["sh0"], params["shN"]], dim=1)[:, :k_use, :]
+        bg_t = torch.tensor([[bg_rgb[0], bg_rgb[1], bg_rgb[2]]], dtype=torch.float32, device=device)
+
+        vms = np.zeros((n_frames, 4, 4), dtype=np.float32)
+        ks = np.zeros((n_frames, 3, 3), dtype=np.float32)
+        for i, f in enumerate(frames_spec):
+            vms[i, 3, 3] = 1.0
+            vms[i, :3, :3] = np.array(f["R_w2c"], dtype=np.float32)
+            vms[i, :3, 3] = np.array(f["t_w2c"], dtype=np.float32)
+            ks[i, 0, 0] = float(f["fx"])
+            ks[i, 1, 1] = float(f["fy"])
+            ks[i, 0, 2] = float(f["cx"])
+            ks[i, 1, 2] = float(f["cy"])
+            ks[i, 2, 2] = 1.0
+
+        vms_gpu = torch.from_numpy(vms).to(device)
+        ks_gpu = torch.from_numpy(ks).to(device)
+        rmode = rasterize_mode if rasterize_mode in ("classic", "antialiased") else "antialiased"
+
+        proc = subprocess.Popen(ff_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
+        assert proc.stdin is not None
+        t_rast = time.perf_counter()
+        try:
+            # Render in mini-batches of 8 cameras for blazing H100 occupancy & low peak VRAM
+            batch_sz = 8
+            for b0 in range(0, n_frames, batch_sz):
+                b1 = min(n_frames, b0 + batch_sz)
+                b_cnt = b1 - b0
+                renders, _, _ = rasterization(
+                    means=means,
+                    quats=quats,
+                    scales=scales_lin,
+                    opacities=opa_sig,
+                    colors=colors,
+                    viewmats=vms_gpu[b0:b1],
+                    Ks=ks_gpu[b0:b1],
+                    width=out_w,
+                    height=out_h,
+                    sh_degree=sh_deg,
+                    backgrounds=bg_t.expand(b_cnt, 3),
+                    packed=True,
+                    rasterize_mode=rmode,
+                )
+                u8_batch = (renders.clamp(0.0, 1.0) * 255.0).to(torch.uint8).cpu().numpy()
+                proc.stdin.write(u8_batch.tobytes())
+                if b1 == n_frames or (b1 % 24 == 0):
+                    yield {
+                        "event": "render_progress",
+                        "job_id": job_id,
+                        "frame": b1,
+                        "total_frames": n_frames,
+                    }
+            proc.stdin.close()
+            proc.stdin = None
+            stderr_b = proc.stderr.read() if proc.stderr else b""
+            rc = proc.wait(timeout=60)
+            if rc != 0:
+                raise RuntimeError(f"FFmpeg encode failed ({rc}): {stderr_b.decode('utf-8', 'ignore')[-400:]}")
+        finally:
+            if proc.stdin is not None:
+                proc.stdin.close()
+            if proc.poll() is None:
+                proc.kill()
+
+    rast_s = max(1e-4, time.perf_counter() - t_rast)
+    mp4_bytes = mp4_out.read_bytes()
+    shutil.rmtree(work_dir, ignore_errors=True)
+    wall_s = round(time.perf_counter() - t0, 3)
+    cost_usd = round((wall_s / 3600.0) * gpu_hourly_usd, 6)
+
+    yield {
+        "event": "render_done",
+        "job_id": job_id,
+        "device": dev_name,
+        "source": source_kind,
+        "frames": n_frames,
+        "fps": fps,
+        "width": out_w,
+        "height": out_h,
+        "wall_s": wall_s,
+        "render_fps": round(n_frames / rast_s, 1),
+        "cost_usd": cost_usd,
+        "mp4_bytes": mp4_bytes,
+    }

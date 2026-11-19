@@ -556,10 +556,14 @@
   // --- Preview Theater ---
   function stopSplatViewer() {
     if (window._bbSplatViewer) window._bbSplatViewer.pause();
+    if (window._bbStopComparator) window._bbStopComparator();
     const sc = el("theater-splat-canvas");
     const hud = el("theater-splat-hud");
+    const cmp = el("theater-compare-wrap");
     if (sc) sc.classList.add("hidden");
     if (hud) hud.classList.add("hidden");
+    if (cmp) cmp.classList.add("hidden");
+    if (el("btn-stage-compare")) el("btn-stage-compare").classList.add("hidden");
   }
 
   function openInTheater(item) {
@@ -1364,6 +1368,10 @@
         handleJobUpdate(data, false);
       } else if (type === "splat-job" && data) {
         handleSplatJobUpdate(data);
+      } else if (type === "splat-telemetry" && data) {
+        if (window._bbPushSplatTelemetry) window._bbPushSplatTelemetry(data);
+      } else if (type === "splat-render" && data) {
+        if (window._bbOnSplatRenderProgress) window._bbOnSplatRenderProgress(data);
       } else if (type === "workspace-media-added") {
         refreshMedia(false);
       } else if (type === "transcript" && data) {
@@ -1513,7 +1521,25 @@
     el("splat-live-diff").classList.remove("hidden");
   });
 
+  if (el("btn-pull-cam-prompt")) {
+    el("btn-pull-cam-prompt").addEventListener("click", async () => {
+      try {
+        const res = await apiFetch("/api/splats/camera_prompt", { method: "POST", json: {} });
+        if (res.seedance_camera_prompt) {
+          const inp = el("input-prompt");
+          const cur = inp.value.trim();
+          inp.value = cur ? `${cur} ${res.seedance_camera_prompt}` : res.seedance_camera_prompt;
+          updatePricingAndInspector();
+          showToast(`Pulled Blender camera '${res.camera}' (${res.distance_m}m, Δyaw ${res.yaw_delta_deg}°)`);
+        }
+      } catch (err) {
+        showToast(`Camera prompt failed: ${err.message}`, true);
+      }
+    });
+  }
+
   el("btn-train-splat").addEventListener("click", async () => {
+    const knownCamVal = el("sel-splat-known-cams") ? el("sel-splat-known-cams").value : "";
     const payload = {
       source_mode: state.splatSourceMode,
       iterations: Math.max(200, Math.min(30000, Number(el("inp-splat-iters").value || 5000))),
@@ -1521,11 +1547,14 @@
       sh_degree: Number(el("sel-splat-sh").value || 1),
       render_mode: el("sel-splat-rendermode").value || "ellipsoids",
       auto_import: el("chk-splat-autoimport").checked,
+      lambda_dssim: el("inp-splat-dssim") ? Number(el("inp-splat-dssim").value || 0.2) : 0.2,
       opa_reg: Number(el("inp-splat-opareg").value || 0.0005),
       prune_opa: Number(el("inp-splat-pruneopa").value || 0.025),
       opacity_reset_every: Number(el("inp-splat-opareset").value || 2000),
       conf_percentile: Number(el("inp-splat-vggtconf").value || 45),
       max_anisotropy: Math.max(4, Number(el("inp-splat-maxaniso").value || 10) * 0.6),
+      rasterize_mode: el("sel-splat-rastmode") ? el("sel-splat-rastmode").value : "antialiased",
+      refine_poses: el("chk-splat-refineposes") ? el("chk-splat-refineposes").checked : false,
       pose_backend: el("sel-splat-pose-backend") ? el("sel-splat-pose-backend").value : "vggt",
     };
     if (state.splatSourceMode === "video") {
@@ -1533,6 +1562,9 @@
       if (!payload.video_path) {
         showToast("Select a source MP4 video first.", true);
         return;
+      }
+      if (knownCamVal) {
+        payload.known_cameras_job = knownCamVal;
       }
     } else {
       payload.num_views = Number(el("inp-splat-views").value || 28);
@@ -1544,7 +1576,10 @@
     btn.disabled = true;
     try {
       const res = await apiFetch("/api/splats/train", { method: "POST", json: payload });
-      if (res.job) handleSplatJobUpdate(res.job);
+      if (res.job) {
+        if (window._bbSelectWorkbenchJob) window._bbSelectWorkbenchJob(res.job.job_id, true);
+        handleSplatJobUpdate(res.job);
+      }
       showToast(`Launched Modal ${payload.gpu} 3DGS job (${payload.iterations} steps): ${res.job ? res.job.job_id : ""}`);
     } catch (err) {
       showToast(err.message, true);
@@ -1657,6 +1692,7 @@
   }
 
   function renderSplatJobs() {
+    populateKnownCamsDropdown();
     const box = el("splat-jobs-list");
     if (!box) return;
     const list = Array.from(state.splatJobs.values()).sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
@@ -1680,6 +1716,8 @@
           <div class="splat-job-sub">${escapeHtml(j.stage)} · ${pts} pts${psnrStr}${costStr}</div>
         </div>
         <div class="splat-job-actions">
+          ${j.cameras_rel ? `<button type="button" class="btn btn-accent btn-xs btn-cmp-path" title="Compare Original Video vs Modal Cloud / Blender Render + 3D Camera Path &amp; Rotation">🎬 Compare &amp; Path</button>` : ""}
+          <button type="button" class="btn btn-secondary btn-xs btn-open-plots" title="Open tt-splat Loss/PSNR/Count plots, GPU stage timings, snapshot scrubber &amp; surgeries">📊 Plots</button>
           ${j.splat_url ? `<button type="button" class="btn btn-primary btn-xs btn-view-3d">🌐 3D</button>` : ""}
           ${j.ply_rel ? `<button type="button" class="btn btn-primary btn-xs btn-imp-bl" title="Import .ply + cameras + frustum rig + GT overlay into Blender 5.3">📥 Splat+Cams</button>` : ""}
           ${j.cameras_rel ? `<button type="button" class="btn btn-secondary btn-xs btn-imp-cams" title="Import ONLY solved Seedance camera trajectory + 3D frustum cones + live GT overlay into Blender">🎥 Cams Only</button>` : ""}
@@ -1691,6 +1729,10 @@
         </div>
       `;
 
+      const bCmp = card.querySelector(".btn-cmp-path");
+      if (bCmp) bCmp.addEventListener("click", () => openComparatorForJob(j));
+      const bPlots = card.querySelector(".btn-open-plots");
+      if (bPlots) bPlots.addEventListener("click", () => window._bbSelectWorkbenchJob && window._bbSelectWorkbenchJob(j.job_id, false));
       const b3d = card.querySelector(".btn-view-3d");
       if (b3d) b3d.addEventListener("click", () => openSplatInTheater(j));
       const bPol = card.querySelector(".btn-polish-splat");
@@ -1757,9 +1799,17 @@
     });
   }
 
-  // --- Embedded Zero-Dependency WebGL2 3D Gaussian Splat Viewer ---
+  // --- Embedded WebGL2 3DGS Viewer + FPS / Minecraft Camera Rail, Subject-Track & Spatial Brief Engine ---
+  const PRIME_LENSES = [18, 24, 28, 35, 50, 85, 105, 135];
+  const VOXEL_SIZES = [0.5, 1.0, 2.0];
+
   function createSplatWebGLViewer(canvas, hudInfoEl) {
-    const gl = canvas.getContext("webgl2", { antialias: false, alpha: false, premultipliedAlpha: false });
+    const gl = canvas.getContext("webgl2", {
+      antialias: false,
+      alpha: false,
+      premultipliedAlpha: false,
+      preserveDrawingBuffer: true,
+    });
     if (!gl) return null;
     gl.getExtension("EXT_color_buffer_float");
 
@@ -1851,6 +1901,32 @@
       fragColor = vec4(v_color.rgb * a, a);
     }`;
 
+    // Second pass: 3D Wireframe / Rail / Subject-Capsule / Voxel / Beacon Overlay Shader
+    const lineVsSrc = `#version 300 es
+    precision highp float;
+    layout(location = 0) in vec3 a_pos;
+    layout(location = 1) in vec4 a_col;
+    uniform mat3 u_W;
+    uniform vec3 u_camPos;
+    uniform vec2 u_focal;
+    uniform vec2 u_viewport;
+    out vec4 v_col;
+    void main() {
+      vec3 cam = u_W * (a_pos - u_camPos);
+      float z = max(0.08, cam.z);
+      vec2 ndc = vec2(cam.x * u_focal.x / z, cam.y * u_focal.y / z) / (u_viewport * 0.5);
+      gl_Position = vec4(ndc, 0.0, 1.0);
+      v_col = a_col;
+    }`;
+
+    const lineFsSrc = `#version 300 es
+    precision mediump float;
+    in vec4 v_col;
+    out vec4 fragColor;
+    void main() {
+      fragColor = vec4(v_col.rgb * v_col.a, v_col.a);
+    }`;
+
     const compile = (type, src) => {
       const sh = gl.createShader(type);
       gl.shaderSource(sh, src);
@@ -1864,6 +1940,11 @@
     gl.attachShader(prog, compile(gl.VERTEX_SHADER, vsSrc));
     gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, fsSrc));
     gl.linkProgram(prog);
+
+    const lineProg = gl.createProgram();
+    gl.attachShader(lineProg, compile(gl.VERTEX_SHADER, lineVsSrc));
+    gl.attachShader(lineProg, compile(gl.FRAGMENT_SHADER, lineFsSrc));
+    gl.linkProgram(lineProg);
 
     const vao = gl.createVertexArray();
     gl.bindVertexArray(vao);
@@ -1879,6 +1960,15 @@
     gl.enableVertexAttribArray(1);
     gl.vertexAttribIPointer(1, 1, gl.UNSIGNED_INT, 0, 0);
     gl.vertexAttribDivisor(1, 1);
+
+    const lineVao = gl.createVertexArray();
+    gl.bindVertexArray(lineVao);
+    const lineBuf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 28, 0);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 28, 12);
 
     const makeTex = (unit) => {
       const t = gl.createTexture();
@@ -1903,33 +1993,147 @@
     gl.uniform1i(gl.getUniformLocation(prog, "u_covTexA"), 1);
     gl.uniform1i(gl.getUniformLocation(prog, "u_covTexB"), 2);
 
+    const luW = gl.getUniformLocation(lineProg, "u_W");
+    const luCamPos = gl.getUniformLocation(lineProg, "u_camPos");
+    const luFocal = gl.getUniformLocation(lineProg, "u_focal");
+    const luViewport = gl.getUniformLocation(lineProg, "u_viewport");
+
     let count = 0;
     let positions = null;
     let sortedIdx = null;
     let depthBuckets = new Int32Array(65536);
     let depthKeys = null;
-    let sceneCenter = [0, 0, 0.5];
+    let sceneCenter = [0, 0, 0.8];
     let sceneRadius = 3.0;
-    let target = [0, 0, 0.5];
+
+    // Orbit state
+    let target = [0, 0, 0.8];
     let theta = -1.25;
-    let phi = 0.28;
+    let phi = 0.25;
     let dist = 4.5;
+
+    // FPS / Rust / Minecraft Rail & Sandbox state
+    const fps = {
+      enabled: false,
+      eye: [0, -4.0, 1.65],
+      yaw: 0.0,            // Body movement heading (0 = +Y forward)
+      pitch: -0.04,        // Body pitch (used in Drone Fly mode)
+      headYaw: 0.0,        // Rust `Hold Alt` decoupled over-the-shoulder head-look yaw offset!
+      headPitch: 0.0,      // Rust `Hold Alt` decoupled head-look pitch offset!
+      gimbalLocked: false, // `CapsLock` freezes head-look offset without holding Alt
+      autoRun: false,      // Rust `T` toggle: hands-free constant-speed forward dolly cruise!
+      prone: false,        // `Z` toggle: 0.32m ground-skimming worms-eye stance
+      leanAmt: 0.0,        // `Q` / `E` smoothed [-1..+1] corner peek/lean offset!
+      vertVel: 0.0,        // Jump impulse in grounded stance
+      floorOffsetZ: 0.0,   // Current height above floor when jumping
+      rollDeg: 0.0,
+      lensMm: 35,
+      grounded: true,      // Starts in Grounded 1.65m Walk (`C`=crouch, `Z`=prone, `G`=toggle Drone Fly!)
+      slot: 1,             // Hotbar 1=Cam, 2=Subject, 3=Voxel, 4=Ping
+      voxelSizeIdx: 1,     // 1.0m default
+      keys: new Set(),
+      adsTarget: null,     // `Hold RMB` locks 3D look-at point!
+      binoZoom: false,     // `Hold B` temporary 135mm spotter scope
+      bookmarks: {},       // `Shift+F1..F4` save POV, `F1..F4` instant teleport
+      lastHit: null,       // { pt: [x,y,z], dist, normal: [nx,ny,nz], kind, voxelIdx }
+      camNodes: [],        // [{ position, forward, target, lens_mm, roll_deg }]
+      subjectNodes: [],    // [{ position }]
+      trackSubject: false, // `K` key or UI button toggles Camera Rail auto-tracking Subject
+      voxels: [],          // [{ center: [x,y,z], size: [s,s,s], color: [r,g,b,a] }]
+      pings: [],           // [{ position: [x,y,z], camera_eye: [x,y,z], note, image_b64 }]
+      riding: false,
+      rideStartT: 0,
+      recordingFlight: false,
+      lastRecT: 0,
+      pendingPing: null,
+    };
+
     let running = false;
     let dirtySort = true;
     let dragging = false;
     let panMode = false;
     let lastX = 0;
     let lastY = 0;
+    let lastFrameT = performance.now();
+
+    function syncHotbarCounts() {
+      if (el("cnt-hb-cam")) el("cnt-hb-cam").textContent = String(fps.camNodes.length);
+      if (el("cnt-hb-sub")) el("cnt-hb-sub").textContent = String(fps.subjectNodes.length);
+      if (el("cnt-hb-vox")) el("cnt-hb-vox").textContent = String(fps.voxels.length);
+      if (el("cnt-hb-ping")) el("cnt-hb-ping").textContent = String(fps.pings.length);
+      if (el("fps-hotbar")) {
+        el("fps-hotbar").querySelectorAll(".hotbar-slot").forEach((b) => {
+          b.classList.toggle("active", Number(b.dataset.slot) === fps.slot);
+        });
+      }
+      if (el("btn-rail-track-sub")) {
+        el("btn-rail-track-sub").textContent = `🎯 Track Subj: ${fps.trackSubject ? "ON" : "OFF"}`;
+        el("btn-rail-track-sub").classList.toggle("btn-primary", fps.trackSubject);
+      }
+    }
+
+    function setFpsMode(on, requestLock = false) {
+      fps.enabled = !!on;
+      if (fps.enabled) {
+        // Seed FPS eye from current orbit camera so transition is seamless
+        const ob = computeOrbitBasis();
+        fps.eye = ob.eye.slice();
+        fps.yaw = Math.atan2(ob.fx, ob.fy);
+        fps.pitch = Math.asin(Math.max(-0.98, Math.min(0.98, ob.fz)));
+      } else if (document.pointerLockElement === canvas) {
+        document.exitPointerLock();
+      }
+      el("fps-crosshair-wrap").classList.toggle("hidden", !fps.enabled);
+      el("fps-radar-canvas")?.classList.toggle("hidden", !fps.enabled);
+      el("fps-rail-topbar").classList.toggle("hidden", !fps.enabled && fps.camNodes.length === 0);
+      el("fps-hotbar").classList.toggle("hidden", !fps.enabled);
+      if (el("btn-splat-fps-toggle")) {
+        el("btn-splat-fps-toggle").textContent = fps.enabled ? "🌐 Orbit Mode" : "🎮 FPS Mode";
+      }
+      syncHotbarCounts();
+      updateHudText();
+      if (fps.enabled && requestLock) {
+        canvas.requestPointerLock?.();
+      }
+      dirtySort = true;
+    }
+
+    function updateHudText() {
+      if (!fps.enabled) {
+        hudInfoEl.textContent = count
+          ? `${count.toLocaleString()} Gaussians · Drag orbit · Click 🎮 FPS for Rust/Minecraft Controls`
+          : `Blank Sandbox · Click 🎮 FPS Mode to build Voxels & Camera Rail`;
+        return;
+      }
+      const locked = document.pointerLockElement === canvas;
+      hudInfoEl.textContent = locked
+        ? `WASD · T autorun · Alt free-look · C crouch · Z prone · Q/E peek · RMB lock · MMB ping · B bino`
+        : `Click viewport to lock mouse · 1-4 hotbar · T autorun · Alt look · P ride`;
+    }
+
+    document.addEventListener("pointerlockchange", updateHudText);
 
     function resetCamera() {
       target = sceneCenter.slice();
       theta = -1.25;
       phi = 0.25;
       dist = Math.max(0.8, sceneRadius * 1.75);
+      if (fps.enabled) {
+        fps.eye = [sceneCenter[0], sceneCenter[1] - Math.max(2.5, sceneRadius * 1.4), 1.65];
+        fps.yaw = 0.0;
+        fps.pitch = -0.04;
+        fps.headYaw = 0.0;
+        fps.headPitch = 0.0;
+        fps.autoRun = false;
+        fps.prone = false;
+        fps.leanAmt = 0.0;
+        fps.rollDeg = 0.0;
+        fps.adsTarget = null;
+      }
       dirtySort = true;
     }
 
-    function computeCameraBasis() {
+    function computeOrbitBasis() {
       const cp = Math.cos(phi);
       const sp = Math.sin(phi);
       const ct = Math.cos(theta);
@@ -1940,19 +2144,555 @@
       let fz = target[2] - eye[2];
       const fn = Math.hypot(fx, fy, fz) || 1;
       fx /= fn; fy /= fn; fz /= fn;
-      // right = normalize(cross(fwd, [0, 0, 1]))
-      let rx = fy;
-      let ry = -fx;
-      let rz = 0;
+      let rx = fy, ry = -fx, rz = 0;
       const rn = Math.hypot(rx, ry, rz) || 1;
       rx /= rn; ry /= rn;
-      // up = cross(right, fwd)
       const ux = ry * fz - rz * fy;
       const uy = rz * fx - rx * fz;
       const uz = rx * fy - ry * fx;
-      // GLSL column-major mat3 for row0=right, row1=up, row2=fwd:
       const W = new Float32Array([rx, ux, fx, ry, uy, fy, rz, uz, fz]);
-      return { eye, rx, ry, rz, ux, uy, uz, fx, fy, fz, W };
+      return { eye, rx, ry, rz, ux, uy, uz, fx, fy, fz, W, lensMm: 35 };
+    }
+
+    function buildBasisFromEyeFwd(eye, fwd, rollDeg = 0, lensOverride = null) {
+      let fx = fwd[0], fy = fwd[1], fz = fwd[2];
+      const fn = Math.hypot(fx, fy, fz) || 1;
+      fx /= fn; fy /= fn; fz /= fn;
+      let rx = fy, ry = -fx, rz = 0;
+      const rn = Math.hypot(rx, ry, rz);
+      if (rn < 1e-5) { rx = 1; ry = 0; rz = 0; } else { rx /= rn; ry /= rn; }
+      let ux = ry * fz - rz * fy;
+      let uy = rz * fx - rx * fz;
+      let uz = rx * fy - ry * fx;
+      if (Math.abs(rollDeg) > 0.01) {
+        const rad = (rollDeg * Math.PI) / 180.0;
+        const cr = Math.cos(rad), sr = Math.sin(rad);
+        const nrx = rx * cr + ux * sr, nry = ry * cr + uy * sr, nrz = rz * cr + uz * sr;
+        ux = -rx * sr + ux * cr; uy = -ry * sr + uy * cr; uz = -rz * sr + uz * cr;
+        rx = nrx; ry = nry; rz = nrz;
+      }
+      const W = new Float32Array([rx, ux, fx, ry, uy, fy, rz, uz, fz]);
+      const effLens = lensOverride !== null ? lensOverride : (fps.binoZoom ? 135 : fps.lensMm);
+      return { eye: eye.slice(), rx, ry, rz, ux, uy, uz, fx, fy, fz, W, lensMm: effLens };
+    }
+
+    function catmull3(p0, p1, p2, p3, u) {
+      const u2 = u * u, u3 = u2 * u;
+      return [0, 1, 2].map((k) =>
+        0.5 * (
+          2 * p1[k] +
+          (-p0[k] + p2[k]) * u +
+          (2 * p0[k] - 5 * p1[k] + 4 * p2[k] - p3[k]) * u2 +
+          (-p0[k] + 3 * p1[k] - 3 * p2[k] + p3[k]) * u3
+        )
+      );
+    }
+
+    function evalSplineAt(pts, frac) {
+      if (!pts.length) return [0, 0, 0];
+      if (pts.length === 1) return pts[0].slice();
+      const f = Math.max(0, Math.min(1, frac)) * (pts.length - 1);
+      const i = Math.min(pts.length - 2, Math.floor(f));
+      const u = f - i;
+      return catmull3(
+        pts[Math.max(0, i - 1)],
+        pts[i],
+        pts[i + 1],
+        pts[Math.min(pts.length - 1, i + 2)],
+        u
+      );
+    }
+
+    function evalRailCameraAt(frac) {
+      const n = fps.camNodes.length;
+      if (n === 0) return computeCameraBasis();
+      if (n === 1) {
+        const c0 = fps.camNodes[0];
+        return buildBasisFromEyeFwd(c0.position, c0.forward, c0.roll_deg || 0, c0.lens_mm || 35);
+      }
+      const pos = evalSplineAt(fps.camNodes.map((c) => c.position), frac);
+      let fwd;
+      if (fps.trackSubject && fps.subjectNodes.length > 0) {
+        const subPt = evalSplineAt(fps.subjectNodes.map((s) => s.position), frac);
+        fwd = [subPt[0] - pos[0], subPt[1] - pos[1], subPt[2] + 1.1 - pos[2]];
+      } else {
+        fwd = evalSplineAt(fps.camNodes.map((c) => c.forward), frac);
+      }
+      const fIdx = Math.min(n - 2, Math.floor(Math.max(0, Math.min(0.9999, frac)) * (n - 1)));
+      const u = Math.max(0, Math.min(1, frac * (n - 1) - fIdx));
+      const lens = (fps.camNodes[fIdx].lens_mm || 35) * (1 - u) + (fps.camNodes[fIdx + 1].lens_mm || 35) * u;
+      const roll = (fps.camNodes[fIdx].roll_deg || 0) * (1 - u) + (fps.camNodes[fIdx + 1].roll_deg || 0) * u;
+      return buildBasisFromEyeFwd(pos, fwd, roll, lens);
+    }
+
+    function computeCameraBasis() {
+      if (fps.riding && fps.camNodes.length >= 1) {
+        const dur = Math.max(1, Number(el("inp-rail-dur")?.value || 5));
+        const elapsed = (performance.now() - fps.rideStartT) / 1000.0;
+        const frac = (elapsed % dur) / dur;
+        return evalRailCameraAt(frac);
+      }
+      if (!fps.enabled) return computeOrbitBasis();
+
+      // Apply Q/E tactical corner peek/lean offset along body-right axis!
+      const bodyRx = Math.cos(fps.yaw), bodyRy = -Math.sin(fps.yaw);
+      const effEye = [
+        fps.eye[0] + bodyRx * (fps.leanAmt * 0.42),
+        fps.eye[1] + bodyRy * (fps.leanAmt * 0.42),
+        fps.eye[2] - Math.abs(fps.leanAmt) * 0.06,
+      ];
+      const effRoll = fps.rollDeg + fps.leanAmt * 6.5;
+
+      let fwd;
+      if (fps.adsTarget) {
+        fwd = [
+          fps.adsTarget[0] - effEye[0],
+          fps.adsTarget[1] - effEye[1],
+          fps.adsTarget[2] - effEye[2],
+        ];
+        const fn = Math.hypot(fwd[0], fwd[1], fwd[2]) || 1;
+        // When NOT holding Alt, ADS updates body heading; when holding Alt, ADS tracks over shoulder!
+        const altHeld = fps.keys.has("AltLeft") || fps.keys.has("AltRight") || fps.gimbalLocked;
+        if (!altHeld) {
+          fps.yaw = Math.atan2(fwd[0] / fn, fwd[1] / fn);
+          fps.pitch = Math.asin(Math.max(-0.98, Math.min(0.98, fwd[2] / fn)));
+        }
+      } else {
+        const lookYaw = fps.yaw + fps.headYaw;
+        const lookPitch = Math.max(-1.48, Math.min(1.48, fps.pitch + fps.headPitch));
+        const cp = Math.cos(lookPitch);
+        fwd = [Math.sin(lookYaw) * cp, Math.cos(lookYaw) * cp, Math.sin(lookPitch)];
+      }
+      return buildBasisFromEyeFwd(effEye, fwd, effRoll);
+    }
+
+    // Raycast crosshair against Voxels -> 3DGS Splat Point Cloud -> Z=0 Ground Plane!
+    function raycastCrosshair(eye, fwd) {
+      let bestT = Infinity;
+      let bestHit = null;
+
+      // 1. Exact slab ray-AABB test against placed Voxels (enables Minecraft face-stacking!)
+      fps.voxels.forEach((vx, vIdx) => {
+        const c = vx.center, s = vx.size;
+        let tmin = -Infinity, tmax = Infinity;
+        let hitAxis = 2, hitSign = 1;
+        for (let a = 0; a < 3; a++) {
+          const lo = c[a] - 0.5 * s[a], hi = c[a] + 0.5 * s[a];
+          const d = fwd[a];
+          if (Math.abs(d) < 1e-7) {
+            if (eye[a] < lo || eye[a] > hi) return;
+          } else {
+            let t1 = (lo - eye[a]) / d, t2 = (hi - eye[a]) / d;
+            let sgn = -1;
+            if (t1 > t2) { const tmp = t1; t1 = t2; t2 = tmp; sgn = 1; }
+            if (t1 > tmin) { tmin = t1; hitAxis = a; hitSign = sgn; }
+            if (t2 < tmax) tmax = t2;
+            if (tmin > tmax) return;
+          }
+        }
+        if (tmin > 0.15 && tmin < bestT) {
+          bestT = tmin;
+          const nrm = [0, 0, 0];
+          nrm[hitAxis] = hitSign;
+          bestHit = {
+            pt: [eye[0] + fwd[0] * tmin, eye[1] + fwd[1] * tmin, eye[2] + fwd[2] * tmin],
+            dist: tmin,
+            normal: nrm,
+            kind: "voxel",
+            voxelIdx: vIdx,
+          };
+        }
+      });
+
+      // 2. Fast cone ray-pick against 3DGS splat cloud (~20k sampled points, <0.25 ms)
+      if (count > 0 && positions) {
+        const stride = Math.max(1, Math.floor(count / 20000));
+        const hitsZ = [];
+        for (let i = 0; i < count; i += stride) {
+          const dx = positions[3 * i] - eye[0];
+          const dy = positions[3 * i + 1] - eye[1];
+          const dz = positions[3 * i + 2] - eye[2];
+          const z = dx * fwd[0] + dy * fwd[1] + dz * fwd[2];
+          if (z <= 0.25 || z >= bestT) continue;
+          const d2 = dx * dx + dy * dy + dz * dz - z * z;
+          const rTol = z * 0.035 + 0.05;
+          if (d2 <= rTol * rTol) hitsZ.push(z);
+        }
+        if (hitsZ.length >= 3) {
+          hitsZ.sort((a, b) => a - b);
+          const zPick = hitsZ[Math.floor(hitsZ.length * 0.15)];
+          if (zPick < bestT) {
+            bestT = zPick;
+            bestHit = {
+              pt: [eye[0] + fwd[0] * zPick, eye[1] + fwd[1] * zPick, eye[2] + fwd[2] * zPick],
+              dist: zPick,
+              normal: [0, 0, 1],
+              kind: "splat",
+              voxelIdx: -1,
+            };
+          }
+        }
+      }
+
+      // 3. Fallback: Z=0 metric floor intersection
+      if (!bestHit && fwd[2] < -0.015 && eye[2] > 0) {
+        const tg = -eye[2] / fwd[2];
+        if (tg > 0.1 && tg < 80.0) {
+          bestHit = {
+            pt: [eye[0] + fwd[0] * tg, eye[1] + fwd[1] * tg, 0.0],
+            dist: tg,
+            normal: [0, 0, 1],
+            kind: "floor",
+            voxelIdx: -1,
+          };
+        }
+      }
+      return bestHit;
+    }
+
+    function stepFpsMovement(dt) {
+      if (!fps.enabled || fps.riding) return;
+      if (el("fps-ping-modal") && !el("fps-ping-modal").classList.contains("hidden")) return;
+
+      const altHeld = fps.keys.has("AltLeft") || fps.keys.has("AltRight");
+      // Rust head-snap: smoothly spring `headYaw`/`headPitch` back to 0 when Alt is released!
+      if (!altHeld && !fps.gimbalLocked && (Math.abs(fps.headYaw) > 1e-4 || Math.abs(fps.headPitch) > 1e-4)) {
+        const kSnap = Math.min(1.0, dt * 14.0);
+        fps.headYaw *= 1.0 - kSnap;
+        fps.headPitch *= 1.0 - kSnap;
+        if (Math.abs(fps.headYaw) < 1e-3) fps.headYaw = 0.0;
+        if (Math.abs(fps.headPitch) < 1e-3) fps.headPitch = 0.0;
+        dirtySort = true;
+      }
+
+      // Smooth Q / E corner peek/lean (`-1` left, `+1` right; Shift+Q/E adjusts persistent Dutch roll)
+      const shiftHeld = fps.keys.has("ShiftLeft") || fps.keys.has("ShiftRight");
+      const ctrlHeld = fps.keys.has("ControlLeft") || fps.keys.has("ControlRight");
+      const crouchHeld = fps.keys.has("KeyC");
+
+      let targetLean = 0.0;
+      if (!shiftHeld) {
+        if (fps.keys.has("KeyQ")) targetLean -= 1.0;
+        if (fps.keys.has("KeyE")) targetLean += 1.0;
+      } else {
+        if (fps.keys.has("KeyQ")) fps.rollDeg = Math.max(-35, fps.rollDeg - 30 * dt);
+        if (fps.keys.has("KeyE")) fps.rollDeg = Math.min(35, fps.rollDeg + 30 * dt);
+      }
+      if (Math.abs(fps.leanAmt - targetLean) > 1e-4) {
+        fps.leanAmt += (targetLean - fps.leanAmt) * Math.min(1.0, dt * 13.0);
+        dirtySort = true;
+      }
+
+      // Speed modifiers: Shift = Sprint (2.6x), Ctrl = Silent Slow-Walk Creep (0.30x), Crouch = 0.55x, Prone = 0.25x
+      let spdMult = shiftHeld ? 2.6 : ctrlHeld ? 0.30 : 1.0;
+      if (fps.grounded) {
+        if (fps.prone) spdMult *= 0.28;
+        else if (crouchHeld) spdMult *= 0.58;
+      }
+      const baseSpd = Math.max(2.2, sceneRadius * 0.9) * spdMult;
+
+      // CRITICAL RUST MECHANIC: Movement vector uses `fps.yaw` (body heading), NOT `headYaw`!
+      // Holding `Alt` to look over your shoulder NEVER curves your `WASD` or `T` Auto-Run line!
+      const cpBody = Math.cos(fps.pitch);
+      const bodyFx = Math.sin(fps.yaw) * (fps.grounded ? 1.0 : cpBody);
+      const bodyFy = Math.cos(fps.yaw) * (fps.grounded ? 1.0 : cpBody);
+      const bodyFz = fps.grounded ? 0.0 : Math.sin(fps.pitch);
+      const bodyRx = Math.cos(fps.yaw), bodyRy = -Math.sin(fps.yaw);
+
+      if (fps.keys.has("KeyS")) fps.autoRun = false; // Backpedal cancels Rust auto-run
+
+      let vx = 0, vy = 0, vz = 0;
+      if (fps.keys.has("KeyW") || fps.autoRun) { vx += bodyFx; vy += bodyFy; vz += bodyFz; }
+      if (fps.keys.has("KeyS")) { vx -= bodyFx; vy -= bodyFy; vz -= bodyFz; }
+      if (fps.keys.has("KeyD")) { vx += bodyRx; vy += bodyRy; }
+      if (fps.keys.has("KeyA")) { vx -= bodyRx; vy -= bodyRy; }
+      if (!fps.grounded) {
+        if (fps.keys.has("Space")) vz += 1.0;
+        if (crouchHeld) vz -= 1.0;
+      }
+
+      if (vx !== 0 || vy !== 0 || vz !== 0) {
+        const vn = Math.hypot(vx, vy, vz) || 1;
+        fps.eye[0] += (vx / vn) * baseSpd * dt;
+        fps.eye[1] += (vy / vn) * baseSpd * dt;
+        fps.eye[2] += (vz / vn) * baseSpd * dt;
+        dirtySort = true;
+      }
+
+      if (fps.grounded) {
+        // Stance height: Standing = 1.65m, C Crouch = 0.95m, Z Prone = 0.32m + Space Jump arc!
+        if (fps.keys.has("Space") && fps.floorOffsetZ <= 0.01) {
+          fps.prone = false;
+          fps.vertVel = 4.4;
+        }
+        if (fps.vertVel !== 0 || fps.floorOffsetZ > 0) {
+          fps.floorOffsetZ = Math.max(0.0, fps.floorOffsetZ + fps.vertVel * dt);
+          fps.vertVel = fps.floorOffsetZ > 0 ? fps.vertVel - 11.5 * dt : 0.0;
+          dirtySort = true;
+        }
+        const stanceZ = crouchHeld ? 0.95 : fps.prone ? 0.32 : 1.65;
+        const targetEyeZ = stanceZ + fps.floorOffsetZ;
+        fps.eye[2] += (targetEyeZ - fps.eye[2]) * Math.min(1.0, dt * 13.0);
+        dirtySort = true;
+      }
+
+      // 1-Take Steadicam / Auto-Run + Alt Free-Look recording while holding `R` in slot 1!
+      const now = performance.now();
+      if (fps.keys.has("KeyR") && fps.slot === 1) {
+        if (!fps.recordingFlight) {
+          fps.recordingFlight = true;
+          fps.camNodes = [];
+          fps.lastRecT = 0;
+        }
+        if (now - fps.lastRecT >= 220) {
+          fps.lastRecT = now;
+          const cNow = computeCameraBasis();
+          fps.camNodes.push({
+            position: cNow.eye.slice(),
+            forward: [cNow.fx, cNow.fy, cNow.fz],
+            target: fps.adsTarget ? fps.adsTarget.slice() : null,
+            lens_mm: fps.lensMm,
+            roll_deg: fps.rollDeg + fps.leanAmt * 6.5,
+          });
+          el("fps-rail-topbar").classList.remove("hidden");
+          syncHotbarCounts();
+        }
+      } else {
+        fps.recordingFlight = false;
+      }
+    }
+
+    function drawRadarMinimap(cam) {
+      const rc = el("fps-radar-canvas");
+      if (!rc || !fps.enabled) return;
+      const g = rc.getContext("2d");
+      const W = rc.width, H = rc.height;
+      const cx = W * 0.5, cy = H * 0.5, rad = W * 0.46;
+      g.clearRect(0, 0, W, H);
+
+      // Range ring
+      g.strokeStyle = "rgba(56, 189, 248, 0.25)";
+      g.lineWidth = 1;
+      g.beginPath(); g.arc(cx, cy, rad * 0.55, 0, Math.PI * 2); g.stroke();
+
+      // Ego-centric rotation: Up on radar (`-Y_px`) = Body Movement Heading (`fps.yaw`)!
+      const scalePx = rad / Math.max(4.0, sceneRadius * 1.6);
+      const cY = Math.cos(fps.yaw), sY = Math.sin(fps.yaw);
+      function toRadar(pt) {
+        const dx = pt[0] - fps.eye[0], dy = pt[1] - fps.eye[1];
+        // bodyRight = (cos, -sin), bodyFwd = (sin, cos)
+        const rx = dx * cY - dy * sY;
+        const fy = dx * sY + dy * cY;
+        return [cx + rx * scalePx, cy - fy * scalePx];
+      }
+
+      // Voxels (cyan squares)
+      g.fillStyle = "rgba(56, 189, 248, 0.7)";
+      fps.voxels.forEach((vx) => {
+        const [px, py] = toRadar(vx.center);
+        if (Math.hypot(px - cx, py - cy) < rad) g.fillRect(px - 2, py - 2, 4, 4);
+      });
+
+      // Subject Track (magenta line + dots)
+      if (fps.subjectNodes.length > 0) {
+        g.strokeStyle = "#f472b6";
+        g.fillStyle = "#f472b6";
+        g.beginPath();
+        fps.subjectNodes.forEach((sn, idx) => {
+          const [px, py] = toRadar(sn.position);
+          if (idx === 0) g.moveTo(px, py); else g.lineTo(px, py);
+        });
+        g.stroke();
+        fps.subjectNodes.forEach((sn) => {
+          const [px, py] = toRadar(sn.position);
+          g.beginPath(); g.arc(px, py, 2.5, 0, Math.PI * 2); g.fill();
+        });
+      }
+
+      // Cam Rail (gold)
+      if (fps.camNodes.length > 0) {
+        g.strokeStyle = "#facc15";
+        g.beginPath();
+        fps.camNodes.forEach((cn, idx) => {
+          const [px, py] = toRadar(cn.position);
+          if (idx === 0) g.moveTo(px, py); else g.lineTo(px, py);
+        });
+        g.stroke();
+      }
+
+      // Pings (orange diamonds)
+      g.fillStyle = "#fb923c";
+      fps.pings.forEach((pg) => {
+        const [px, py] = toRadar(pg.position);
+        if (Math.hypot(px - cx, py - cy) < rad) {
+          g.beginPath(); g.arc(px, py, 3.0, 0, Math.PI * 2); g.fill();
+        }
+      });
+
+      // Cyan Sight Cone (rotates relative to Up whenever Holding Alt to look over shoulder!!)
+      const lookAng = Math.atan2(cam.fx, cam.fy) - fps.yaw;
+      const halfFov = Math.atan(18.0 / Math.max(12, cam.lensMm || 35));
+      g.fillStyle = "rgba(56, 189, 248, 0.24)";
+      g.beginPath();
+      g.moveTo(cx, cy);
+      g.arc(cx, cy, rad * 0.72, -Math.PI * 0.5 + lookAng - halfFov, -Math.PI * 0.5 + lookAng + halfFov);
+      g.closePath();
+      g.fill();
+
+      // Green Body Movement Heading Arrow (always points straight Up on ego radar!)
+      g.strokeStyle = fps.autoRun ? "#4ade80" : "#e2e8f0";
+      g.lineWidth = 2;
+      g.beginPath(); g.moveTo(cx, cy + 4); g.lineTo(cx, cy - 9); g.stroke();
+      g.fillStyle = "#4ade80";
+      g.beginPath(); g.arc(cx, cy, 3, 0, Math.PI * 2); g.fill();
+    }
+
+    // Build dynamic 3D wireframe overlay buffer (`GL_LINES` clipped cleanly at near plane z=0.12)
+    function draw3DOverlays(cam, w, h) {
+      const verts = [];
+      const ex = cam.eye[0], ey = cam.eye[1], ez = cam.eye[2];
+      const W = cam.W; // column-major: rx=W[0],ry=W[3],rz=W[6]; ux=W[1],uy=W[4],uz=W[7]; fx=W[2],fy=W[5],fz=W[8]
+      const zCam = (p) => (p[0] - ex) * W[2] + (p[1] - ey) * W[5] + (p[2] - ez) * W[8];
+
+      function pushSeg(a, b, r, g, bl, al) {
+        let za = zCam(a), zb = zCam(b);
+        const zNear = 0.12;
+        if (za < zNear && zb < zNear) return;
+        let pa = a, pb = b;
+        if (za < zNear) {
+          const t = (zNear - za) / (zb - za);
+          pa = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+        } else if (zb < zNear) {
+          const t = (zNear - zb) / (za - zb);
+          pb = [b[0] + (a[0] - b[0]) * t, b[1] + (a[1] - b[1]) * t, b[2] + (a[2] - b[2]) * t];
+        }
+        verts.push(pa[0], pa[1], pa[2], r, g, bl, al, pb[0], pb[1], pb[2], r, g, bl, al);
+      }
+
+      function pushBox(c, sz, r, g, bl, al) {
+        const hx = 0.5 * sz[0], hy = 0.5 * sz[1], hz = 0.5 * sz[2];
+        const p = [
+          [c[0] - hx, c[1] - hy, c[2] - hz], [c[0] + hx, c[1] - hy, c[2] - hz],
+          [c[0] + hx, c[1] + hy, c[2] - hz], [c[0] - hx, c[1] + hy, c[2] - hz],
+          [c[0] - hx, c[1] - hy, c[2] + hz], [c[0] + hx, c[1] - hy, c[2] + hz],
+          [c[0] + hx, c[1] + hy, c[2] + hz], [c[0] - hx, c[1] + hy, c[2] + hz],
+        ];
+        [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]].forEach(([i, j]) =>
+          pushSeg(p[i], p[j], r, g, bl, al)
+        );
+      }
+
+      // 1. Z=0 Metric Grid (in FPS mode or when count===0)
+      if (fps.enabled || count === 0) {
+        const gRad = 8;
+        for (let g = -gRad; g <= gRad; g++) {
+          const hi = g === 0 ? 0.36 : 0.14;
+          pushSeg([g, -gRad, 0], [g, gRad, 0], 0.25, 0.4, 0.65, hi);
+          pushSeg([-gRad, g, 0], [gRad, g, 0], 0.25, 0.4, 0.65, hi);
+        }
+      }
+
+      // 2. Placed Snap-Grid Voxels
+      fps.voxels.forEach((vx) => {
+        const col = vx.color || [0.35, 0.78, 0.98, 0.9];
+        pushBox(vx.center, vx.size, col[0], col[1], col[2], 0.9);
+      });
+
+      // Ghost preview voxel when Slot 3 is active
+      if (fps.enabled && !fps.riding && fps.slot === 3 && fps.lastHit) {
+        const vsz = VOXEL_SIZES[fps.voxelSizeIdx];
+        const ghostC = snapVoxelPlacement(fps.lastHit, vsz);
+        pushBox(ghostC, [vsz, vsz, vsz], 0.3, 1.0, 0.55, 0.55);
+      }
+
+      // 3. Camera Rail Spline + Gold Frustum Blocks
+      if (fps.camNodes.length >= 2) {
+        const pts = fps.camNodes.map((n) => n.position);
+        const steps = Math.max(24, pts.length * 14);
+        let prev = pts[0];
+        for (let s = 1; s <= steps; s++) {
+          const cur = evalSplineAt(pts, s / steps);
+          pushSeg(prev, cur, 0.22, 0.78, 1.0, 0.95);
+          prev = cur;
+        }
+      }
+      fps.camNodes.forEach((nd) => {
+        const nb = buildBasisFromEyeFwd(nd.position, nd.forward, nd.roll_deg || 0);
+        const L = nd.position;
+        const fl = 0.28, fw = 0.16, fh = 0.10;
+        const c4 = [
+          [L[0] + nb.fx * fl - nb.rx * fw - nb.ux * fh, L[1] + nb.fy * fl - nb.ry * fw - nb.uy * fh, L[2] + nb.fz * fl - nb.rz * fw - nb.uz * fh],
+          [L[0] + nb.fx * fl + nb.rx * fw - nb.ux * fh, L[1] + nb.fy * fl + nb.ry * fw - nb.uy * fh, L[2] + nb.fz * fl + nb.rz * fw - nb.uz * fh],
+          [L[0] + nb.fx * fl + nb.rx * fw + nb.ux * fh, L[1] + nb.fy * fl + nb.ry * fw + nb.uy * fh, L[2] + nb.fz * fl + nb.rz * fw + nb.uz * fh],
+          [L[0] + nb.fx * fl - nb.rx * fw + nb.ux * fh, L[1] + nb.fy * fl - nb.ry * fw + nb.uy * fh, L[2] + nb.fz * fl - nb.rz * fw + nb.uz * fh],
+        ];
+        c4.forEach((c, k) => {
+          pushSeg(L, c, 1.0, 0.82, 0.2, 0.95);
+          pushSeg(c, c4[(k + 1) % 4], 1.0, 0.82, 0.2, 0.95);
+        });
+      });
+
+      // 4. Subject / Player Landmark Trajectory + Animated 1.75m Player Capsule!
+      if (fps.subjectNodes.length >= 1) {
+        const sPts = fps.subjectNodes.map((s) => s.position);
+        if (sPts.length >= 2) {
+          let spPrev = sPts[0];
+          for (let s = 1; s <= sPts.length * 12; s++) {
+            const sc = evalSplineAt(sPts, s / (sPts.length * 12));
+            pushSeg([spPrev[0], spPrev[1], spPrev[2] + 0.05], [sc[0], sc[1], sc[2] + 0.05], 0.95, 0.35, 0.88, 0.92);
+            spPrev = sc;
+          }
+        }
+        fps.subjectNodes.forEach((sn) => {
+          pushBox([sn.position[0], sn.position[1], sn.position[2] + 0.88], [0.45, 0.45, 1.75], 0.95, 0.35, 0.88, 0.45);
+        });
+        // Live animated player capsule during Ride preview!
+        if (fps.riding) {
+          const dur = Math.max(1, Number(el("inp-rail-dur")?.value || 5));
+          const frac = (((performance.now() - fps.rideStartT) / 1000.0) % dur) / dur;
+          const liveP = evalSplineAt(sPts, frac);
+          pushBox([liveP[0], liveP[1], liveP[2] + 0.88], [0.52, 0.52, 1.75], 0.3, 1.0, 0.55, 1.0);
+        }
+      }
+
+      // 5. Spatial Brief Pings (`[#1]` Vertical Beacon Poles) + ADS Target-Lock Diamond
+      fps.pings.forEach((pg) => {
+        const p = pg.position;
+        pushSeg(p, [p[0], p[1], p[2] + 1.4], 1.0, 0.48, 0.16, 0.95);
+        pushBox([p[0], p[1], p[2] + 1.45], [0.22, 0.22, 0.22], 1.0, 0.48, 0.16, 0.95);
+      });
+
+      if (fps.adsTarget) {
+        pushBox(fps.adsTarget, [0.18, 0.18, 0.18], 0.22, 0.88, 1.0, 1.0);
+      }
+
+      if (!verts.length) return;
+      const arr = new Float32Array(verts);
+      gl.useProgram(lineProg);
+      gl.bindVertexArray(lineVao);
+      gl.bindBuffer(gl.ARRAY_BUFFER, lineBuf);
+      gl.bufferData(gl.ARRAY_BUFFER, arr, gl.DYNAMIC_DRAW);
+      gl.uniformMatrix3fv(luW, false, cam.W);
+      gl.uniform3f(luCamPos, cam.eye[0], cam.eye[1], cam.eye[2]);
+      const focalPx = ((cam.lensMm || 35) / 36.0) * Math.max(w, h);
+      gl.uniform2f(luFocal, focalPx, focalPx);
+      gl.uniform2f(luViewport, w, h);
+      gl.drawArrays(gl.LINES, 0, verts.length / 7);
+    }
+
+    function snapVoxelPlacement(hit, sz) {
+      if (hit.kind === "voxel") {
+        const base = fps.voxels[hit.voxelIdx];
+        return [
+          base.center[0] + hit.normal[0] * (0.5 * base.size[0] + 0.5 * sz),
+          base.center[1] + hit.normal[1] * (0.5 * base.size[1] + 0.5 * sz),
+          base.center[2] + hit.normal[2] * (0.5 * base.size[2] + 0.5 * sz),
+        ];
+      }
+      const gx = Math.round(hit.pt[0] / sz) * sz;
+      const gy = Math.round(hit.pt[1] / sz) * sz;
+      const gz = Math.max(0.5 * sz, Math.floor(hit.pt[2] / sz) * sz + 0.5 * sz);
+      return [gx, gy, gz];
     }
 
     function sortBackToFront(cam) {
@@ -1974,7 +2714,6 @@
       const invSpan = 65535.0 / (maxZ - minZ);
       for (let i = 0; i < count; i++) {
         const z = depthKeys[i];
-        // Back-to-front: largest z maps to bucket 0!
         const b = z <= 0.1 ? 65535 : Math.max(0, Math.min(65534, 65534 - ((z - minZ) * invSpan) | 0));
         depthKeys[i] = b;
         depthBuckets[b]++;
@@ -1996,16 +2735,129 @@
       dirtySort = false;
     }
 
+    function handlePrimaryFpsAction() {
+      const cam = computeCameraBasis();
+      const hit = raycastCrosshair(cam.eye, [cam.fx, cam.fy, cam.fz]);
+
+      if (fps.slot === 1) {
+        // Place Camera Rail Node
+        fps.camNodes.push({
+          position: cam.eye.slice(),
+          forward: [cam.fx, cam.fy, cam.fz],
+          target: fps.adsTarget ? fps.adsTarget.slice() : null,
+          lens_mm: fps.lensMm,
+          roll_deg: fps.rollDeg,
+        });
+        el("fps-rail-topbar").classList.remove("hidden");
+        syncHotbarCounts();
+        showToast(`Placed Cam Node #${fps.camNodes.length} (${fps.lensMm}mm)`);
+      } else if (fps.slot === 2) {
+        // Place Subject / Player Waypoint on landmark/floor
+        const pt = hit ? hit.pt.slice() : [cam.eye[0] + cam.fx * 3.0, cam.eye[1] + cam.fy * 3.0, 0.0];
+        fps.subjectNodes.push({ position: pt });
+        el("fps-rail-topbar").classList.remove("hidden");
+        syncHotbarCounts();
+        showToast(`Placed Subject Waypoint #${fps.subjectNodes.length} @ (${pt[0].toFixed(1)}, ${pt[1].toFixed(1)}, ${pt[2].toFixed(1)})m`);
+      } else if (fps.slot === 3) {
+        // Place Snap-Grid Voxel Block
+        const vsz = VOXEL_SIZES[fps.voxelSizeIdx];
+        const baseHit = hit || { pt: [cam.eye[0] + cam.fx * 3.5, cam.eye[1] + cam.fy * 3.5, 0.0], kind: "floor", normal: [0, 0, 1] };
+        const center = snapVoxelPlacement(baseHit, vsz);
+        fps.voxels.push({ center, size: [vsz, vsz, vsz], color: [0.38, 0.75, 0.96, 1.0] });
+        el("fps-rail-topbar").classList.remove("hidden");
+        syncHotbarCounts();
+      } else if (fps.slot === 4) {
+        // Place Mule-style 3D Spatial Ping + Hero Screenshot!
+        const pt = hit ? hit.pt.slice() : [cam.eye[0] + cam.fx * 3.0, cam.eye[1] + cam.fy * 3.0, 0.0];
+        const heroPng = renderCleanSnapshotDataUrl(cam);
+        fps.pendingPing = { position: pt, camera_eye: cam.eye.slice(), image_b64: heroPng };
+        if (document.pointerLockElement === canvas) document.exitPointerLock();
+        el("fps-ping-coords").textContent = `📍 Ping #${fps.pings.length + 1} (${pt[0].toFixed(1)}, ${pt[1].toFixed(1)}, ${pt[2].toFixed(1)})m`;
+        el("fps-ping-modal").classList.remove("hidden");
+        el("inp-fps-ping-note").value = "";
+        el("inp-fps-ping-note").focus();
+      }
+    }
+
+    function handleDemolishAction() {
+      const cam = computeCameraBasis();
+      const hit = raycastCrosshair(cam.eye, [cam.fx, cam.fy, cam.fz]);
+      if (fps.slot === 3 && hit && hit.kind === "voxel") {
+        fps.voxels.splice(hit.voxelIdx, 1);
+      } else if (fps.slot === 1 && fps.camNodes.length) {
+        fps.camNodes.pop();
+      } else if (fps.slot === 2 && fps.subjectNodes.length) {
+        fps.subjectNodes.pop();
+      } else if (fps.slot === 4 && fps.pings.length) {
+        fps.pings.pop();
+      }
+      syncHotbarCounts();
+    }
+
     canvas.addEventListener("mousedown", (e) => {
+      if (fps.enabled) {
+        if (document.pointerLockElement !== canvas) {
+          canvas.requestPointerLock?.();
+          return;
+        }
+        if (e.button === 0) {
+          handlePrimaryFpsAction();
+        } else if (e.button === 1) {
+          // Apex / Rust Middle-Click (`MMB`): Instant Tactical Landmark Ping from ANY hotbar slot!
+          e.preventDefault();
+          const cam = computeCameraBasis();
+          const hit = raycastCrosshair(cam.eye, [cam.fx, cam.fy, cam.fz]);
+          const pt = hit ? hit.pt.slice() : [cam.eye[0] + cam.fx * 3.5, cam.eye[1] + cam.fy * 3.5, 0.0];
+          const heroPng = renderCleanSnapshotDataUrl(cam);
+          fps.pings.push({
+            position: pt,
+            camera_eye: cam.eye.slice(),
+            note: `Tactical Ping #${fps.pings.length + 1} (${hit ? hit.kind : "air"})`,
+            image_b64: heroPng,
+          });
+          el("fps-rail-topbar").classList.remove("hidden");
+          syncHotbarCounts();
+          showToast(`📍 Tactical Ping #${fps.pings.length} @ (${pt[0].toFixed(1)}, ${pt[1].toFixed(1)}, ${pt[2].toFixed(1)})m`);
+        } else if (e.button === 2) {
+          const cam = computeCameraBasis();
+          const hit = raycastCrosshair(cam.eye, [cam.fx, cam.fy, cam.fz]);
+          fps.adsTarget = hit
+            ? hit.pt.slice()
+            : [cam.eye[0] + cam.fx * 4.0, cam.eye[1] + cam.fy * 4.0, cam.eye[2] + cam.fz * 4.0];
+        }
+        return;
+      }
       dragging = true;
       panMode = e.button === 2 || e.shiftKey;
       lastX = e.clientX;
       lastY = e.clientY;
     });
     canvas.addEventListener("contextmenu", (e) => e.preventDefault());
-    window.addEventListener("mouseup", () => { dragging = false; });
+    window.addEventListener("mouseup", (e) => {
+      dragging = false;
+      if (fps.enabled && e.button === 2) {
+        fps.adsTarget = null;
+      }
+    });
     window.addEventListener("mousemove", (e) => {
-      if (!dragging || !running) return;
+      if (!running) return;
+      if (fps.enabled && document.pointerLockElement === canvas) {
+        if (!fps.adsTarget) {
+          const altHeld = fps.keys.has("AltLeft") || fps.keys.has("AltRight") || fps.gimbalLocked;
+          const sens = fps.binoZoom ? 0.0008 : 0.0024;
+          if (altHeld) {
+            // Rust `Hold Alt` Free-Look: turn head over shoulder up to ±175° without curving movement!
+            fps.headYaw = Math.max(-3.05, Math.min(3.05, fps.headYaw + e.movementX * sens));
+            fps.headPitch = Math.max(-1.42, Math.min(1.42, fps.headPitch - e.movementY * sens));
+          } else {
+            fps.yaw += e.movementX * sens;
+            fps.pitch = Math.max(-1.48, Math.min(1.48, fps.pitch - e.movementY * sens));
+          }
+          dirtySort = true;
+        }
+        return;
+      }
+      if (!dragging || fps.enabled) return;
       const dx = e.clientX - lastX;
       const dy = e.clientY - lastY;
       lastX = e.clientX;
@@ -2022,14 +2874,160 @@
       }
       dirtySort = true;
     });
+
     canvas.addEventListener("wheel", (e) => {
       e.preventDefault();
+      if (fps.enabled) {
+        const curIdx = PRIME_LENSES.reduce(
+          (best, v, idx) => (Math.abs(v - fps.lensMm) < Math.abs(PRIME_LENSES[best] - fps.lensMm) ? idx : best),
+          3
+        );
+        const nextIdx = Math.max(0, Math.min(PRIME_LENSES.length - 1, curIdx + (e.deltaY < 0 ? 1 : -1)));
+        fps.lensMm = PRIME_LENSES[nextIdx];
+        return;
+      }
       dist = Math.max(0.25, Math.min(200.0, dist * Math.exp(e.deltaY * 0.0012)));
       dirtySort = true;
     }, { passive: false });
 
-    function frameLoop() {
+    window.addEventListener("keydown", (e) => {
       if (!running) return;
+      const tag = (document.activeElement && document.activeElement.tagName) || "";
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+
+      if (e.code === "KeyF" && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        setFpsMode(!fps.enabled, !fps.enabled);
+        return;
+      }
+      if (!fps.enabled) return;
+
+      // Prevent Windows browser menu bar from stealing PointerLock when holding/releasing Left Alt!
+      if (e.code === "AltLeft" || e.code === "AltRight" || e.code === "Space") {
+        e.preventDefault();
+      }
+      if (e.repeat && ["KeyT", "KeyG", "KeyZ", "KeyP", "KeyK", "CapsLock"].includes(e.code)) return;
+
+      fps.keys.add(e.code);
+      if (["Digit1", "Digit2", "Digit3", "Digit4"].includes(e.code)) {
+        fps.slot = Number(e.code.slice(-1));
+        syncHotbarCounts();
+      } else if (e.code === "KeyT") {
+        // Rust `T` Auto-Run: hands-free constant-velocity dolly cruise!
+        fps.autoRun = !fps.autoRun;
+        showToast(fps.autoRun ? "🏃 Auto-Run ON (Hold Alt to free-look over shoulder!)" : "Auto-Run OFF");
+      } else if (e.code === "CapsLock") {
+        e.preventDefault();
+        fps.gimbalLocked = !fps.gimbalLocked;
+        showToast(fps.gimbalLocked ? "🔒 Head-Look Gimbal Locked (keeps off-axis angle)" : "Head-Look springs forward on Alt release");
+      } else if (e.code === "KeyZ") {
+        fps.prone = !fps.prone;
+        showToast(fps.prone ? "🐍 Prone 0.32m Worms-Eye Stance" : "Standing 1.65m Stance");
+      } else if (e.code === "KeyB") {
+        fps.binoZoom = true;
+      } else if (e.code === "KeyV") {
+        // Rust `V` Push-to-Callout: drop Spatial Ping + open note prompt at crosshair!
+        const prevSlot = fps.slot;
+        fps.slot = 4;
+        handlePrimaryFpsAction();
+        fps.slot = prevSlot;
+      } else if (e.code === "KeyG") {
+        fps.grounded = !fps.grounded;
+        showToast(fps.grounded ? "🚶 Grounded 1.65m Walk (C crouch · Z prone)" : "🛸 Drone Free-Fly (Space up · C down)");
+      } else if (e.code === "KeyP") {
+        toggleRideRail();
+      } else if (e.code === "KeyK") {
+        fps.trackSubject = !fps.trackSubject;
+        syncHotbarCounts();
+        showToast(fps.trackSubject ? "🎯 Camera Rail tracking Subject ON" : "Camera Rail tracking Subject OFF");
+      } else if (["F1", "F2", "F3", "F4"].includes(e.code)) {
+        e.preventDefault();
+        if (e.shiftKey) {
+          fps.bookmarks[e.code] = { eye: fps.eye.slice(), yaw: fps.yaw, pitch: fps.pitch, lensMm: fps.lensMm };
+          showToast(`Saved POV Bookmark ${e.code}`);
+        } else if (fps.bookmarks[e.code]) {
+          const bm = fps.bookmarks[e.code];
+          fps.eye = bm.eye.slice(); fps.yaw = bm.yaw; fps.pitch = bm.pitch; fps.lensMm = bm.lensMm;
+          dirtySort = true;
+          showToast(`Teleported to ${e.code}`);
+        }
+      } else if (e.code === "KeyX" || e.code === "Backspace") {
+        handleDemolishAction();
+      } else if (e.code === "BracketLeft") {
+        fps.voxelSizeIdx = Math.max(0, fps.voxelSizeIdx - 1);
+        showToast(`Voxel snap size: ${VOXEL_SIZES[fps.voxelSizeIdx]}m`);
+      } else if (e.code === "BracketRight") {
+        fps.voxelSizeIdx = Math.min(VOXEL_SIZES.length - 1, fps.voxelSizeIdx + 1);
+        showToast(`Voxel snap size: ${VOXEL_SIZES[fps.voxelSizeIdx]}m`);
+      } else if (e.code === "Digit0") {
+        fps.rollDeg = 0.0;
+        fps.headYaw = 0.0;
+        fps.headPitch = 0.0;
+      }
+    });
+    window.addEventListener("keyup", (e) => {
+      if (fps.enabled && (e.code === "AltLeft" || e.code === "AltRight")) e.preventDefault();
+      if (e.code === "KeyB") fps.binoZoom = false;
+      fps.keys.delete(e.code);
+    });
+
+    function toggleRideRail() {
+      if (!fps.camNodes.length) {
+        showToast("Place at least 2 Cam Nodes (`[1] + LMB`) to ride the rail!", true);
+        return;
+      }
+      fps.riding = !fps.riding;
+      fps.rideStartT = performance.now();
+      if (el("btn-rail-ride")) {
+        el("btn-rail-ride").textContent = fps.riding ? "⏹ Stop Ride" : "▶ Ride (P)";
+      }
+    }
+
+    function renderSinglePass(cam, w, h, drawOverlays = true) {
+      if (dirtySort || drawOverlays === false) sortBackToFront(cam);
+      gl.viewport(0, 0, w, h);
+      gl.clearColor(0.035, 0.048, 0.078, 1.0);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+      gl.disable(gl.DEPTH_TEST);
+      gl.enable(gl.BLEND);
+      gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+      const focalPx = ((cam.lensMm || 35) / 36.0) * Math.max(w, h);
+      if (count > 0) {
+        gl.useProgram(prog);
+        gl.bindVertexArray(vao);
+        gl.uniformMatrix3fv(uW, false, cam.W);
+        gl.uniform3f(uCamPos, cam.eye[0], cam.eye[1], cam.eye[2]);
+        gl.uniform2f(uFocal, focalPx, focalPx);
+        gl.uniform2f(uViewport, w, h);
+        const nDraw = sortBackToFront._validCount || count;
+        if (nDraw > 0) gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, nDraw);
+      }
+
+      if (drawOverlays) {
+        draw3DOverlays(cam, w, h);
+      } else if (fps.voxels.length > 0) {
+        const savedNodes = fps.camNodes, savedSub = fps.subjectNodes, savedPings = fps.pings, savedEn = fps.enabled;
+        fps.camNodes = []; fps.subjectNodes = []; fps.pings = []; fps.enabled = false;
+        draw3DOverlays(cam, w, h);
+        fps.camNodes = savedNodes; fps.subjectNodes = savedSub; fps.pings = savedPings; fps.enabled = savedEn;
+      }
+    }
+
+    function renderCleanSnapshotDataUrl(camOverride) {
+      const w = Math.max(64, canvas.width);
+      const h = Math.max(64, canvas.height);
+      renderSinglePass(camOverride, w, h, false);
+      dirtySort = true;
+      return canvas.toDataURL("image/png");
+    }
+
+    function frameLoop(now = performance.now()) {
+      if (!running) return;
+      const dt = Math.min(0.08, Math.max(0.001, (now - lastFrameT) / 1000.0));
+      lastFrameT = now;
+      stepFpsMovement(dt);
+
       const dpr = Math.min(window.devicePixelRatio || 1, 2);
       const w = Math.max(64, Math.floor(canvas.clientWidth * dpr));
       const h = Math.max(64, Math.floor(canvas.clientHeight * dpr));
@@ -2038,25 +3036,31 @@
         canvas.height = h;
       }
       const cam = computeCameraBasis();
-      if (dirtySort) sortBackToFront(cam);
+      if (fps.enabled && !fps.riding) {
+        fps.lastHit = raycastCrosshair(cam.eye, [cam.fx, cam.fy, cam.fz]);
+        const ch = el("fps-crosshair");
+        const tag = el("fps-reticle-tag");
+        if (ch && tag) {
+          ch.classList.toggle("hit", !!fps.lastHit && !fps.adsTarget);
+          ch.classList.toggle("locked", !!fps.adsTarget);
+          const altHeld = fps.keys.has("AltLeft") || fps.keys.has("AltRight") || fps.gimbalLocked;
+          const crouch = fps.keys.has("KeyC");
+          let stanceLbl = "🛸 FLY";
+          if (fps.grounded) {
+            stanceLbl = crouch ? "🧎 CROUCH 0.95m" : fps.prone ? "🐍 PRONE 0.32m" : "🚶 WALK 1.65m";
+          }
+          const runLbl = fps.autoRun ? " · 🏃 AUTORUN" : "";
+          const altLbl = altHeld ? ` · 👀 ALT ${(fps.headYaw * 57.3).toFixed(0)}°` : "";
+          const lockLbl = fps.adsTarget ? " · 🎯 LOCK" : "";
+          const binoLbl = fps.binoZoom ? " · 🔭 BINO" : "";
+          const distLbl = fps.lastHit ? ` · ${fps.lastHit.dist.toFixed(1)}m` : "";
+          const recLbl = fps.recordingFlight ? " · 🔴 REC" : "";
+          tag.textContent = `${Math.round(cam.lensMm || fps.lensMm)}mm · ${stanceLbl}${runLbl}${altLbl}${lockLbl}${binoLbl}${distLbl}${recLbl}`;
+        }
+        drawRadarMinimap(cam);
+      }
 
-      gl.viewport(0, 0, w, h);
-      gl.clearColor(0.035, 0.048, 0.078, 1.0);
-      gl.clear(gl.COLOR_BUFFER_BIT);
-      gl.disable(gl.DEPTH_TEST);
-      gl.enable(gl.BLEND);
-      gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
-
-      gl.useProgram(prog);
-      gl.bindVertexArray(vao);
-      gl.uniformMatrix3fv(uW, false, cam.W);
-      gl.uniform3f(uCamPos, cam.eye[0], cam.eye[1], cam.eye[2]);
-      const fy = h * 0.92;
-      gl.uniform2f(uFocal, fy, fy);
-      gl.uniform2f(uViewport, w, h);
-
-      const nDraw = sortBackToFront._validCount || count;
-      if (nDraw > 0) gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, nDraw);
+      renderSinglePass(cam, w, h, true);
       requestAnimationFrame(frameLoop);
     }
 
@@ -2161,17 +3165,191 @@
       gl.bufferSubData(gl.ARRAY_BUFFER, 0, sortedIdx);
 
       resetCamera();
-      hudInfoEl.textContent = `${cap.toLocaleString()} Gaussians · Drag orbit · Right-drag pan · Scroll zoom`;
+      updateHudText();
       if (!running) {
         running = true;
+        lastFrameT = performance.now();
         requestAnimationFrame(frameLoop);
       }
     }
 
+    function startBlankSandbox() {
+      if (!running) {
+        running = true;
+        lastFrameT = performance.now();
+        requestAnimationFrame(frameLoop);
+      }
+      setFpsMode(true, false);
+    }
+
+    function buildExportPayload(extra = {}) {
+      const nodes = fps.camNodes.length
+        ? fps.camNodes
+        : [(() => { const c = computeCameraBasis(); return { position: c.eye, forward: [c.fx, c.fy, c.fz], lens_mm: fps.lensMm, roll_deg: fps.rollDeg }; })()];
+      const firstCam = evalRailCameraAt(0.0);
+      const lastCam = evalRailCameraAt(1.0);
+      const firstB64 = renderCleanSnapshotDataUrl(firstCam);
+      const lastB64 = nodes.length > 1 ? renderCleanSnapshotDataUrl(lastCam) : null;
+
+      return Object.assign({
+        splat_job_id: state.activeSplatJob ? state.activeSplatJob.job_id : null,
+        cam_nodes: nodes,
+        subject_nodes: fps.subjectNodes,
+        track_subject: fps.trackSubject,
+        voxels: fps.voxels,
+        pings: fps.pings,
+        grounded_walk: fps.grounded,
+        duration_sec: Math.max(2, Number(el("inp-rail-dur")?.value || 5)),
+        fps: 24,
+        width: 1280,
+        height: 720,
+        first_frame_b64: firstB64,
+        last_frame_b64: lastB64,
+      }, extra);
+    }
+
+    // Bind FPS / Hotbar / Ping / Export UI buttons once
+    el("btn-splat-fps-toggle")?.addEventListener("click", () => setFpsMode(!fps.enabled, !fps.enabled));
+    el("fps-hotbar")?.addEventListener("click", (e) => {
+      const b = e.target.closest(".hotbar-slot");
+      if (b && b.dataset.slot) {
+        fps.slot = Number(b.dataset.slot);
+        syncHotbarCounts();
+      }
+    });
+    el("btn-rail-ride")?.addEventListener("click", toggleRideRail);
+    el("btn-rail-track-sub")?.addEventListener("click", () => {
+      fps.trackSubject = !fps.trackSubject;
+      syncHotbarCounts();
+    });
+    el("btn-rail-clear")?.addEventListener("click", () => {
+      fps.camNodes = [];
+      fps.subjectNodes = [];
+      fps.voxels = [];
+      fps.pings = [];
+      fps.riding = false;
+      syncHotbarCounts();
+    });
+
+    function commitPendingPing() {
+      if (!fps.pendingPing) return;
+      const note = el("inp-fps-ping-note").value.trim() || `Landmark #${fps.pings.length + 1}`;
+      fps.pings.push(Object.assign({}, fps.pendingPing, { note }));
+      fps.pendingPing = null;
+      el("fps-ping-modal").classList.add("hidden");
+      el("fps-rail-topbar").classList.remove("hidden");
+      syncHotbarCounts();
+      showToast(`Saved Spatial Ping #${fps.pings.length}: "${note}"`);
+    }
+    el("btn-fps-ping-save")?.addEventListener("click", commitPendingPing);
+    el("btn-fps-ping-cancel")?.addEventListener("click", () => {
+      fps.pendingPing = null;
+      el("fps-ping-modal").classList.add("hidden");
+    });
+    el("inp-fps-ping-note")?.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); commitPendingPing(); }
+      if (e.key === "Escape") { fps.pendingPing = null; el("fps-ping-modal").classList.add("hidden"); }
+    });
+
+    // 1. Export Rail -> Seedance 2.5 Composer + Lock Splat Prior!
+    el("btn-rail-to-seedance")?.addEventListener("click", async () => {
+      try {
+        const res = await apiFetch("/api/shots/export", { method: "POST", json: buildExportPayload() });
+        await refreshMedia(false);
+        await refreshShotsList();
+        const fItem = state.mediaItems.find((m) => m.path === res.first_frame_rel) ||
+          (res.first_frame_rel ? { path: res.first_frame_rel, name: "first_frame.png", kind: "image", url: res.first_frame_url } : null);
+        const lItem = state.mediaItems.find((m) => m.path === res.last_frame_rel) ||
+          (res.last_frame_rel ? { path: res.last_frame_rel, name: "last_frame.png", kind: "image", url: res.last_frame_url } : null);
+        state.firstFrame = fItem;
+        state.lastFrame = lItem;
+        el("sel-duration").value = String(Math.round(res.brief.duration_sec));
+        const curP = el("input-prompt").value.trim();
+        el("input-prompt").value = curP ? `${curP} ${res.brief.optical_prompt}` : res.brief.optical_prompt;
+        if (el("sel-splat-known-cams")) {
+          el("sel-splat-known-cams").value = `shot:${res.shot_id}`;
+        }
+        renderConditioningSlots();
+        renderMediaGrid();
+        updatePricingAndInspector();
+        switchStudioTab("seedance");
+        showToast(`Loaded Rail '${res.shot_id}' (First/Last PNGs + Optical/Subject Prompt + Camera Prior) into Seedance 2.5!`);
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+
+    // 2. Farm Modal H100 Rail Render (~2s)
+    el("btn-rail-farm-modal")?.addEventListener("click", async () => {
+      if (!state.activeSplatJob) {
+        showToast("Load a 3D Splat first to farm a Modal 3DGS render (or use 🎬 → Seedance / 🧊 → Blender on blank voxel stages!).", true);
+        return;
+      }
+      const btn = el("btn-rail-farm-modal");
+      btn.disabled = true;
+      btn.textContent = "☁️ Rendering…";
+      try {
+        const res = await apiFetch("/api/shots/export", {
+          method: "POST",
+          json: buildExportPayload({ action: "render_modal", gpu: el("sel-splat-gpu")?.value || "H100" }),
+        });
+        await refreshShotsList();
+        await refreshMedia(false);
+        if (res.modal_render_url) {
+          openInTheater({
+            path: res.modal_render_rel,
+            name: `${res.shot_id}.mp4`,
+            kind: "video",
+            size_bytes: 0,
+            cost_usd: res.cost_usd,
+            url: res.modal_render_url,
+          });
+        }
+        showToast(`Modal H100 rendered rail '${res.shot_id}' @ ${res.render_fps} fps in ${res.wall_s}s!`);
+      } catch (err) {
+        showToast(err.message, true);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "☁️ Modal Render";
+      }
+    });
+
+    // 3. Sync `shot.usda` / `DirectorRailCam` + Voxel `blockout.glb` + Spatial `brief.md` to Blender 5.3 & Agent!
+    el("btn-rail-sync-bl")?.addEventListener("click", async () => {
+      try {
+        const sendAgent = fps.pings.length > 0;
+        const res = await apiFetch("/api/shots/export", {
+          method: "POST",
+          json: buildExportPayload({
+            action: "sync_blender",
+            send_brief_to_agent: sendAgent,
+            task: fps.pings.map((p, i) => `[P${i + 1}] ${p.note}`).join("; "),
+          }),
+        });
+        await refreshShotsList();
+        const inp = el("agent-input");
+        if (!sendAgent && inp && !inp.value.includes(res.brief_rel)) {
+          inp.value = `@${res.brief_rel} `;
+        }
+        showToast(
+          `Synced DirectorRailCam + ${res.brief.voxels_count} voxels + ${res.brief_rel} to Blender 5.3!`
+        );
+      } catch (err) {
+        showToast(err.message, true);
+      }
+    });
+
     return {
       load: loadSplatUrl,
+      startBlankSandbox,
       resetCamera,
-      pause: () => { running = false; },
+      pause: () => {
+        running = false;
+        if (document.pointerLockElement === canvas) document.exitPointerLock();
+        el("fps-crosshair-wrap")?.classList.add("hidden");
+        el("fps-radar-canvas")?.classList.add("hidden");
+        el("fps-rail-topbar")?.classList.add("hidden");
+      },
     };
   }
 
@@ -2188,6 +3366,9 @@
     el("theater-image").classList.add("hidden");
     el("theater-audio").classList.add("hidden");
 
+    if (window._bbStopComparator) window._bbStopComparator();
+    el("theater-compare-wrap").classList.add("hidden");
+
     const sc = el("theater-splat-canvas");
     const hud = el("theater-splat-hud");
     sc.classList.remove("hidden");
@@ -2198,6 +3379,7 @@
       `3DGS SPLAT · ${Number(job.n_gaussians || 0).toLocaleString()} pts` +
       (job.psnr ? ` · PSNR ${Number(job.psnr).toFixed(2)} dB` : "") +
       (job.cost_usd ? ` · $${Number(job.cost_usd).toFixed(4)}` : "");
+    el("btn-stage-compare").classList.toggle("hidden", !job.cameras_rel);
     el("btn-stage-to-splat").classList.add("hidden");
     el("btn-stage-import-bl").classList.toggle("hidden", !job.ply_rel);
     el("btn-stage-use-vid").classList.add("hidden");
@@ -2225,6 +3407,976 @@
     }
   }
 
+  if (el("btn-stage-compare")) {
+    el("btn-stage-compare").addEventListener("click", () => {
+      if (state.activeSplatJob) openComparatorForJob(state.activeSplatJob);
+    });
+  }
+
+  // =========================================================================
+  // PHASE 5A: `tt-splat` TELEMETRY PLOTS, STAGE BAR, SCRUBBER & SURGERIES
+  // =========================================================================
+
+  const wbState = {
+    jobId: null,
+    paused: false,
+    ticks: [],
+    densify: [],
+    surgeries: [],
+    snapshots: [],
+    cameras: [],
+    hoverIdx: -1,
+  };
+
+  const STAGE_COLORS = [
+    { key: "fwd_raster_ms", label: "raster fwd", color: "#38bdf8" },
+    { key: "loss_ssim_ms", label: "loss+SSIM", color: "#94a3b8" },
+    { key: "bwd_ms", label: "raster bwd", color: "#fb923c" },
+    { key: "adam_ms", label: "Adam", color: "#22d3ee" },
+    { key: "densify_ms", label: "densify", color: "#4ade80" },
+    { key: "host_ms", label: "host", color: "#64748b" },
+  ];
+
+  state.exportedShots = [];
+
+  async function refreshShotsList() {
+    try {
+      const res = await apiFetch("/api/shots/list");
+      if (Array.isArray(res.shots)) {
+        state.exportedShots = res.shots;
+        populateKnownCamsDropdown();
+      }
+    } catch (_e) {}
+  }
+
+  function populateKnownCamsDropdown() {
+    const sel = el("sel-splat-known-cams");
+    if (!sel) return;
+    const prev = sel.value;
+    sel.innerHTML =
+      `<option value="">— Auto Solve Poses (VGGT / COLMAP) —</option>` +
+      `<option value="__blender_active__">🎥 Active Blender 5.3 Camera (Zero-Drift Lock / Prior)</option>`;
+    (state.exportedShots || []).forEach((sh) => {
+      const o = document.createElement("option");
+      o.value = `shot:${sh.shot_id}`;
+      o.textContent = `🎮 FPS Rail: ${sh.shot_id} (${sh.cam_nodes_count || 0} nodes, ${sh.duration_sec}s)`;
+      sel.appendChild(o);
+    });
+    Array.from(state.splatJobs.values()).forEach((j) => {
+      if (j.cameras_rel) {
+        const o = document.createElement("option");
+        o.value = j.job_id;
+        o.textContent = `📁 ${j.job_id} cameras.json`;
+        sel.appendChild(o);
+      }
+    });
+    if (prev) sel.value = prev;
+  }
+
+  function renderStageBreakdownBar(timings) {
+    const wrap = el("splat-stage-wrap");
+    const bar = el("splat-stage-bar");
+    const leg = el("splat-stage-legend");
+    if (!timings || !timings.fwd_raster_ms) {
+      wrap.classList.add("hidden");
+      return;
+    }
+    wrap.classList.remove("hidden");
+    const total = Math.max(0.001, STAGE_COLORS.reduce((s, it) => s + Number(timings[it.key] || 0), 0));
+    bar.innerHTML = STAGE_COLORS.map((it) => {
+      const v = Number(timings[it.key] || 0);
+      const pct = Math.max(0, (v / total) * 100);
+      return `<div class="splat-stage-seg" style="width:${pct.toFixed(1)}%;background:${it.color}" title="${it.label}: ${v.toFixed(2)} ms (${pct.toFixed(0)}%)"></div>`;
+    }).join("");
+    leg.innerHTML = STAGE_COLORS.map((it) => {
+      const v = Number(timings[it.key] || 0);
+      return `<span><i style="color:${it.color}">●</i> ${it.label} <b>${v.toFixed(2)}ms</b></span>`;
+    }).join("") + `<span>total <b>${Number(timings.step_ms || total).toFixed(2)}ms</b></span>`;
+  }
+
+  function drawTelemetryCharts() {
+    const wrap = el("splat-charts-wrap");
+    const cMain = el("canvas-splat-loss-psnr");
+    const cCnt = el("canvas-splat-count");
+    const ticks = wbState.ticks;
+    if (!ticks.length || !cMain || !cCnt) {
+      wrap.classList.add("hidden");
+      return;
+    }
+    wrap.classList.remove("hidden");
+
+    const ctx1 = cMain.getContext("2d");
+    const W = cMain.width, H = cMain.height;
+    ctx1.clearRect(0, 0, W, H);
+
+    const padL = 38, padR = 38, padT = 10, padB = 18;
+    const pw = W - padL - padR, ph = H - padT - padB;
+    const minStep = ticks[0].step;
+    const maxStep = Math.max(minStep + 1, ticks[ticks.length - 1].step);
+    const xOf = (st) => padL + ((st - minStep) / (maxStep - minStep)) * pw;
+
+    const losses = ticks.map((t) => Number(t.loss || 0));
+    const psnrs = ticks.map((t) => Number(t.psnr || 0));
+    const maxLoss = Math.max(0.01, ...losses);
+    const minPsnr = Math.min(...psnrs, 12);
+    const maxPsnr = Math.max(minPsnr + 2, ...psnrs);
+
+    // Grid lines
+    ctx1.strokeStyle = "#182234";
+    ctx1.lineWidth = 1;
+    for (let g = 0; g <= 3; g++) {
+      const gy = padT + (g / 3) * ph;
+      ctx1.beginPath(); ctx1.moveTo(padL, gy); ctx1.lineTo(W - padR, gy); ctx1.stroke();
+    }
+
+    // Vertical densify & surgery markers
+    ctx1.save();
+    ctx1.setLineDash([3, 3]);
+    wbState.densify.forEach((d) => {
+      if (d.step >= minStep && d.step <= maxStep) {
+        const dx = xOf(d.step);
+        ctx1.strokeStyle = "rgba(74, 222, 128, 0.28)";
+        ctx1.beginPath(); ctx1.moveTo(dx, padT); ctx1.lineTo(dx, H - padB); ctx1.stroke();
+      }
+    });
+    wbState.surgeries.forEach((s) => {
+      if (s.step >= minStep && s.step <= maxStep) {
+        const sx = xOf(s.step);
+        ctx1.strokeStyle = "rgba(250, 204, 21, 0.75)";
+        ctx1.beginPath(); ctx1.moveTo(sx, padT); ctx1.lineTo(sx, H - padB); ctx1.stroke();
+      }
+    });
+    ctx1.restore();
+
+    const plotLine = (ctx, vals, vmin, vmax, color, lw = 1.6) => {
+      ctx.strokeStyle = color;
+      ctx.lineWidth = lw;
+      ctx.beginPath();
+      vals.forEach((v, i) => {
+        const x = xOf(ticks[i].step);
+        const y = padT + (1.0 - (v - vmin) / Math.max(1e-6, vmax - vmin)) * ph;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+    };
+
+    plotLine(ctx1, ticks.map((t) => Number(t.l1 || 0)), 0, maxLoss, "#38bdf8", 1.2);
+    plotLine(ctx1, losses, 0, maxLoss, "#fb923c", 1.7);
+    plotLine(ctx1, psnrs, minPsnr, maxPsnr, "#4ade80", 1.8);
+
+    // Axis labels
+    ctx1.fillStyle = "#fb923c";
+    ctx1.font = "10px monospace";
+    ctx1.fillText(maxLoss.toFixed(3), 2, padT + 8);
+    ctx1.fillText("0.00", 6, H - padB);
+    ctx1.fillStyle = "#4ade80";
+    ctx1.fillText(`${maxPsnr.toFixed(1)}dB`, W - padR + 3, padT + 8);
+    ctx1.fillText(`${minPsnr.toFixed(0)}dB`, W - padR + 3, H - padB);
+    ctx1.fillStyle = "#8b98ad";
+    ctx1.fillText(`step ${minStep}`, padL, H - 4);
+    ctx1.fillText(`step ${maxStep}`, W - padR - 54, H - 4);
+
+    if (wbState.hoverIdx >= 0 && wbState.hoverIdx < ticks.length) {
+      const ht = ticks[wbState.hoverIdx];
+      const hx = xOf(ht.step);
+      ctx1.strokeStyle = "#e2e8f0";
+      ctx1.lineWidth = 1;
+      ctx1.beginPath(); ctx1.moveTo(hx, padT); ctx1.lineTo(hx, H - padB); ctx1.stroke();
+      el("lbl-chart-hover").textContent =
+        `step ${ht.step} · loss ${Number(ht.loss).toFixed(4)} · L1 ${Number(ht.l1 || 0).toFixed(4)} · SSIM ${Number(ht.ssim || 0).toFixed(3)} · PSNR ${Number(ht.psnr).toFixed(2)}dB · ${Number(ht.n_gaussians).toLocaleString()} pts`;
+    }
+
+    // Gaussian count chart
+    const ctx2 = cCnt.getContext("2d");
+    const W2 = cCnt.width, H2 = cCnt.height;
+    ctx2.clearRect(0, 0, W2, H2);
+    const ph2 = H2 - 16;
+    const cnts = ticks.map((t) => Number(t.n_gaussians || 0));
+    const minC = Math.min(...cnts) * 0.92;
+    const maxC = Math.max(minC + 100, ...cnts) * 1.03;
+
+    ctx2.strokeStyle = "#a78bfa";
+    ctx2.lineWidth = 1.6;
+    ctx2.beginPath();
+    cnts.forEach((v, i) => {
+      const x = padL + ((ticks[i].step - minStep) / (maxStep - minStep)) * (W2 - padL - padR);
+      const y = 6 + (1.0 - (v - minC) / Math.max(1, maxC - minC)) * ph2;
+      if (i === 0) ctx2.moveTo(x, y);
+      else ctx2.lineTo(x, y);
+    });
+    ctx2.stroke();
+    ctx2.fillStyle = "#a78bfa";
+    ctx2.font = "10px monospace";
+    ctx2.fillText(`${Math.round(maxC / 1000)}k pts`, 2, 13);
+    ctx2.fillText(`${Math.round(minC / 1000)}k`, 2, H2 - 4);
+  }
+
+  el("canvas-splat-loss-psnr").addEventListener("mousemove", (e) => {
+    if (!wbState.ticks.length) return;
+    const rect = e.target.getBoundingClientRect();
+    const frac = Math.max(0, Math.min(1, (e.clientX - rect.left - 30) / Math.max(40, rect.width - 60)));
+    wbState.hoverIdx = Math.min(wbState.ticks.length - 1, Math.round(frac * (wbState.ticks.length - 1)));
+    drawTelemetryCharts();
+  });
+
+  async function selectWorkbenchJob(jobId, resetLive = false) {
+    wbState.jobId = jobId;
+    populateKnownCamsDropdown();
+    el("splat-live-card").classList.remove("hidden");
+    if (resetLive) {
+      wbState.ticks = [];
+      wbState.densify = [];
+      wbState.surgeries = [];
+      wbState.snapshots = [];
+      drawTelemetryCharts();
+      return;
+    }
+    try {
+      const data = await apiFetch(`/api/splats/telemetry/${encodeURIComponent(jobId)}`);
+      wbState.ticks = data.ticks || [];
+      wbState.densify = data.densify_events || [];
+      wbState.surgeries = data.surgery_events || [];
+      wbState.snapshots = data.snapshots || [];
+      wbState.cameras = data.cameras || [];
+
+      const fSel = el("sel-wb-focus-cam");
+      fSel.innerHTML = `<option value="">🎯 Focus: All Views (${wbState.cameras.length})</option>`;
+      wbState.cameras.forEach((cn) => {
+        const o = document.createElement("option");
+        o.value = cn;
+        o.textContent = `🎯 ${cn}`;
+        fSel.appendChild(o);
+      });
+
+      const lastTick = wbState.ticks[wbState.ticks.length - 1];
+      if (lastTick) {
+        el("splat-live-title").textContent = `${jobId} · Telemetry (${lastTick.step} steps)`;
+        el("splat-live-metrics").textContent =
+          `PSNR ${Number(lastTick.psnr || 0).toFixed(2)} dB · SSIM ${Number(lastTick.ssim || 0).toFixed(3)} · ${Number(lastTick.n_gaussians || 0).toLocaleString()} pts`;
+        el("splat-prog-fill").style.width = "100%";
+        renderStageBreakdownBar(lastTick.stage_timings);
+      }
+      drawTelemetryCharts();
+
+      const snapRow = el("splat-snap-row");
+      if (wbState.snapshots.length > 0) {
+        snapRow.classList.remove("hidden");
+        const rng = el("rng-splat-snap");
+        rng.max = String(wbState.snapshots.length - 1);
+        rng.value = String(wbState.snapshots.length - 1);
+        const sLast = wbState.snapshots[wbState.snapshots.length - 1];
+        el("lbl-splat-snap").textContent = `step ${sLast.step}`;
+        el("splat-live-preview-wrap").classList.remove("hidden");
+        el("splat-live-img").src = withTokenUrl(sLast.url);
+      } else {
+        snapRow.classList.add("hidden");
+      }
+    } catch (err) {
+      showToast(`Telemetry load failed: ${err.message}`, true);
+    }
+  }
+  window._bbSelectWorkbenchJob = selectWorkbenchJob;
+
+  window._bbPushSplatTelemetry = (ev) => {
+    if (!wbState.jobId) wbState.jobId = ev.job_id;
+    if (ev.job_id !== wbState.jobId) return;
+    if (ev.event === "telemetry") {
+      wbState.ticks.push(ev);
+      if (ev.stage_timings) renderStageBreakdownBar(ev.stage_timings);
+      drawTelemetryCharts();
+    } else if (ev.event === "densify") {
+      wbState.densify.push(ev);
+    } else if (ev.event === "surgery") {
+      wbState.surgeries.push(ev);
+      showToast(`Surgery @ step ${ev.step}: removed ${ev.removed || 0} Gaussians`);
+    } else if (ev.event === "checkpoint_saved") {
+      showToast(`Saved cloud checkpoint @ step ${ev.step}`);
+    }
+  };
+
+  el("rng-splat-snap").addEventListener("input", (e) => {
+    const idx = Number(e.target.value || 0);
+    const snap = wbState.snapshots[idx];
+    if (!snap) return;
+    el("lbl-splat-snap").textContent = `step ${snap.step}`;
+    el("splat-live-preview-wrap").classList.remove("hidden");
+    el("splat-live-img").classList.remove("hidden");
+    el("splat-live-diff").classList.add("hidden");
+    el("splat-live-img").src = withTokenUrl(snap.url);
+  });
+
+  // Live Mid-Train Controls & Surgical Workbench Actions
+  function activeWorkbenchJobId() {
+    if (wbState.jobId) return wbState.jobId;
+    if (state.activeSplatJob) return state.activeSplatJob.job_id;
+    const first = Array.from(state.splatJobs.keys())[0];
+    return first || null;
+  }
+
+  el("btn-wb-pause").addEventListener("click", async () => {
+    const jid = activeWorkbenchJobId();
+    if (!jid) return;
+    wbState.paused = !wbState.paused;
+    el("btn-wb-pause").textContent = wbState.paused ? "▶ Resume" : "⏸ Pause";
+    try {
+      await apiFetch(`/api/splats/control/${encodeURIComponent(jid)}`, {
+        method: "POST",
+        json: { paused: wbState.paused },
+      });
+      showToast(wbState.paused ? `Paused ${jid}` : `Resumed ${jid}`);
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+
+  el("btn-wb-saveckpt").addEventListener("click", async () => {
+    const jid = activeWorkbenchJobId();
+    if (!jid) return;
+    try {
+      await apiFetch(`/api/splats/control/${encodeURIComponent(jid)}`, {
+        method: "POST",
+        json: { save_checkpoint: true },
+      });
+      showToast(`Requested immediate cloud checkpoint for ${jid}`);
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+
+  el("btn-wb-stop").addEventListener("click", async () => {
+    const jid = activeWorkbenchJobId();
+    if (!jid) return;
+    try {
+      await apiFetch(`/api/splats/cancel/${encodeURIComponent(jid)}`, { method: "POST", json: {} });
+      showToast(`Sent stop & export to ${jid}`);
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+
+  el("sel-wb-focus-cam").addEventListener("change", async (e) => {
+    const jid = activeWorkbenchJobId();
+    if (!jid) return;
+    const cam = e.target.value;
+    try {
+      await apiFetch(`/api/splats/control/${encodeURIComponent(jid)}`, {
+        method: "POST",
+        json: { focus_camera: cam },
+      });
+      showToast(cam ? `Locked focus to ${cam}` : "Cleared camera focus (round-robin)");
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+
+  el("btn-wb-push-knobs").addEventListener("click", async () => {
+    const jid = activeWorkbenchJobId();
+    if (!jid) return;
+    const lam = Number(el("inp-splat-dssim").value || 0.2);
+    const opa = Number(el("inp-splat-opareg").value || 0.0005);
+    try {
+      await apiFetch(`/api/splats/control/${encodeURIComponent(jid)}`, {
+        method: "POST",
+        json: { lambda_dssim: lam, opa_reg: opa },
+      });
+      showToast(`Pushed live λ_dssim=${lam}, opa_reg=${opa} to ${jid}`);
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+
+  el("btn-surg-reset-opa").addEventListener("click", async () => {
+    const jid = activeWorkbenchJobId();
+    if (!jid) return showToast("Select a splat job first", true);
+    try {
+      const res = await apiFetch("/api/splats/resume", {
+        method: "POST",
+        json: { job_id: jid, add_steps: 1500, reset_opacities: 0.015, gpu: el("sel-splat-gpu").value },
+      });
+      if (res.job) handleSplatJobUpdate(res.job);
+      showToast(`Reset opacities on ${jid} + 1,500 healing steps`);
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+
+  el("btn-surg-clamp-scale").addEventListener("click", async () => {
+    const jid = activeWorkbenchJobId();
+    if (!jid) return showToast("Select a splat job first", true);
+    try {
+      const res = await apiFetch("/api/splats/resume", {
+        method: "POST",
+        json: { job_id: jid, add_steps: 1000, clamp_log_scale: -1.6, prune_opa: 0.03, gpu: el("sel-splat-gpu").value },
+      });
+      if (res.job) handleSplatJobUpdate(res.job);
+      showToast(`Clamped overgrown spikes on ${jid} + 1,000 polish steps`);
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+
+  el("btn-cropbox-spawn").addEventListener("click", async () => {
+    try {
+      const res = await apiFetch("/api/splats/crop_box", { method: "POST", json: { action: "spawn" } });
+      const b = res.crop_box || {};
+      showToast(`Spawned '${b.object}' in Blender 5.3 — position/scale it around floaters or hero subject!`);
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+
+  async function runCropBoxHeal(action) {
+    const jid = activeWorkbenchJobId();
+    if (!jid) return showToast("Select a splat job first", true);
+    try {
+      const res = await apiFetch("/api/splats/crop_box", {
+        method: "POST",
+        json: { action, job_id: jid, add_steps: 1500, gpu: el("sel-splat-gpu").value },
+      });
+      if (res.job) handleSplatJobUpdate(res.job);
+      showToast(`Launched ${action === "keep_heal" ? "Keep-Inside-Box" : "Cull-Inside-Box"} & Heal on ${jid}!`);
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  }
+  el("btn-cropbox-cull").addEventListener("click", () => runCropBoxHeal("cull_heal"));
+  el("btn-cropbox-keep").addEventListener("click", () => runCropBoxHeal("keep_heal"));
+
+  el("btn-build-proxy").addEventListener("click", async () => {
+    const jid = activeWorkbenchJobId();
+    if (!jid) return showToast("Select a splat job first", true);
+    showToast(`Extracting Surface-Nets proxy_collision.glb for ${jid}…`);
+    try {
+      const res = await apiFetch(`/api/splats/proxy/${encodeURIComponent(jid)}`, {
+        method: "POST",
+        json: { import_blender: true, grid_res: 48 },
+      });
+      showToast(`Built ${res.proxy_glb_rel} & imported into Blender 5.3!`);
+      refreshSplats();
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+
+  // =========================================================================
+  // PHASE 5B: SIDE-BY-SIDE CLIP COMPARATOR & 3D CAMERA PATH / ROTATION HUD
+  // =========================================================================
+
+  const cmpState = {
+    active: false,
+    job: null,
+    traj: null,
+    curFrameIdx: 0,
+    orbitYaw: -0.75,
+    orbitPitch: 0.48,
+    dragging: false,
+    lastX: 0,
+    lastY: 0,
+    rafId: 0,
+  };
+
+  function stopComparator() {
+    cmpState.active = false;
+    if (cmpState.rafId) cancelAnimationFrame(cmpState.rafId);
+    const vL = el("vid-cmp-left");
+    const vR = el("vid-cmp-right");
+    if (vL) vL.pause();
+    if (vR) vR.pause();
+  }
+  window._bbStopComparator = stopComparator;
+
+  window._bbOnSplatRenderProgress = (ev) => {
+    if (!cmpState.active || !cmpState.job || ev.job_id !== cmpState.job.job_id) return;
+    if (ev.event === "render_progress") {
+      el("btn-cmp-farm-modal").textContent = `☁️ Rendering ${ev.frame}/${ev.total_frames}…`;
+    }
+  };
+
+  function buildClipChoicesForJob(job, data) {
+    const leftOpts = [];
+    const rightOpts = [];
+    if (data.source_video_url) {
+      leftOpts.push({ label: `🎬 Original (${data.source_video_rel || "source"})`, url: data.source_video_url });
+      rightOpts.push({ label: `🎬 Original (${data.source_video_rel || "source"})`, url: data.source_video_url });
+    }
+    if (data.modal_render_url) {
+      rightOpts.unshift({ label: "☁️ Modal H100 3DGS Render", url: data.modal_render_url });
+      leftOpts.push({ label: "☁️ Modal H100 3DGS Render", url: data.modal_render_url });
+    }
+    if (data.blender_render_url) {
+      rightOpts.push({ label: "🧊 Blender 5.3 EEVEE Render", url: data.blender_render_url });
+      leftOpts.push({ label: "🧊 Blender 5.3 EEVEE Render", url: data.blender_render_url });
+    }
+    state.mediaItems.filter((m) => m.kind === "video").slice(0, 12).forEach((m) => {
+      leftOpts.push({ label: `📁 ${m.name}`, url: m.url });
+      rightOpts.push({ label: `📁 ${m.name}`, url: m.url });
+    });
+    return { leftOpts, rightOpts };
+  }
+
+  function applyCmpVideoSrc(vidEl, badgeEl, phEl, opt) {
+    if (!opt || !opt.url) {
+      vidEl.pause();
+      vidEl.removeAttribute("src");
+      if (phEl) phEl.classList.remove("hidden");
+      badgeEl.textContent = "No render yet";
+      return;
+    }
+    if (phEl) phEl.classList.add("hidden");
+    badgeEl.textContent = opt.label;
+    vidEl.src = withTokenUrl(opt.url);
+    vidEl.playbackRate = Number(el("sel-cmp-speed").value || 1);
+    vidEl.load();
+  }
+
+  async function openComparatorForJob(job) {
+    stopSplatViewer();
+    state.activeSplatJob = job;
+    cmpState.job = job;
+    cmpState.active = true;
+
+    el("stage-title").textContent = `Compare & Camera Path · ${job.job_id}`;
+    el("theater-empty").classList.add("hidden");
+    el("theater-video").classList.add("hidden");
+    el("theater-image").classList.add("hidden");
+    el("theater-audio").classList.add("hidden");
+    el("theater-compare-wrap").classList.remove("hidden");
+    el("theater-actions").classList.remove("hidden");
+    el("btn-stage-import-bl").classList.toggle("hidden", !job.ply_rel);
+
+    try {
+      const data = await apiFetch(`/api/splats/trajectory/${encodeURIComponent(job.job_id)}`);
+      cmpState.traj = data.trajectory;
+      cmpState.curFrameIdx = 0;
+
+      const { leftOpts, rightOpts } = buildClipChoicesForJob(job, data);
+      const selL = el("sel-cmp-left");
+      const selR = el("sel-cmp-right");
+      selL.innerHTML = leftOpts.length
+        ? leftOpts.map((o, i) => `<option value="${i}">${escapeHtml(o.label)}</option>`).join("")
+        : `<option value="">— No source clip —</option>`;
+      selR.innerHTML = rightOpts.length
+        ? rightOpts.map((o, i) => `<option value="${i}">${escapeHtml(o.label)}</option>`).join("")
+        : `<option value="">— Click Farm Modal Render or Render Blender —</option>`;
+
+      selL._opts = leftOpts;
+      selR._opts = rightOpts;
+
+      applyCmpVideoSrc(el("vid-cmp-left"), el("lbl-cmp-left"), null, leftOpts[0]);
+      // Prefer Modal or Blender render on right; if neither rendered yet, show placeholder prompt!
+      const hasRecreated = !!(data.modal_render_url || data.blender_render_url);
+      if (hasRecreated) {
+        applyCmpVideoSrc(el("vid-cmp-right"), el("lbl-cmp-right"), el("cmp-right-placeholder"), rightOpts[0]);
+      } else {
+        applyCmpVideoSrc(el("vid-cmp-right"), el("lbl-cmp-right"), el("cmp-right-placeholder"), null);
+      }
+
+      // Render scrubber range & gold keyframe marker ticks
+      const nF = cmpState.traj.total_frames;
+      const scrub = el("rng-cmp-scrub");
+      scrub.max = String(Math.max(0, nF - 1));
+      scrub.value = "0";
+      const ticksBox = el("cmp-keyframe-ticks");
+      ticksBox.innerHTML = (cmpState.traj.keyframe_markers || []).map((km) => {
+        const pct = nF > 1 ? ((km.frame - 1) / (nF - 1)) * 100 : 0;
+        return `<span class="cmp-kf-tick" style="left:${pct.toFixed(2)}%" title="Solved Keyframe #${km.key_index + 1} (${km.image_name} @ ${km.pts_sec}s)"></span>`;
+      }).join("");
+
+      el("theater-meta").textContent =
+        `${nF} frames @ ${cmpState.traj.fps} fps (${cmpState.traj.duration_sec}s) · ${cmpState.traj.solved_keyframes} keyframes · path ${cmpState.traj.path_length_m}m`;
+
+      drawComparatorCanvases();
+      startComparatorLoop();
+    } catch (err) {
+      showToast(`Trajectory load failed: ${err.message}`, true);
+    }
+  }
+
+  el("sel-cmp-left").addEventListener("change", (e) => {
+    const opts = e.target._opts || [];
+    applyCmpVideoSrc(el("vid-cmp-left"), el("lbl-cmp-left"), null, opts[Number(e.target.value)]);
+  });
+  el("sel-cmp-right").addEventListener("change", (e) => {
+    const opts = e.target._opts || [];
+    applyCmpVideoSrc(el("vid-cmp-right"), el("lbl-cmp-right"), el("cmp-right-placeholder"), opts[Number(e.target.value)]);
+  });
+
+  function masterCmpVideo() {
+    const vL = el("vid-cmp-left");
+    const vR = el("vid-cmp-right");
+    return vL && vL.src ? vL : vR && vR.src ? vR : null;
+  }
+
+  function seekBothVideosToFrame(fi) {
+    if (!cmpState.traj) return;
+    const nF = cmpState.traj.total_frames;
+    const clamped = Math.max(0, Math.min(nF - 1, fi));
+    cmpState.curFrameIdx = clamped;
+    const tSec = clamped / Math.max(1, cmpState.traj.fps);
+    [el("vid-cmp-left"), el("vid-cmp-right")].forEach((v) => {
+      if (v && v.src && Number.isFinite(v.duration)) {
+        v.currentTime = Math.min(v.duration - 0.001, tSec);
+      }
+    });
+    el("rng-cmp-scrub").value = String(clamped);
+    drawComparatorCanvases();
+  }
+
+  el("btn-cmp-play").addEventListener("click", () => {
+    const vL = el("vid-cmp-left");
+    const vR = el("vid-cmp-right");
+    const m = masterCmpVideo();
+    if (!m) {
+      // Even with no MP4 loaded yet, animate playhead through the 3D camera path!
+      cmpState._virtualPlay = !cmpState._virtualPlay;
+      el("btn-cmp-play").textContent = cmpState._virtualPlay ? "⏸ Pause" : "▶ Play";
+      return;
+    }
+    if (m.paused) {
+      if (vL.src && vR.src) vR.currentTime = vL.currentTime;
+      if (vL.src) vL.play().catch(() => {});
+      if (vR.src) vR.play().catch(() => {});
+      el("btn-cmp-play").textContent = "⏸ Pause";
+    } else {
+      vL.pause();
+      vR.pause();
+      el("btn-cmp-play").textContent = "▶ Play";
+    }
+  });
+
+  el("btn-cmp-prevf").addEventListener("click", () => {
+    el("vid-cmp-left").pause();
+    el("vid-cmp-right").pause();
+    cmpState._virtualPlay = false;
+    el("btn-cmp-play").textContent = "▶ Play";
+    seekBothVideosToFrame(cmpState.curFrameIdx - 1);
+  });
+  el("btn-cmp-nextf").addEventListener("click", () => {
+    el("vid-cmp-left").pause();
+    el("vid-cmp-right").pause();
+    cmpState._virtualPlay = false;
+    el("btn-cmp-play").textContent = "▶ Play";
+    seekBothVideosToFrame(cmpState.curFrameIdx + 1);
+  });
+  el("rng-cmp-scrub").addEventListener("input", (e) => {
+    seekBothVideosToFrame(Number(e.target.value || 0));
+  });
+  el("sel-cmp-speed").addEventListener("change", (e) => {
+    const r = Number(e.target.value || 1);
+    el("vid-cmp-left").playbackRate = r;
+    el("vid-cmp-right").playbackRate = r;
+  });
+
+  el("btn-cmp-farm-modal").addEventListener("click", async () => {
+    if (!cmpState.job) return;
+    const btn = el("btn-cmp-farm-modal");
+    btn.disabled = true;
+    btn.textContent = "☁️ Farming on H100…";
+    try {
+      const res = await apiFetch("/api/splats/render", {
+        method: "POST",
+        json: { job_id: cmpState.job.job_id, mode: "modal", gpu: el("sel-splat-gpu").value || "H100" },
+      });
+      showToast(
+        `Modal H100 rendered ${res.frames} frames @ ${res.render_fps} fps in ${res.wall_s}s ($${Number(res.cost_usd || 0).toFixed(4)})!`
+      );
+      await refreshSplats();
+      await openComparatorForJob(state.splatJobs.get(cmpState.job.job_id) || cmpState.job);
+    } catch (err) {
+      showToast(`Modal render failed: ${err.message}`, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "☁️ Farm Modal Render";
+    }
+  });
+
+  el("btn-cmp-render-blender").addEventListener("click", async () => {
+    if (!cmpState.job) return;
+    const btn = el("btn-cmp-render-blender");
+    btn.disabled = true;
+    btn.textContent = "🧊 Rendering EEVEE…";
+    try {
+      const res = await apiFetch("/api/splats/render", {
+        method: "POST",
+        json: { job_id: cmpState.job.job_id, mode: "blender" },
+      });
+      showToast(`Blender 5.3 rendered ${res.frames} matching frames in ${res.wall_s}s!`);
+      await refreshSplats();
+      await openComparatorForJob(state.splatJobs.get(cmpState.job.job_id) || cmpState.job);
+    } catch (err) {
+      showToast(`Blender render failed: ${err.message}`, true);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "🧊 Render Blender";
+    }
+  });
+
+  // Orbit drag on 3D Camera Trajectory canvas + click-to-seek on Angles canvas
+  const cPath3d = el("canvas-cmp-path3d");
+  cPath3d.addEventListener("mousedown", (e) => {
+    cmpState.dragging = true;
+    cmpState.lastX = e.clientX;
+    cmpState.lastY = e.clientY;
+  });
+  window.addEventListener("mouseup", () => { cmpState.dragging = false; });
+  window.addEventListener("mousemove", (e) => {
+    if (!cmpState.dragging || !cmpState.active) return;
+    cmpState.orbitYaw -= (e.clientX - cmpState.lastX) * 0.01;
+    cmpState.orbitPitch = Math.max(-1.35, Math.min(1.42, cmpState.orbitPitch + (e.clientY - cmpState.lastY) * 0.01));
+    cmpState.lastX = e.clientX;
+    cmpState.lastY = e.clientY;
+    drawComparatorCanvases();
+  });
+
+  el("canvas-cmp-angles").addEventListener("click", (e) => {
+    if (!cmpState.traj) return;
+    const rect = e.target.getBoundingClientRect();
+    const frac = Math.max(0, Math.min(1, (e.clientX - rect.left - 24) / Math.max(30, rect.width - 34)));
+    seekBothVideosToFrame(Math.round(frac * (cmpState.traj.total_frames - 1)));
+  });
+
+  function startComparatorLoop() {
+    if (cmpState.rafId) cancelAnimationFrame(cmpState.rafId);
+    let lastVirt = performance.now();
+
+    function tick(now) {
+      if (!cmpState.active || !cmpState.traj) return;
+      const vL = el("vid-cmp-left");
+      const vR = el("vid-cmp-right");
+      const m = masterCmpVideo();
+      const nF = cmpState.traj.total_frames;
+      const fps = cmpState.traj.fps || 24;
+
+      if (m && !m.paused) {
+        // Keep secondary video locked within 45 ms of master
+        if (vL.src && vR.src && m === vL && Math.abs(vR.currentTime - vL.currentTime) > 0.045) {
+          vR.currentTime = vL.currentTime;
+        }
+        const fi = Math.max(0, Math.min(nF - 1, Math.floor(m.currentTime * fps)));
+        if (fi !== cmpState.curFrameIdx) {
+          cmpState.curFrameIdx = fi;
+          el("rng-cmp-scrub").value = String(fi);
+          drawComparatorCanvases();
+        }
+      } else if (cmpState._virtualPlay) {
+        const dt = (now - lastVirt) / 1000.0;
+        const rate = Number(el("sel-cmp-speed").value || 1);
+        if (dt >= 1.0 / (fps * rate)) {
+          lastVirt = now;
+          cmpState.curFrameIdx = (cmpState.curFrameIdx + 1) % nF;
+          el("rng-cmp-scrub").value = String(cmpState.curFrameIdx);
+          drawComparatorCanvases();
+        }
+      }
+      cmpState.rafId = requestAnimationFrame(tick);
+    }
+    cmpState.rafId = requestAnimationFrame(tick);
+  }
+
+  function drawComparatorCanvases() {
+    const traj = cmpState.traj;
+    if (!traj || !traj.frames || !traj.frames.length) return;
+    const frames = traj.frames;
+    const fi = Math.max(0, Math.min(frames.length - 1, cmpState.curFrameIdx));
+    const cur = frames[fi];
+
+    el("lbl-cmp-readout").textContent =
+      `f ${String(cur.frame).padStart(3, "0")}/${frames.length} · t=${cur.pts_sec.toFixed(2)}s` +
+      (cur.is_keyframe ? ` [★ KF #${cur.keyframe_index + 1}]` : "") +
+      ` · XYZ=(${cur.location[0].toFixed(2)}, ${cur.location[1].toFixed(2)}, ${cur.location[2].toFixed(2)})m` +
+      ` · Yaw ${cur.yaw_deg.toFixed(1)}° Pitch ${cur.pitch_deg.toFixed(1)}° Roll ${cur.roll_deg.toFixed(1)}° · ${cur.lens_mm.toFixed(0)}mm`;
+
+    // --- 1. 3D Orbit Camera Trajectory & Frustum Canvas ---
+    const c3 = el("canvas-cmp-path3d");
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w3 = Math.max(120, Math.floor(c3.clientWidth * dpr));
+    const h3 = Math.max(90, Math.floor(c3.clientHeight * dpr));
+    if (c3.width !== w3 || c3.height !== h3) { c3.width = w3; c3.height = h3; }
+    const g3 = c3.getContext("2d");
+    g3.clearRect(0, 0, w3, h3);
+
+    const bmin = traj.bounds_min, bmax = traj.bounds_max;
+    const cx = 0.5 * (bmin[0] + bmax[0]);
+    const cy = 0.5 * (bmin[1] + bmax[1]);
+    const cz = 0.5 * Math.min(0, bmin[2]) + 0.5 * bmax[2];
+    const span = Math.max(1.2, Math.hypot(bmax[0] - bmin[0], bmax[1] - bmin[1], bmax[2] - bmin[2]) * 0.85);
+
+    const cyaw = Math.cos(cmpState.orbitYaw), syaw = Math.sin(cmpState.orbitYaw);
+    const cp = Math.cos(cmpState.orbitPitch), sp = Math.sin(cmpState.orbitPitch);
+    const eyeDist = span * 2.1;
+    const eye = [cx + eyeDist * cp * cyaw, cy + eyeDist * cp * syaw, cz + eyeDist * sp];
+    let fx = cx - eye[0], fy = cy - eye[1], fz = cz - eye[2];
+    const fn = Math.hypot(fx, fy, fz) || 1;
+    fx /= fn; fy /= fn; fz /= fn;
+    let rx = fy, ry = -fx, rz = 0;
+    const rn = Math.hypot(rx, ry) || 1;
+    rx /= rn; ry /= rn;
+    const ux = ry * fz, uy = -rx * fz, uz = rx * fy - ry * fx;
+    const focal = Math.min(w3, h3) * 1.15;
+
+    function proj(pt) {
+      const dx = pt[0] - eye[0], dy = pt[1] - eye[1], dz = pt[2] - eye[2];
+      const zc = dx * fx + dy * fy + dz * fz;
+      if (zc < 0.08) return null;
+      const xc = dx * rx + dy * ry + dz * rz;
+      const yc = dx * ux + dy * uy + dz * uz;
+      return [w3 * 0.5 + (xc / zc) * focal, h3 * 0.5 - (yc / zc) * focal, zc];
+    }
+
+    // Z=0 Ground Grid
+    g3.strokeStyle = "rgba(51, 65, 85, 0.45)";
+    g3.lineWidth = 1;
+    const gridR = Math.max(2, Math.ceil(span));
+    const stepG = Math.max(0.5, gridR / 4);
+    for (let gv = -gridR; gv <= gridR + 1e-4; gv += stepG) {
+      const a = proj([cx + gv, cy - gridR, 0]), b = proj([cx + gv, cy + gridR, 0]);
+      if (a && b) { g3.beginPath(); g3.moveTo(a[0], a[1]); g3.lineTo(b[0], b[1]); g3.stroke(); }
+      const c = proj([cx - gridR, cy + gv, 0]), d = proj([cx + gridR, cy + gv, 0]);
+      if (c && d) { g3.beginPath(); g3.moveTo(c[0], c[1]); g3.lineTo(d[0], d[1]); g3.stroke(); }
+    }
+
+    // Trajectory Ribbon
+    g3.lineWidth = 2.0;
+    for (let i = 1; i < frames.length; i++) {
+      const p0 = proj(frames[i - 1].location);
+      const p1 = proj(frames[i].location);
+      if (!p0 || !p1) continue;
+      g3.strokeStyle = i <= fi ? "#38bdf8" : "rgba(148, 163, 184, 0.38)";
+      g3.beginPath(); g3.moveTo(p0[0], p0[1]); g3.lineTo(p1[0], p1[1]); g3.stroke();
+    }
+
+    // Solved Keyframe Markers + Mini Optical Ticks
+    const coneScale = span * 0.11;
+    frames.forEach((f) => {
+      if (!f.is_keyframe) return;
+      const pc = proj(f.location);
+      const tip = proj([
+        f.location[0] + f.forward[0] * coneScale * 0.7,
+        f.location[1] + f.forward[1] * coneScale * 0.7,
+        f.location[2] + f.forward[2] * coneScale * 0.7,
+      ]);
+      if (pc) {
+        g3.fillStyle = "#facc15";
+        g3.beginPath(); g3.arc(pc[0], pc[1], 2.6, 0, Math.PI * 2); g3.fill();
+        if (tip) {
+          g3.strokeStyle = "rgba(250, 204, 21, 0.5)";
+          g3.lineWidth = 1;
+          g3.beginPath(); g3.moveTo(pc[0], pc[1]); g3.lineTo(tip[0], tip[1]); g3.stroke();
+        }
+      }
+    });
+
+    // Live Active 3D Camera Frustum Pyramid + Optical Ray
+    const L = cur.location, F = cur.forward, R = cur.right, U = cur.up;
+    const pEye = proj(L);
+    const fLen = coneScale * 1.45, fW = fLen * 0.55, fH = fLen * 0.34;
+    const corners3d = [
+      [L[0] + F[0] * fLen - R[0] * fW - U[0] * fH, L[1] + F[1] * fLen - R[1] * fW - U[1] * fH, L[2] + F[2] * fLen - R[2] * fW - U[2] * fH],
+      [L[0] + F[0] * fLen + R[0] * fW - U[0] * fH, L[1] + F[1] * fLen + R[1] * fW - U[1] * fH, L[2] + F[2] * fLen + R[2] * fW - U[2] * fH],
+      [L[0] + F[0] * fLen + R[0] * fW + U[0] * fH, L[1] + F[1] * fLen + R[1] * fW + U[1] * fH, L[2] + F[2] * fLen + R[2] * fW + U[2] * fH],
+      [L[0] + F[0] * fLen - R[0] * fW + U[0] * fH, L[1] + F[1] * fLen - R[1] * fW + U[1] * fH, L[2] + F[2] * fLen - R[2] * fW + U[2] * fH],
+    ];
+    const c2d = corners3d.map(proj);
+    if (pEye && c2d.every(Boolean)) {
+      g3.strokeStyle = "#ff7b29";
+      g3.lineWidth = 1.8;
+      c2d.forEach((cp2) => {
+        g3.beginPath(); g3.moveTo(pEye[0], pEye[1]); g3.lineTo(cp2[0], cp2[1]); g3.stroke();
+      });
+      g3.beginPath();
+      c2d.forEach((cp2, idx) => { if (idx === 0) g3.moveTo(cp2[0], cp2[1]); else g3.lineTo(cp2[0], cp2[1]); });
+      g3.closePath();
+      g3.fillStyle = "rgba(255, 123, 41, 0.22)";
+      g3.fill();
+      g3.stroke();
+    }
+    g3.fillStyle = "#94a3b8";
+    g3.font = `${Math.round(9.5 * dpr)}px monospace`;
+    g3.fillText("3D Cam Path (Z=0 grid · ★ keyframes)", 6 * dpr, 12 * dpr);
+
+    // --- 2. Synchronized Camera Rotation (Yaw/Pitch/Roll) & Speed Curves ---
+    const cA = el("canvas-cmp-angles");
+    const wA = Math.max(120, Math.floor(cA.clientWidth * dpr));
+    const hA = Math.max(90, Math.floor(cA.clientHeight * dpr));
+    if (cA.width !== wA || cA.height !== hA) { cA.width = wA; cA.height = hA; }
+    const gA = cA.getContext("2d");
+    gA.clearRect(0, 0, wA, hA);
+
+    const pL = 24 * dpr, pR = 10 * dpr, pT = 16 * dpr, pB = 12 * dpr;
+    const aw = wA - pL - pR, ah = hA - pT - pB;
+    const yaws = frames.map((f) => f.yaw_deg);
+    const pitches = frames.map((f) => f.pitch_deg);
+    const rolls = frames.map((f) => f.roll_deg);
+    const speeds = frames.map((f) => f.speed_m_s);
+
+    const allAng = [...yaws, ...pitches, ...rolls];
+    const minAng = Math.min(...allAng, -5);
+    const maxAng = Math.max(...allAng, 5);
+    const maxSpd = Math.max(0.5, ...speeds);
+
+    const xF = (i) => pL + (frames.length > 1 ? (i / (frames.length - 1)) * aw : 0);
+    const drawCurve = (arr, vmin, vmax, col, lw = 1.5) => {
+      gA.strokeStyle = col;
+      gA.lineWidth = lw * dpr;
+      gA.beginPath();
+      arr.forEach((v, i) => {
+        const x = xF(i);
+        const y = pT + (1.0 - (v - vmin) / Math.max(1e-5, vmax - vmin)) * ah;
+        if (i === 0) gA.moveTo(x, y); else gA.lineTo(x, y);
+      });
+      gA.stroke();
+    };
+
+    drawCurve(speeds, 0, maxSpd, "rgba(74, 222, 128, 0.55)", 1.1);
+    drawCurve(rolls, minAng, maxAng, "#a78bfa", 1.2);
+    drawCurve(pitches, minAng, maxAng, "#fb923c", 1.4);
+    drawCurve(yaws, minAng, maxAng, "#38bdf8", 1.6);
+
+    // Playhead cursor
+    const px = xF(fi);
+    gA.strokeStyle = "#ffffff";
+    gA.lineWidth = 1.2 * dpr;
+    gA.beginPath(); gA.moveTo(px, pT - 2); gA.lineTo(px, hA - pB); gA.stroke();
+
+    gA.font = `${Math.round(9.5 * dpr)}px monospace`;
+    gA.fillStyle = "#38bdf8"; gA.fillText("Yaw°", 6 * dpr, 12 * dpr);
+    gA.fillStyle = "#fb923c"; gA.fillText("Pitch°", 38 * dpr, 12 * dpr);
+    gA.fillStyle = "#a78bfa"; gA.fillText("Roll°", 80 * dpr, 12 * dpr);
+    gA.fillStyle = "#4ade80"; gA.fillText("m/s", 116 * dpr, 12 * dpr);
+    gA.fillStyle = "#94a3b8";
+    gA.fillText(`${maxAng.toFixed(0)}°`, 2 * dpr, pT + 7 * dpr);
+    gA.fillText(`${minAng.toFixed(0)}°`, 2 * dpr, hA - pB);
+  }
+
+  // Launch FPS / Voxel / Rail Sandbox on active splat OR blank Z=0 grid!
+  el("btn-open-fps-sandbox")?.addEventListener("click", () => {
+    if (window._bbStopComparator) window._bbStopComparator();
+    el("theater-compare-wrap")?.classList.add("hidden");
+    el("theater-empty").classList.add("hidden");
+    el("theater-video").pause();
+    el("theater-audio").pause();
+    el("theater-video").classList.add("hidden");
+    el("theater-image").classList.add("hidden");
+    el("theater-audio").classList.add("hidden");
+
+    const sc = el("theater-splat-canvas");
+    const hud = el("theater-splat-hud");
+    sc.classList.remove("hidden");
+    hud.classList.remove("hidden");
+    el("stage-title").textContent = state.activeSplatJob
+      ? `FPS Rail · ${state.activeSplatJob.job_id}`
+      : "FPS Rail & Voxel Sandbox (Z=0 Grid)";
+
+    if (!window._bbSplatViewer) {
+      window._bbSplatViewer = createSplatWebGLViewer(sc, el("splat-hud-info"));
+      el("btn-splat-reset-cam").addEventListener("click", () => {
+        if (window._bbSplatViewer) window._bbSplatViewer.resetCamera();
+      });
+    }
+    window._bbSplatViewer.startBlankSandbox();
+  });
+
   // --- Init ---
   renderPromptHistoryDropdown();
   populatePricingDropdowns();
@@ -2236,5 +4388,6 @@
   refreshModels();
   refreshMedia(true);
   refreshSplats();
+  refreshShotsList();
   connectSSE();
 })();

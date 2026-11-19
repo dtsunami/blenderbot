@@ -177,6 +177,7 @@
             </select>
           </div>
           <div class="mode-pills" id="mode-pills">
+            <button type="button" id="btn-pull-cam-prompt" class="btn btn-secondary btn-xs" title="Compile active Blender 5.3 camera lens, 3D dolly/orbit arc &amp; elevation into prompt">🎥 Pull Blender Cam</button>
             <button class="mode-pill active" data-mode="standard" title="Exact prompt as written">Standard</button>
             <button class="mode-pill" data-mode="orbit_plate" title="Appends smooth steady camera parallax hints for 3D Gaussian Splatting">3D Orbit Plate</button>
             <button class="mode-pill" data-mode="subject_4d" title="Appends clean silhouette &amp; coherent motion cues for 4D unprojection">4D Subject</button>
@@ -251,7 +252,14 @@
               <option value="">— Select workspace / Seedance video —</option>
             </select>
           </div>
-          <div class="sub-hint">Reconstructs metric camera poses via <b>VGGT-1B</b>, locks floor to <code>Z=0</code>, and trains 3D Gaussians on Modal GPU. (Tip: click <b>Splat</b> on any video card in the Library!)</div>
+          <div class="cond-video-top" style="margin-top:6px">
+            <label for="sel-splat-known-cams" class="picker-label" title="Lock or nudge Seedance video reconstruction onto a known Blender / prior camera path">Camera Prior:</label>
+            <select id="sel-splat-known-cams" class="video-picker-select">
+              <option value="">— Auto Solve Poses (VGGT / COLMAP) —</option>
+              <option value="__blender_active__">🎥 Active Blender 5.3 Camera (Zero-Drift Lock / Prior)</option>
+            </select>
+          </div>
+          <div class="sub-hint">Extracts exact video PTS timestamps, solves or locks metric camera poses (<code>Z=0</code> floor), and exports <code>.ply</code> + <code>.splat</code> + <code>proxy_collision.glb</code>.</div>
         </div>
 
         <div id="splat-src-blender-box" class="cond-video-card hidden">
@@ -310,10 +318,14 @@
           </label>
         </div>
 
-        <!-- Collapsible Anti-Floater & Culling Knobs (arcgs / tt-splat) -->
+        <!-- Collapsible Anti-Floater, Pose Optimization & Quality Knobs (`tt-splat` + `gsplat`) -->
         <details class="splat-knobs-drawer">
-          <summary>🛠 Anti-Floater, Culling &amp; Blender Import Knobs (opacity reset, needle cull, VGGT filter)</summary>
+          <summary>🛠 Quality, Pose Refinement &amp; Anti-Floater Knobs (DSSIM λ, se(3) Pose Opt, Mip-Splat, COLMAP Prior)</summary>
           <div class="params-grid" style="margin-top:8px">
+            <label class="field" title="(1-λ)·L1 + λ·(1-SSIM): higher sharpens structural edges">
+              <span>DSSIM Weight (<code>lambda_dssim</code>)</span>
+              <input id="inp-splat-dssim" type="number" step="0.05" min="0" max="0.95" value="0.20" />
+            </label>
             <label class="field" title="L1 penalty on opacity — higher evaporates misty AI-video air floaters">
               <span>Floater Opacity Penalty (<code>opa_reg</code>)</span>
               <input id="inp-splat-opareg" type="number" step="0.0001" min="0" max="0.02" value="0.0005" />
@@ -338,13 +350,26 @@
               <span>Blender Max Needle Ratio</span>
               <input id="inp-splat-maxaniso" type="number" step="1" min="2" max="50" value="10" />
             </label>
-            <label class="field" title="VGGT-1B solves fast metric poses on all videos; COLMAP SIFT is exact on rigid scenes">
+            <label class="field" title="2D EWA anti-aliasing filter prevents distant shimmer in Blender/UE">
+              <span>Rasterizer Filter</span>
+              <select id="sel-splat-rastmode">
+                <option value="antialiased" selected>Mip-Splatting Antialiased</option>
+                <option value="classic">Classic 3DGS</option>
+              </select>
+            </label>
+            <label class="field" title="VGGT-1B solves fast metric poses; COLMAP Prior locks PINHOLE K + Umeyama Sim3 onto Blender camera">
               <span>Camera Pose Solver</span>
               <select id="sel-splat-pose-backend">
                 <option value="vggt" selected>VGGT-1B (Fast Metric GPU · Letterbox-safe)</option>
-                <option value="colmap">COLMAP SIFT + Mapper (Exact Rigid SfM)</option>
+                <option value="colmap">COLMAP PINHOLE (Rigid SfM)</option>
+                <option value="colmap_prior">COLMAP + Blender Prior (PINHOLE K + Umeyama)</option>
+                <option value="known_cameras">Hard Lock to Camera Prior (0px Drift)</option>
               </select>
             </label>
+          </div>
+          <div class="toggles-row" style="margin-top:8px">
+            <label title="Optimizes 6D rotation + 3D translation per camera during gsplat training"><input type="checkbox" id="chk-splat-refineposes" checked /> Sub-pixel <code>se(3)</code> camera pose refinement</label>
+            <label title="Also import Surface-Nets proxy_collision.glb as Cycles shadow-catcher / collider"><input type="checkbox" id="chk-splat-proxyglb" /> Import coarse <code>proxy_collision.glb</code> into Blender</label>
           </div>
         </details>
 
@@ -357,13 +382,25 @@
           <button id="btn-train-splat" type="button" class="btn btn-primary btn-lg">🚀 Train 3D Gaussian Splat</button>
         </div>
 
-        <!-- Live Training Telemetry Card -->
+        <!-- Live Training Telemetry Card + `tt-splat` Plots, Stage Bar, Scrubber & Surgical Workbench -->
         <div id="splat-live-card" class="splat-live-card hidden">
           <div class="splat-live-head">
             <span id="splat-live-title">Training…</span>
             <span id="splat-live-metrics" class="splat-metrics-pill">PSNR — dB · 0 Gaussians</span>
           </div>
           <div class="splat-prog-track"><div id="splat-prog-fill" class="splat-prog-fill" style="width:0%"></div></div>
+
+          <!-- Mid-Train Live Controls (`tt-splat` Operations) -->
+          <div id="splat-live-ctl-bar" class="splat-ctl-bar">
+            <button type="button" id="btn-wb-pause" class="btn btn-secondary btn-xs" title="Pause / Resume GPU training loop">⏸ Pause</button>
+            <button type="button" id="btn-wb-saveckpt" class="btn btn-secondary btn-xs" title="Write intermediate checkpoint on Modal Volume">💾 Save Ckpt</button>
+            <button type="button" id="btn-wb-stop" class="btn btn-ghost btn-xs" title="Stop training early and export .ply/.splat now">⏹ Stop &amp; Export</button>
+            <select id="sel-wb-focus-cam" class="wb-mini-select" title="Lock optimization to a single camera view ('Focus here')">
+              <option value="">🎯 Focus: All Views</option>
+            </select>
+            <button type="button" id="btn-wb-push-knobs" class="btn btn-secondary btn-xs" title="Push current DSSIM λ &amp; opa_reg sliders live into running job">⚡ Push Knobs</button>
+          </div>
+
           <div id="splat-live-preview-wrap" class="splat-live-preview-wrap hidden">
             <img id="splat-live-img" alt="Live 3DGS render" />
             <img id="splat-live-diff" class="hidden" alt="3x Luminance Error" />
@@ -371,6 +408,38 @@
               <button type="button" id="btn-splat-show-render" class="btn btn-secondary btn-xs">Render</button>
               <button type="button" id="btn-splat-show-diff" class="btn btn-ghost btn-xs">Error Map</button>
             </div>
+          </div>
+
+          <!-- `tt-splat` Stacked GPU Stage Breakdown Bar -->
+          <div id="splat-stage-wrap" class="splat-stage-wrap hidden">
+            <div id="splat-stage-bar" class="splat-stage-bar"></div>
+            <div id="splat-stage-legend" class="splat-stage-legend"></div>
+          </div>
+
+          <!-- Interactive Loss/PSNR + Gaussian Count Charts -->
+          <div id="splat-charts-wrap" class="splat-charts-wrap hidden">
+            <div class="chart-head">
+              <span id="lbl-chart-hover">Loss (orange) · L1 (cyan) · PSNR dB (green) · dashed = densify/surgery</span>
+            </div>
+            <canvas id="canvas-splat-loss-psnr" class="splat-chart-canvas" width="520" height="125"></canvas>
+            <canvas id="canvas-splat-count" class="splat-chart-canvas" width="520" height="68"></canvas>
+          </div>
+
+          <!-- Snapshot Timeline Scrubber -->
+          <div id="splat-snap-row" class="splat-snap-row hidden">
+            <span class="wb-lbl">📸 Snapshots:</span>
+            <input type="range" id="rng-splat-snap" min="0" max="0" value="0" />
+            <span id="lbl-splat-snap" class="wb-mono">—</span>
+          </div>
+
+          <!-- Surgical & Blender 3D CropBox / Proxy Mesh Bar -->
+          <div id="splat-surgery-bar" class="splat-ctl-bar">
+            <button type="button" id="btn-surg-reset-opa" class="btn btn-secondary btn-xs" title="Reset opacities to 0.01 &amp; run +1,500 steps so floaters evaporate">🫧 Reset Opa</button>
+            <button type="button" id="btn-surg-clamp-scale" class="btn btn-secondary btn-xs" title="Clamp overgrown spiky log-scales &amp; polish +1,000 steps">✂️ Clamp Spikes</button>
+            <button type="button" id="btn-cropbox-spawn" class="btn btn-secondary btn-xs" title="Spawn wireframe SplatCropBox cube in Blender 5.3 viewport">📦 Spawn CropBox</button>
+            <button type="button" id="btn-cropbox-cull" class="btn btn-primary btn-xs" title="Cull Gaussians inside Blender SplatCropBox &amp; heal background (+1,500 steps)">🔥 Cull Box &amp; Heal</button>
+            <button type="button" id="btn-cropbox-keep" class="btn btn-secondary btn-xs" title="Keep ONLY Gaussians inside Blender SplatCropBox &amp; polish">🎯 Keep Box</button>
+            <button type="button" id="btn-build-proxy" class="btn btn-secondary btn-xs" title="Generate Surface-Nets proxy_collision.glb &amp; import into Blender 5.3">🕸 Proxy .GLB</button>
           </div>
         </div>
 
@@ -390,8 +459,11 @@
     <!-- RIGHT COLUMN: Theater Player, WebGL 3D Splat Viewer, Job Queue & Agent Co-Pilot -->
     <section class="pane pane-stage">
       <div class="pane-header">
-        <h2>Preview Stage &amp; 3D Viewer</h2>
-        <span id="stage-title" class="stage-filename">Select media or 3D splat</span>
+        <h2>Preview Stage &amp; 3D Sandbox</h2>
+        <div class="header-actions">
+          <button type="button" id="btn-open-fps-sandbox" class="btn btn-secondary btn-xs" title="Open Minecraft/Rust FPS Camera Rail, Subject-Track &amp; Voxel Sandbox (works on active splat or blank Z=0 grid!)">🎮 FPS Rail Sandbox</button>
+          <span id="stage-title" class="stage-filename">Select media or 3D splat</span>
+        </div>
       </div>
 
       <div class="theater" id="theater-box">
@@ -401,16 +473,104 @@
         <video id="theater-video" class="theater-media hidden" controls autoplay loop playsinline></video>
         <img id="theater-image" class="theater-media hidden" alt="preview" />
         <canvas id="theater-splat-canvas" class="theater-splat-canvas hidden"></canvas>
-        <div id="theater-splat-hud" class="splat-hud hidden">
-          <span id="splat-hud-info">3DGS Viewer · Drag to orbit · Right-drag pan · Scroll zoom</span>
-          <button type="button" id="btn-splat-reset-cam" class="btn btn-ghost btn-xs">Reset View</button>
+
+        <!-- FPS Crosshair + Telemetry Overlay -->
+        <div id="fps-crosshair-wrap" class="fps-crosshair-wrap hidden">
+          <div id="fps-crosshair" class="fps-crosshair">+</div>
+          <div id="fps-reticle-tag" class="fps-reticle-tag">35mm · WALK 1.65m</div>
         </div>
+
+        <!-- Rust/PUBG Tactical Radar Minimap (shows Body Heading vs Alt Free-Look Cone + Landmarks!) -->
+        <canvas id="fps-radar-canvas" class="fps-radar-canvas hidden" width="104" height="104" title="Tactical Minimap: Green arrow = movement heading · Cyan cone = Alt look direction · Gold = Cam Rail · Magenta = Subject · Orange = Pings"></canvas>
+
+        <!-- Inline Non-Blocking Ping Note Input -->
+        <div id="fps-ping-modal" class="fps-ping-modal hidden">
+          <span id="fps-ping-coords" class="wb-mono">📍 Ping #1</span>
+          <input id="inp-fps-ping-note" type="text" placeholder="Callout for agent (e.g. 'weathered blast door 2.2m here') — Enter saves" autocomplete="off" />
+          <button type="button" id="btn-fps-ping-save" class="btn btn-primary btn-xs">Save</button>
+          <button type="button" id="btn-fps-ping-cancel" class="btn btn-ghost btn-xs">✕</button>
+        </div>
+
+        <!-- Top FPS / Rail Collateral Export Bar -->
+        <div id="fps-rail-topbar" class="fps-rail-topbar hidden">
+          <label class="wb-mono">Dur:
+            <input id="inp-rail-dur" type="number" min="2" max="30" step="1" value="5" style="width:42px" />s
+          </label>
+          <button type="button" id="btn-rail-ride" class="btn btn-secondary btn-xs" title="Ride your Camera Rail &amp; preview moving Subject capsule (Key: P)">▶ Ride (P)</button>
+          <button type="button" id="btn-rail-track-sub" class="btn btn-ghost btn-xs" title="Auto-aim Camera Rail at moving Subject capsule (Key: K)">🎯 Track Subj: OFF</button>
+          <button type="button" id="btn-rail-to-seedance" class="btn btn-accent btn-xs" title="Export clean First/Last node frames + optical &amp; subject prompt into Seedance 2.5 + lock Camera Prior">🎬 → Seedance</button>
+          <button type="button" id="btn-rail-farm-modal" class="btn btn-primary btn-xs" title="Farm 1080p H.264 render of this rail on Modal H100 (~2s)">☁️ Modal Render</button>
+          <button type="button" id="btn-rail-sync-bl" class="btn btn-secondary btn-xs" title="Export shot.usda + blockout.glb + brief.md into Blender 5.3 &amp; Agent">🧊 → Blender+Brief</button>
+          <button type="button" id="btn-rail-clear" class="btn btn-ghost btn-xs" title="Clear rail, subject waypoints, voxels &amp; pings">Clear</button>
+        </div>
+
+        <!-- Bottom Survival Hotbar (`1-4` + Orbit/FPS Toggle) -->
+        <div id="theater-splat-hud" class="splat-hud hidden">
+          <div id="fps-hotbar" class="fps-hotbar hidden">
+            <button type="button" class="hotbar-slot active" data-slot="1" title="[1] LMB drops Camera Node · Hold R records flight · X removes">[1] 🎥 Cam <b id="cnt-hb-cam">0</b></button>
+            <button type="button" class="hotbar-slot" data-slot="2" title="[2] LMB drops Subject/Player waypoint relative to landmarks · X removes">[2] 🏃 Subj <b id="cnt-hb-sub">0</b></button>
+            <button type="button" class="hotbar-slot" data-slot="3" title="[3] LMB snap-builds Voxel block · [ ] size · X breaks">[3] 🧱 Voxel <b id="cnt-hb-vox">0</b></button>
+            <button type="button" class="hotbar-slot" data-slot="4" title="[4] LMB drops raycast 3D Spatial Brief Ping + Hero screenshot">[4] 📍 Ping <b id="cnt-hb-ping">0</b></button>
+          </div>
+          <span id="splat-hud-info">3DGS Viewer · Drag orbit · Click 🎮 FPS for WASD+Rail</span>
+          <div style="display:flex;gap:4px">
+            <button type="button" id="btn-splat-fps-toggle" class="btn btn-primary btn-xs" title="Toggle WASD + PointerLock + RMB Target-Lock + Hotbar (Key: F)">🎮 FPS Mode</button>
+            <button type="button" id="btn-splat-reset-cam" class="btn btn-ghost btn-xs">Reset</button>
+          </div>
+        </div>
+
+        <!-- Side-by-Side Synced Clip Comparator + 3D Camera Path & Rotation Visualizer -->
+        <div id="theater-compare-wrap" class="theater-compare-wrap hidden">
+          <div class="cmp-toolbar">
+            <select id="sel-cmp-left" class="wb-mini-select" title="Left player clip"></select>
+            <span class="wb-lbl">vs</span>
+            <select id="sel-cmp-right" class="wb-mini-select" title="Right player clip"></select>
+            <button type="button" id="btn-cmp-farm-modal" class="btn btn-primary btn-xs" title="Farm full-rate recreated camera path render to Modal H100 gsplat (~2s)">☁️ Farm Modal Render</button>
+            <button type="button" id="btn-cmp-render-blender" class="btn btn-secondary btn-xs" title="Render matching camera trajectory in Blender 5.3 EEVEE">🧊 Render Blender</button>
+          </div>
+
+          <div class="cmp-videos-row">
+            <div class="cmp-vid-cell">
+              <span id="lbl-cmp-left" class="cmp-vid-badge">Original Video</span>
+              <video id="vid-cmp-left" muted loop playsinline></video>
+            </div>
+            <div class="cmp-vid-cell">
+              <span id="lbl-cmp-right" class="cmp-vid-badge">Recreated 3DGS / Blender</span>
+              <video id="vid-cmp-right" muted loop playsinline></video>
+              <div id="cmp-right-placeholder" class="cmp-placeholder hidden">Click <b>☁️ Farm Modal Render</b> (~2s) or <b>🧊 Render Blender</b></div>
+            </div>
+          </div>
+
+          <div class="cmp-transport">
+            <button type="button" id="btn-cmp-play" class="btn btn-secondary btn-xs">▶ Play</button>
+            <button type="button" id="btn-cmp-prevf" class="btn btn-ghost btn-xs" title="Step -1 frame">◀</button>
+            <button type="button" id="btn-cmp-nextf" class="btn btn-ghost btn-xs" title="Step +1 frame">▶</button>
+            <div class="cmp-scrub-box">
+              <input type="range" id="rng-cmp-scrub" min="0" max="100" value="0" />
+              <div id="cmp-keyframe-ticks" class="cmp-keyframe-ticks"></div>
+            </div>
+            <select id="sel-cmp-speed" class="wb-mini-select">
+              <option value="1" selected>1.0×</option>
+              <option value="0.5">0.5×</option>
+              <option value="0.25">0.25×</option>
+            </select>
+          </div>
+
+          <div id="lbl-cmp-readout" class="cmp-readout">f 001/001 · t=0.00s · Yaw 0.0° Pitch 0.0° Roll 0.0°</div>
+
+          <div class="cmp-viz-row">
+            <canvas id="canvas-cmp-path3d" title="Drag to orbit 3D camera trajectory · Gold cones = solved keyframes · Cyan cone = live camera"></canvas>
+            <canvas id="canvas-cmp-angles" title="Yaw° (cyan) · Pitch° (orange) · Roll° (purple) · Speed m/s (green) · Click to seek"></canvas>
+          </div>
+        </div>
+
         <audio id="theater-audio" class="hidden" controls></audio>
       </div>
 
       <div id="theater-actions" class="theater-actions hidden">
         <span id="theater-meta" class="theater-meta"></span>
         <div class="theater-btns">
+          <button id="btn-stage-compare" class="btn btn-accent btn-xs hidden">🎬 Compare &amp; Path</button>
           <button id="btn-stage-to-splat" class="btn btn-primary btn-xs hidden">🌐 Train 3D Splat</button>
           <button id="btn-stage-import-bl" class="btn btn-primary btn-xs hidden">📥 Import into Blender 5.3</button>
           <button id="btn-stage-use-vid" class="btn btn-secondary btn-xs hidden">Set Source Video</button>
