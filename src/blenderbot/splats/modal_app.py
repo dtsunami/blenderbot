@@ -29,6 +29,27 @@ GPU_HOURLY_USD: dict[str, float] = {
     "A100": 2.50,
 }
 
+
+def _resolve_modal_worker_timeout(default: int = 900) -> int:
+    raw = (
+        os.environ.get("MODAL_WORKER_TIMEOUT")
+        or os.environ.get("BLENDERBOT_MODAL_WORKER_TIMEOUT")
+        or ""
+    ).strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw.replace("_", ""))
+    except ValueError as exc:
+        raise ValueError(f'MODAL_WORKER_TIMEOUT must be a positive integer (got "{raw}").') from exc
+    if val <= 0:
+        raise ValueError(f'MODAL_WORKER_TIMEOUT must be a positive integer (got "{raw}").')
+    return val
+
+
+MODAL_WORKER_TIMEOUT = _resolve_modal_worker_timeout(900)
+MODAL_RENDER_TIMEOUT = _resolve_modal_worker_timeout(1800)
+
 models_vol = modal.Volume.from_name(MODELS_VOL_NAME, create_if_missing=True)
 jobs_vol = modal.Volume.from_name(JOBS_VOL_NAME, create_if_missing=True)
 blender_cache_vol = modal.Volume.from_name(BLENDER_CACHE_VOL_NAME, create_if_missing=True)
@@ -145,6 +166,7 @@ class _BaseSplatWorker:
         job_id: str,
         mp4_bytes: bytes | None = None,
         views_tar_gz: bytes | None = None,
+        images_tar_gz: bytes | None = None,
         known_cameras_json: str | None = None,
         cfg_dict: dict[str, Any] | None = None,
         cfg_overrides: dict[str, Any] | None = None,
@@ -184,6 +206,7 @@ class _BaseSplatWorker:
             models_dir=Path("/models"),
             mp4_bytes=mp4_bytes,
             views_tar_gz=views_tar_gz,
+            images_tar_gz=images_tar_gz,
             known_cameras_json=known_cameras_json,
             cfg=cfg,
             cfg_overrides=cfg_overrides,
@@ -232,7 +255,7 @@ class _BaseSplatWorker:
     cpu=8.0,
     volumes={"/models": models_vol, "/jobs": jobs_vol},
     scaledown_window=90,
-    timeout=900,
+    timeout=MODAL_WORKER_TIMEOUT,
 )
 class SplatWorker(_BaseSplatWorker):
     """Primary H100 (80 GB HBM3) 3DGS worker."""
@@ -244,7 +267,7 @@ class SplatWorker(_BaseSplatWorker):
     cpu=8.0,
     volumes={"/models": models_vol, "/jobs": jobs_vol},
     scaledown_window=90,
-    timeout=900,
+    timeout=MODAL_WORKER_TIMEOUT,
 )
 class SplatWorkerL40S(_BaseSplatWorker):
     """Cost-optimized L40S (48 GB Ada, $1.95/hr) peer worker."""
@@ -390,7 +413,7 @@ class _BaseBlenderRenderWorker:
     cpu=8.0,
     volumes={"/blender_cache": blender_cache_vol},
     scaledown_window=90,
-    timeout=1800,
+    timeout=MODAL_RENDER_TIMEOUT,
 )
 class BlenderRenderWorker(_BaseBlenderRenderWorker):
     """Primary H100 (80 GB HBM3) Blender 5.3 Cycles OptiX / EEVEE cloud renderer."""
@@ -402,7 +425,7 @@ class BlenderRenderWorker(_BaseBlenderRenderWorker):
     cpu=8.0,
     volumes={"/blender_cache": blender_cache_vol},
     scaledown_window=90,
-    timeout=1800,
+    timeout=MODAL_RENDER_TIMEOUT,
 )
 class BlenderRenderWorkerL40S(_BaseBlenderRenderWorker):
     """Cost-optimized L40S (48 GB Ada RT-Core, $1.95/hr) Blender 5.3 cloud renderer."""

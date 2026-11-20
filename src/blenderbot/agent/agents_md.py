@@ -34,9 +34,21 @@ def discover_agents_files(
         if hp.is_file():
             out.append({"path": hp, "source": "home"})
     if cwd is not None:
+        pyproj = cwd / "pyproject.toml"
+        is_self_repo_readme = False
+        if pyproj.is_file():
+            try:
+                ptxt = pyproj.read_text(encoding="utf-8", errors="ignore")
+                is_self_repo_readme = 'readme = "blenderbot.md"' in ptxt
+            except OSError:
+                pass
         for name in PROJECT_AGENTS_NAMES:
             pp = (cwd / name).resolve()
             if pp.is_file():
+                # On case-insensitive filesystems (Windows/macOS), avoid mistaking blenderbot's
+                # own package README (`blenderbot.md`) for an operator `BLENDERBOT.md` prompt file.
+                if is_self_repo_readme and pp.name == "blenderbot.md":
+                    continue
                 if not any(e["path"] == pp for e in out):
                     out.append({"path": pp, "source": "project"})
                 break

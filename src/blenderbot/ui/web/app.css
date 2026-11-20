@@ -1425,7 +1425,7 @@ body.hide-right #sash-right {
 }
 .studio-mode-tabs {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(5, minmax(0, 1fr));
   flex: 1 1 auto;
   min-width: 0;
   background: #070b12;

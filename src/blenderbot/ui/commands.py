@@ -27,6 +27,7 @@ from blenderbot.session.profiles_ctl import profile_state, switch_profile
 HELP_TEXT = """Commands
   sh <cmd>                    run a local shell command; output is added to context
   /blender [mode]             show Blender 5.3+ status or reconnect (`auto` | `bridge` | `headless`)
+  /meshy [img|list|import]    open Meshy 7.1 Image-to-3D Studio (fal API), list `.glb` jobs, or generate/import
   /seedream [prompt] [flags]  open Seedream 5.5 Image Studio (or generate `--ref`/`--res`/`--aspect` PNG/JPG)
   /seedance [prompt] [flags]  open Seedance 2.5 GUI Studio (or generate `--video`/`--first`/`--last` MP4)
   /splat [list|import <id>]   open 3DGS Splat Studio GUI, list splats, or import `<job_id>` into Blender
@@ -277,6 +278,197 @@ async def handle_command(
                 "text": "usage: /splat | /splat list | /splat import <job_id> [ellipsoids|pointcloud]",
             }
         )
+        return {"handled": True}
+
+    if cmd == "/meshy":
+        if not args or (
+            len(args) == 1 and args[0].lower() in ("gui", "open", "--gui", "--open", "studio")
+        ):
+            from blenderbot.server import ensure_web_sidecar
+
+            srv = await ensure_web_sidecar(session, open_browser=False)
+            import webbrowser as _wb_m
+
+            m_url = f"{srv.auth_url}#meshy"
+            with contextlib.suppress(Exception):
+                _wb_m.open(m_url)
+            push({"type": "notice", "message": f"Opened Meshy 7.1 3D Studio -> {m_url}"})
+            return {"handled": True}
+
+        sub_m = args[0].lower()
+        if sub_m == "list":
+            m_root = session.cfg.cwd / "assets" / "meshy"
+            if not m_root.is_dir():
+                push({"type": "info", "text": "No Meshy 3D jobs in assets/meshy/ yet."})
+                return {"handled": True}
+            dirs_m = sorted(
+                (d for d in m_root.iterdir() if d.is_dir() and any(d.glob("*.glb"))),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            if not dirs_m:
+                push({"type": "info", "text": "No Meshy 3D .glb jobs in assets/meshy/ yet."})
+                return {"handled": True}
+            rows_m = ["Meshy 7.1 3D Jobs (`assets/meshy/`):"]
+            for dm in dirs_m[:25]:
+                glb_p = dm / "model.glb"
+                sz_kb = round(glb_p.stat().st_size / 1024.0, 1) if glb_p.is_file() else 0.0
+                rows_m.append(f"  - {dm.name} ({sz_kb} KB)")
+            push({"type": "info", "text": "\n".join(rows_m)})
+            return {"handled": True}
+
+        if sub_m == "import" and len(args) >= 2:
+            if session.transport is None:
+                await session.maybe_auto_connect_blender()
+            if session.transport is None:
+                push({"type": "warning", "message": "Blender 5.3 is not connected."})
+                return {"handled": True}
+            jid_m = args[1]
+            try:
+                jdir_m = session.sandbox.resolve_for_read(f"assets/meshy/{jid_m}")
+                glb_m = jdir_m / "model.glb"
+                if not glb_m.is_file():
+                    cands_m = sorted(jdir_m.glob("*.glb"))
+                    if not cands_m:
+                        push({"type": "warning", "message": f"No .glb found in assets/meshy/{jid_m}"})
+                        return {"handled": True}
+                    glb_m = cands_m[0]
+                imp_m = await session.transport.call(
+                    "asset.import",
+                    {"filepath": str(glb_m), "collection": "MeshyAssets", "place_on_ground": True},
+                    timeout=120.0,
+                )
+                push(
+                    {
+                        "type": "notice",
+                        "message": f"Imported {glb_m.name} -> {imp_m.get('imported_objects')} on Z=0",
+                    }
+                )
+            except Exception as err:  # noqa: BLE001
+                push({"type": "warning", "message": f"/meshy import failed: {err}"})
+            return {"handled": True}
+
+        from blenderbot.media_gen.meshy import default_meshy_job_dir, generate_meshy_3d
+
+        fal_key = session.cfg.keys.get("fal")
+        if not fal_key:
+            push(
+                {
+                    "type": "warning",
+                    "message": "FAL_KEY is not configured. Run `/keys fal <key> --save` or `/meshy` to set it in the GUI.",
+                }
+            )
+            return {"handled": True}
+
+        img_arg: str | None = None
+        topo_m = "triangle"
+        poly_m = 30000
+        tex_m = True
+        pbr_m = False
+        rig_m = False
+        anim_m = False
+        auto_imp_m = False
+        tex_prompt_words: list[str] = []
+        im = 0
+        while im < len(args):
+            tm = args[im]
+            if tm in ("--image", "-i") and im + 1 < len(args):
+                img_arg = args[im + 1]
+                im += 2
+            elif tm == "--topology" and im + 1 < len(args):
+                topo_m = args[im + 1]
+                im += 2
+            elif tm in ("--poly", "--polycount") and im + 1 < len(args):
+                poly_m = int(args[im + 1])
+                im += 2
+            elif tm == "--no-texture":
+                tex_m = False
+                im += 1
+            elif tm == "--pbr":
+                pbr_m = True
+                im += 1
+            elif tm == "--rig":
+                rig_m = True
+                im += 1
+            elif tm == "--anim":
+                rig_m = True
+                anim_m = True
+                im += 1
+            elif tm == "--import":
+                auto_imp_m = True
+                im += 1
+            elif img_arg is None and not tm.startswith("-"):
+                img_arg = tm
+                im += 1
+            else:
+                tex_prompt_words.append(tm)
+                im += 1
+
+        if not img_arg:
+            push(
+                {
+                    "type": "info",
+                    "text": "usage: /meshy | /meshy list | /meshy import <job_id> | /meshy <image_path> [--pbr] [--rig] [--anim] [--poly 30000] [--import]",
+                }
+            )
+            return {"handled": True}
+
+        try:
+            src_m: str | Path = (
+                img_arg
+                if img_arg.startswith(("https://", "http://", "data:"))
+                else session.sandbox.resolve_for_read(img_arg)
+            )
+            stem_m = src_m.stem if isinstance(src_m, Path) else "meshy"
+            jid_new, jdir_new = default_meshy_job_dir(session.cfg.cwd, stem=stem_m)
+            push(
+                {
+                    "type": "notice",
+                    "message": f"Submitting Meshy 7.1 job ({session.cfg.meshy_model}) -> assets/meshy/{jid_new}/model.glb…",
+                }
+            )
+            res_m = await generate_meshy_3d(
+                api_key=fal_key,
+                output_dir=jdir_new,
+                image=src_m,
+                model=session.cfg.meshy_model,
+                topology=topo_m,
+                target_polycount=poly_m,
+                should_texture=tex_m,
+                enable_pbr=pbr_m,
+                texture_prompt=" ".join(tex_prompt_words).strip() or None,
+                enable_rigging=rig_m,
+                enable_animation=anim_m,
+                on_progress=lambda _p: session.log.flight.touch(),
+            )
+            cost_m = float(res_m.get("cost_usd") or 0.0)
+            session.agent.run_cost += cost_m
+            session.agent.stats["cost"] += cost_m
+            session.log.record("meshy", res_m)
+            if auto_imp_m:
+                if session.transport is None:
+                    await session.maybe_auto_connect_blender()
+                if session.transport is not None:
+                    await session.transport.call(
+                        "asset.import",
+                        {
+                            "filepath": str(res_m["glb_path"]),
+                            "collection": "MeshyAssets",
+                            "place_on_ground": True,
+                        },
+                        timeout=120.0,
+                    )
+            push(
+                {
+                    "type": "notice",
+                    "message": (
+                        f"Meshy 7.1 completed in {res_m['elapsed_sec']}s (req={res_m.get('request_id')}, "
+                        f"~${cost_m:.2f}, {res_m.get('triangles_total', 0):,} tris) -> assets/meshy/{jid_new}/model.glb"
+                    ),
+                }
+            )
+        except Exception as err:  # noqa: BLE001
+            push({"type": "warning", "message": f"/meshy failed: {err}"})
         return {"handled": True}
 
     if cmd == "/seedream":
@@ -1278,10 +1470,12 @@ async def handle_command(
                 push({"type": "warning", "message": str(err)})
             return {"handled": True}
         st_k = key_state(session)
+        rows_k = st_k["providers"] if isinstance(st_k, dict) else st_k
         lines = ["API Keys (`/keys <provider> <key> [--save]`):"]
-        for row in st_k["providers"]:
+        for row in rows_k:
             mark = "✓" if row["configured"] else "—"
-            src = f" ({row['var']} from {row['source']})" if row["configured"] else ""
+            src_from = row.get("from") or row.get("source") or "env"
+            src = f" ({row['var']} from {src_from})" if row["configured"] else ""
             lines.append(f"  {mark} {row['provider']:<12}{src}")
         push({"type": "info", "text": "\n".join(lines)})
         return {"handled": True}

@@ -219,3 +219,224 @@ async def test_pack_for_cloud_and_render_modal_routing(
     assert outcome.results[0]["result"]["backend"] == "OPTIX"
     assert outcome.results[0]["result"]["device"] == "NVIDIA H100 80GB HBM3"
     assert any(m["kind"] == "image" for m in outcome.attached_media)
+
+
+def test_modal_worker_timeout_env_and_self_readme_guard(tmp_path: Path) -> None:
+    """Verify `MODAL_WORKER_TIMEOUT` config/worker resolution and repo `blenderbot.md` exclusion."""
+    from blenderbot.agent.agents_md import discover_agents_files
+    from blenderbot.config.env import load_config, resolve_modal_worker_timeout
+    from blenderbot.splats.modal_app import _resolve_modal_worker_timeout
+
+    home = tmp_path / "home"
+    home.mkdir()
+    ws = tmp_path / "ws"
+    ws.mkdir()
+
+    cfg_default = load_config(cwd=ws, home=home, environ={})
+    assert cfg_default.modal_worker_timeout == 900
+    assert cfg_default.to_public_dict()["modal_worker_timeout"] == 900
+
+    cfg_env = load_config(cwd=ws, home=home, environ={"MODAL_WORKER_TIMEOUT": "2400"})
+    assert cfg_env.modal_worker_timeout == 2400
+    assert resolve_modal_worker_timeout({"MODAL_WORKER_TIMEOUT": "2400"}) == 2400
+
+    (home / ".env").write_text("MODAL_WORKER_TIMEOUT=1500\n", encoding="utf-8")
+    cfg_dotenv = load_config(cwd=ws, home=home, environ={})
+    assert cfg_dotenv.modal_worker_timeout == 1500
+    assert resolve_modal_worker_timeout({}, cwd=ws, home=home) == 1500
+
+    with pytest.raises(ValueError, match="MODAL_WORKER_TIMEOUT"):
+        load_config(cwd=ws, home=home, environ={"MODAL_WORKER_TIMEOUT": "0"})
+
+    with patch.dict("os.environ", {"MODAL_WORKER_TIMEOUT": "2100"}, clear=False):
+        assert _resolve_modal_worker_timeout(900) == 2100
+        assert _resolve_modal_worker_timeout(1800) == 2100
+
+    # Repo root `blenderbot.md` (package readme) must NOT be auto-injected as `BLENDERBOT.md`
+    repo_root = Path(__file__).resolve().parents[1]
+    found_repo = discover_agents_files(cwd=repo_root)
+    assert not any(Path(e["path"]).name == "blenderbot.md" for e in found_repo)
+
+    # Genuine project `AGENTS.md` in a normal workspace still loads cleanly
+    (ws / "AGENTS.md").write_text("# Studio Rules\nUse meters.\n", encoding="utf-8")
+    found_ws = discover_agents_files(cwd=ws)
+    assert len(found_ws) == 1 and Path(found_ws[0]["path"]).name == "AGENTS.md"
+
+
+@pytest.mark.asyncio
+async def test_splat_from_images_bundle_exif_timeout_and_execution(tmp_path: Path) -> None:
+    """Verify `splat.from_images`, EXIF transpose + downscale, directory hint on `from_video`, and `with_options(timeout=...)`."""
+    import gzip
+    import json
+
+    from PIL import Image
+
+    from blenderbot.config.env import load_config
+    from blenderbot.splats.client import (
+        discover_image_files,
+        pack_images_tar_gz,
+        run_modal_splat_job,
+        unpack_images_bundle,
+    )
+    from blenderbot.splats.config import ExtractConfig
+
+    assert is_op_allowed_for_role("viewer", "splat.from_images") is False
+    assert is_op_allowed_for_role("builder", "splat.from_images") is True
+    assert is_op_allowed_for_role("master", "splat.from_images") is True
+
+    sys_prompt = build_system_prompt(prompts=builtin_prompts(), grounding="G", role="builder")
+    assert "splat.from_images" in sys_prompt
+    assert "Zero Self-Source Inspection" in sys_prompt
+
+    img_dir = tmp_path / "assets" / "inputs" / "pelle_test"
+    img_dir.mkdir(parents=True)
+
+    # Create 4 landscape 1600x1200 JPEGs tagged with EXIF Orientation=6 (90 deg CW -> upright 1200x1600!)
+    # Named `img_1`, `img_2`, `img_10`, `img_20` to verify natural sort order.
+    exif = Image.Exif()
+    exif[0x0112] = 6  # Orientation = Rotate 90 CW
+    for idx in (10, 2, 20, 1):
+        im = Image.new("RGB", (1600, 1200), color=(20 * idx % 255, 100, 180))
+        im.save(img_dir / f"img_{idx}.jpeg", format="JPEG", quality=92, exif=exif.tobytes())
+
+    discovered = discover_image_files(images_path=img_dir)
+    assert [p.name for p in discovered] == [
+        "img_1.jpeg",
+        "img_2.jpeg",
+        "img_10.jpeg",
+        "img_20.jpeg",
+    ]
+
+    ext_cfg = ExtractConfig(max_frames=10, max_width=800, quality=92, fps=8.0)
+    tar_bytes = pack_images_tar_gz(discovered, ext_cfg)
+    assert len(tar_bytes) > 200
+
+    unpack_dir = tmp_path / "unpacked" / "frames"
+    frames, pts_map, meta, has_alpha = unpack_images_bundle(tar_bytes, unpack_dir, ext_cfg)
+    assert len(frames) == 4
+    assert has_alpha is False
+    # Raw 1600x1200 + EXIF 6 -> 1200x1600 -> scaled to max_width=800 on long edge -> 600x800!
+    assert (meta["width"], meta["height"]) == (600, 800)
+    assert [f.name for f in frames] == ["img_1.jpg", "img_2.jpg", "img_10.jpg", "img_20.jpg"]
+    assert len(pts_map) == 4
+
+    sandbox = Sandbox(cwd=tmp_path)
+    journal = Journal(tmp_path / ".bb_journal")
+
+    # Passing a folder to `splat.from_video` directs the agent straight to `splat.from_images`
+    vid_dir_errs = plan_batch(
+        [OpCall(index=0, op="splat.from_video", params={"video_path": "assets/inputs/pelle_test"})],
+        sandbox=sandbox,
+        has_transport=False,
+        role="builder",
+    )
+    assert len(vid_dir_errs) == 1
+    assert "splat.from_images" in vid_dir_errs[0]["message"]
+
+    # `splat.from_images` passes planning without needing Blender connected (unless auto_import)
+    img_errs = plan_batch(
+        [
+            OpCall(
+                index=0,
+                op="splat.from_images",
+                params={"images_path": "assets/inputs/pelle_test", "job_id": "pelle_imgs"},
+            )
+        ],
+        sandbox=sandbox,
+        has_transport=False,
+        role="builder",
+    )
+    assert img_errs == []
+
+    # Verify `run_modal_splat_job` binds `with_options(timeout=...)` from `Config.modal_worker_timeout`
+    # and streams `images_tar_gz` cleanly through `execute_batch`.
+    seen_timeouts: list[int] = []
+    seen_kwargs: list[dict[str, Any]] = []
+
+    class _FakeBoundCls:
+        def __call__(self) -> Any:
+            return self
+
+        @property
+        def run_stream(self) -> Any:
+            return self
+
+        def remote_gen(self, **kwargs: Any):
+            seen_kwargs.append(kwargs)
+            yield {"event": "stage", "stage": "extract", "source": "images", "frames": 4}
+            yield {
+                "event": "done",
+                "burst_id": 1,
+                "step": 2500,
+                "n_gaussians": 42000,
+                "device": "NVIDIA H100 80GB HBM3",
+                "cost_usd": 0.042,
+                "macro_timings": {"extract_s": 0.2, "pose_s": 1.8, "train_s": 22.0},
+                "ply_gz": gzip.compress(b"ply\nformat ascii 1.0\nelement vertex 0\nend_header\n"),
+                "splat_gz": gzip.compress(b"\x00" * 32),
+                "cameras_json": json.dumps({"job_id": kwargs["job_id"], "cameras": []}),
+            }
+
+    class _FakeModalCls:
+        def with_options(self, **opts: Any) -> _FakeBoundCls:
+            seen_timeouts.append(int(opts["timeout"]))
+            return _FakeBoundCls()
+
+    home_dir = tmp_path / "bb_home"
+    home_dir.mkdir()
+    cfg = load_config(cwd=tmp_path, home=home_dir, environ={"MODAL_WORKER_TIMEOUT": "1850"})
+
+    with patch("modal.Cls.from_name", return_value=_FakeModalCls()):
+        outcome = await execute_batch(
+            [
+                OpCall(
+                    index=0,
+                    op="splat.from_images",
+                    params={
+                        "images_path": "assets/inputs/pelle_test",
+                        "job_id": "pelle_imgs",
+                        "iterations": 2500,
+                        "max_width": 800,
+                    },
+                )
+            ],
+            sandbox=sandbox,
+            journal=journal,
+            transport=None,
+            cfg=cfg,
+            role="builder",
+        )
+
+    assert outcome.status == "ok", outcome.errors
+    assert seen_timeouts == [1850]
+    assert len(seen_kwargs) == 1
+    assert seen_kwargs[0]["mp4_bytes"] is None
+    assert isinstance(seen_kwargs[0]["images_tar_gz"], bytes) and len(seen_kwargs[0]["images_tar_gz"]) > 200
+    assert (tmp_path / "assets" / "splats" / "pelle_imgs" / "splat.ply").is_file()
+
+    # Also verify timeout error message surfaces `MODAL_WORKER_TIMEOUT`
+    class _TimeoutCls:
+        def with_options(self, **opts: Any) -> Any:
+            return self
+
+        def __call__(self) -> Any:
+            return self
+
+        @property
+        def run_stream(self) -> Any:
+            return self
+
+        def remote_gen(self, **_kwargs: Any):
+            raise TimeoutError("Task's current input in-01ABC hit its timeout of 1200s")
+            yield  # pragma: no cover
+
+    with (
+        patch("modal.Cls.from_name", return_value=_TimeoutCls()),
+        pytest.raises(RuntimeError, match="MODAL_WORKER_TIMEOUT=1200s"),
+    ):
+        await run_modal_splat_job(
+            output_dir=tmp_path / "assets" / "splats" / "t_err",
+            job_id="t_err",
+            images_path=img_dir,
+            timeout_sec=1200,
+        )

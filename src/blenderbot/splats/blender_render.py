@@ -531,15 +531,27 @@ async def _run_single_modal_shard(
     eff_gpu: str,
     blend_payload: bytes,
     shard_spec: dict[str, Any],
+    timeout_sec: int | None = None,
     on_shard_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     import modal
+
+    from blenderbot.config.env import resolve_modal_worker_timeout
+
+    eff_timeout = (
+        max(1, int(timeout_sec))
+        if timeout_sec is not None and timeout_sec > 0
+        else resolve_modal_worker_timeout(default=1800)
+    )
 
     q: queue.Queue[tuple[str, Any]] = queue.Queue()
 
     def _producer() -> None:
         try:
             worker_cls = modal.Cls.from_name("blenderbot-splat", cls_name)
+            with_opts = getattr(worker_cls, "with_options", None)
+            if callable(with_opts):
+                worker_cls = with_opts(timeout=eff_timeout)
             worker = worker_cls()
             gen = worker.render_stream.remote_gen(
                 blend_gz=blend_payload,
@@ -599,6 +611,7 @@ async def run_modal_blender_render(
     scene: str | None = None,
     quality: str = "HIGH",
     shards: int | None = None,
+    timeout_sec: float | None = None,
     on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> ModalBlenderRenderResult:
     """Upload `.blend` to Modal H100/L40S (parallelizing multi-frame animations across GPU shards!)."""
@@ -660,12 +673,19 @@ async def run_modal_blender_render(
         total_expected = 1
         eff_shards = 1
 
+    eff_timeout_int = (
+        max(1, round(float(timeout_sec)))
+        if timeout_sec is not None and float(timeout_sec) > 0
+        else None
+    )
+
     if len(ranges) == 1:
         done_ev = await _run_single_modal_shard(
             cls_name=cls_name,
             eff_gpu=eff_gpu,
             blend_payload=blend_payload,
             shard_spec=base_spec,
+            timeout_sec=eff_timeout_int,
             on_shard_event=on_event,
         )
         out_bytes = gzip.decompress(done_ev["output_gz"])
@@ -754,6 +774,7 @@ async def run_modal_blender_render(
                 eff_gpu=eff_gpu,
                 blend_payload=blend_payload,
                 shard_spec=s_spec,
+                timeout_sec=eff_timeout_int,
                 on_shard_event=_make_shard_cb(idx),
             )
         )

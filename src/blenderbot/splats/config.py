@@ -18,6 +18,7 @@ class ExtractConfig:
 @dataclass
 class PoseConfig:
     backend: str = "vggt"          # "vggt" | "colmap" | "colmap_prior" (Blender K + Sim3 nudge) | "known_cameras" (hard lock)
+    matcher: str = "auto"          # "auto" (exhaustive for <=80 photos, sequential for video) | "exhaustive" | "sequential"
     vggt_max_frames: int = 64      # VGGT attention batch; remaining frames interpolated or sub-batched
     conf_percentile: float = 35.0  # drop lowest N% confidence VGGT points on init
     max_init_points: int = 180_000
@@ -94,6 +95,7 @@ class SurgerySpec:
 # automatically route into the right sub-config without requiring nested dicts.
 _FLAT_KEY_ALIASES: dict[str, tuple[str, str]] = {
     "pose_backend": ("pose", "backend"),
+    "colmap_matcher": ("pose", "matcher"),
 }
 
 

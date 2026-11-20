@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>blenderbot · 3D Studio, Seedance 2.5, Seedream 5.5 &amp; FPS Splat Editor</title>
   <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
-  <link rel="stylesheet" href="/assets/app.css" />
+  <link rel="stylesheet" href="/assets/app.css?v=meshy71" />
 </head>
 <body>
   <!-- TOP WORKBENCH TITLE / COMMAND BAR -->
@@ -30,6 +30,7 @@
       <button id="btn-cap-playblast" type="button" class="btn btn-secondary btn-sm" title="Render EEVEE MP4 playblast from Blender 5.3">🎞 Playblast</button>
       <button id="pill-blender" type="button" class="pill pill-btn pill-muted" title="Click to connect or hot-swap onto live Blender 5.3">Blender: checking…</button>
       <button id="btn-or-key" type="button" class="pill pill-btn" title="Configure OpenRouter API key">OpenRouter: checking…</button>
+      <button id="btn-fal-key" type="button" class="pill pill-btn" title="Configure fal API key for Meshy 7.1 Image-to-3D">fal: checking…</button>
       <span id="pill-health" class="pill pill-ok" title="Agent context health">Health: healthy</span>
       <span id="pill-cost" class="pill pill-muted" title="Accumulated session spend">$0.0000</span>
       <button id="btn-topbar-agent" type="button" class="btn btn-ghost btn-sm panel-toggle-btn" title="Show/Hide Agent Co-Pilot Chat Drawer (Ctrl+J)">🤖 Chat <span id="topbar-agent-dot" class="agent-live-dot hidden"></span></button>
@@ -43,6 +44,15 @@
       <input id="input-or-key" type="password" placeholder="sk-or-v1-…" autocomplete="off" />
       <button id="btn-save-key" type="button" class="btn btn-primary btn-sm">Save Key</button>
       <button id="btn-close-key" type="button" class="btn btn-ghost btn-sm">Cancel</button>
+    </div>
+  </div>
+
+  <div id="fal-key-drawer" class="key-drawer hidden">
+    <div class="key-drawer-inner">
+      <label for="input-fal-key"><strong>FAL_KEY</strong> (saved to <code>~/.blenderbot/.env</code> · <a href="https://fal.ai/dashboard/usage-billing/credits" target="_blank" rel="noopener">fal credits</a>):</label>
+      <input id="input-fal-key" type="password" placeholder="key_id:key_secret…" autocomplete="off" />
+      <button id="btn-save-fal-key" type="button" class="btn btn-primary btn-sm">Save Key</button>
+      <button id="btn-close-fal-key" type="button" class="btn btn-ghost btn-sm">Cancel</button>
     </div>
   </div>
 
@@ -69,8 +79,8 @@
       <div class="pane-header explorer-header">
         <h2 class="vsc-pane-title" title="Scene &amp; Workspace Hierarchy">EXPLORER</h2>
         <div class="header-actions">
-          <button id="btn-upload-trigger" type="button" class="icon-action-btn accent-icon" title="Upload images, videos, audio, or .ply/.splat splats">+ Upload</button>
-          <input id="file-upload-input" type="file" multiple accept="image/*,video/*,audio/*,.ply,.splat" class="hidden" />
+          <button id="btn-upload-trigger" type="button" class="icon-action-btn accent-icon" title="Upload images, videos, audio, .glb meshes, or .ply/.splat splats">+ Upload</button>
+          <input id="file-upload-input" type="file" multiple accept="image/*,video/*,audio/*,.glb,.ply,.splat" class="hidden" />
           <button id="btn-refresh-media" type="button" class="icon-action-btn" title="Refresh Workspace Explorer">↻</button>
           <button id="btn-collapse-all-tree" type="button" class="icon-action-btn" title="Collapse / Expand All Folders in Explorer">⊟</button>
           <button id="btn-close-left" type="button" class="icon-action-btn" title="Hide Explorer Sidebar (Ctrl+B)">«</button>
@@ -269,14 +279,17 @@
           <button id="btn-3d-to-first" type="button" class="btn btn-secondary btn-sm" title="Capture clean perspective PNG from current 3D angle into Seedance First Frame">📸 View → 1st Frame</button>
           <button id="btn-3d-to-last" type="button" class="btn btn-secondary btn-sm" title="Capture clean perspective PNG from current 3D angle into Seedance Last Frame">📸 View → Last Frame</button>
           <button id="btn-3d-to-seedream" type="button" class="btn btn-secondary btn-sm" title="Capture current 3D angle as a Seedream 5.5 Reference Image">🎨 View → Seedream</button>
+          <button id="btn-3d-to-meshy" type="button" class="btn btn-secondary btn-sm" title="Capture current 3D angle as a Meshy 7.1 Image-to-3D Input">🧊 View → Meshy 3D</button>
           <button id="btn-stage-save-splat" type="button" class="btn btn-primary btn-sm" title="Save culled/edited Gaussians to .ply + .splat (Ctrl+S)">💾 Save Splat</button>
-          <button id="btn-stage-import-bl" type="button" class="btn btn-secondary btn-sm" title="Import active Splat .ply + Cameras into Blender 5.3">📥 Import → Blender</button>
+          <button id="btn-stage-import-bl" type="button" class="btn btn-secondary btn-sm" title="Import active 3D Mesh (.glb) or Splat (.ply + Cameras) into Blender 5.3">📥 Import → Blender</button>
+          <a id="link-stage-download-glb" class="btn btn-ghost btn-sm hidden" download>⬇ .glb</a>
         </div>
 
         <div id="stage-media-btns" class="theater-btns hidden">
           <button id="btn-stage-use-first" type="button" class="btn btn-secondary btn-sm hidden">Set 1st Frame</button>
           <button id="btn-stage-use-last" type="button" class="btn btn-secondary btn-sm hidden">Set Last Frame</button>
           <button id="btn-stage-use-sr" type="button" class="btn btn-secondary btn-sm hidden">🎨 +Seedream Ref</button>
+          <button id="btn-stage-use-meshy" type="button" class="btn btn-primary btn-sm hidden" title="Send image to Meshy 7.1 Image-to-3D (fal API)">🧊 → Meshy 3D</button>
           <button id="btn-stage-use-vid" type="button" class="btn btn-secondary btn-sm hidden">Set Video 1</button>
           <button id="btn-stage-ref-vid" type="button" class="btn btn-secondary btn-sm hidden">Set Video 2</button>
           <button id="btn-stage-to-splat" type="button" class="btn btn-primary btn-sm hidden">🌐 Train 3D Splat</button>
@@ -336,6 +349,7 @@
         <div class="studio-mode-tabs" role="tablist" aria-label="Inspector Mode">
           <button id="tab-mode-seedance" class="studio-mode-btn active" type="button" title="Seedance 2.5 Composer">🎬 Seedance</button>
           <button id="tab-mode-seedream" class="studio-mode-btn" type="button" title="Seedream 5.5 Image Generator">🎨 Seedream</button>
+          <button id="tab-mode-meshy" class="studio-mode-btn" type="button" title="Meshy 7.1 Image-to-3D Studio (fal API)">🧊 Meshy 3D</button>
           <button id="tab-mode-fps" class="studio-mode-btn" type="button" title="FPS Camera Pose, Splat Culling &amp; Cloud 3DGS">✂️ FPS &amp; Splat</button>
           <button id="tab-mode-copilot" class="studio-mode-btn" type="button" title="Generation &amp; Cloud Job Queue">📋 Jobs <span id="badge-jobs-cnt" class="tab-cnt hidden">0</span></button>
         </div>
@@ -651,6 +665,197 @@
       </div>
 
       <!-- =========================================================
+           TAB 2.5: Meshy 7.1 Image-to-3D Studio (`meshy/v7.1/image-to-3d` via fal Queue API)
+           ========================================================= -->
+      <div id="panel-meshy-composer" class="composer-scroll hidden" aria-label="Meshy 7.1 Image-to-3D Composer">
+        <details class="insp-section" id="sec-meshy-input" open>
+          <summary class="insp-section-head">
+            <span class="insp-sec-title"><span class="sec-chev">▸</span> 🧊 Meshy 7.1 Image → 3D (<code>fal.ai</code>)</span>
+            <span class="sec-meta-pill">meshy/v7.1</span>
+          </summary>
+          <div class="insp-section-body">
+            <!-- Input Image Slot + Optional Texture Guide Image Slot -->
+            <div class="frames-grid">
+              <div class="frame-slot" id="slot-meshy-img" title="Click card to display Meshy Input Image in Center Stage">
+                <div class="frame-slot-head">
+                  <span>Input Image *</span>
+                  <div class="slot-head-btns">
+                    <button id="btn-meshy-grab3d" type="button" class="mini-tag-btn" title="Capture current Center 3D View as Input Image">📸 3D</button>
+                    <button id="btn-clear-meshy-img" type="button" class="icon-x hidden" title="Clear Input Image">✕</button>
+                  </div>
+                </div>
+                <div class="frame-slot-body" id="slot-meshy-img-body">
+                  <span class="empty-placeholder">Click <b>🧊 3D</b> on any image or <b>📸 3D</b></span>
+                </div>
+              </div>
+
+              <div class="frame-slot" id="slot-meshy-teximg" title="Optional 2D reference image to guide texturing">
+                <div class="frame-slot-head">
+                  <span>Texture Image</span>
+                  <div class="slot-head-btns">
+                    <button id="btn-clear-meshy-teximg" type="button" class="icon-x hidden" title="Clear Texture Image">✕</button>
+                  </div>
+                </div>
+                <div class="frame-slot-body" id="slot-meshy-teximg-body">
+                  <span class="empty-placeholder">Optional front texture guide</span>
+                </div>
+              </div>
+            </div>
+
+            <div class="params-grid">
+              <label class="field">
+                <span>Topology</span>
+                <select id="sel-meshy-topology">
+                  <option value="triangle" selected>triangle (detailed)</option>
+                  <option value="quad">quad (smooth)</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Target Polycount</span>
+                <input id="inp-meshy-polycount" type="number" min="100" max="300000" step="1000" value="30000" />
+              </label>
+              <label class="field">
+                <span>Symmetry</span>
+                <select id="sel-meshy-symmetry">
+                  <option value="auto" selected>auto</option>
+                  <option value="on">on</option>
+                  <option value="off">off</option>
+                </select>
+              </label>
+              <label class="field">
+                <span>Geometry Res</span>
+                <select id="sel-meshy-geomres">
+                  <option value="" selected>default (standard)</option>
+                  <option value="standard">standard</option>
+                  <option value="2k">2k</option>
+                  <option value="4k">4k (Meshy 7.1)</option>
+                </select>
+              </label>
+            </div>
+
+            <div class="toggles-row">
+              <label><input type="checkbox" id="chk-meshy-remesh" checked /> Remesh</label>
+              <label><input type="checkbox" id="chk-meshy-texture" checked /> Texture (+$0.40)</label>
+              <label><input type="checkbox" id="chk-meshy-pbr" /> PBR Maps</label>
+              <label><input type="checkbox" id="chk-meshy-autoimport" checked /> Auto-import → Blender</label>
+            </div>
+
+            <div class="submit-bar">
+              <div class="est-cost" id="meshy-est-cost-label">$1.20 USD</div>
+              <button id="btn-generate-meshy" type="button" class="btn btn-accent btn-lg">✦ Generate 3D (.glb)</button>
+            </div>
+
+            <!-- Live Meshy Queue Progress Card -->
+            <div id="meshy-live-card" class="splat-live-card hidden">
+              <div class="splat-live-head">
+                <span id="meshy-live-title">Queued on fal…</span>
+                <span id="meshy-live-stage" class="splat-metrics-pill">IN_QUEUE</span>
+              </div>
+              <div id="meshy-live-logs" class="wb-lbl" style="font-family:var(--mono);font-size:11px;max-height:54px;overflow-y:auto;"></div>
+            </div>
+
+            <!-- Additional Options: Texturing, Pose, Rigging & Animation -->
+            <details class="insp-more" id="more-meshy-advanced">
+              <summary class="insp-more-head">
+                <span><span class="sec-chev">▸</span> Texturing, Pose, Auto-Rigging &amp; Animation</span>
+              </summary>
+              <div class="insp-more-body">
+                <div class="params-grid">
+                  <label class="field">
+                    <span>Texture Model</span>
+                    <select id="sel-meshy-texmodel">
+                      <option value="" selected>endpoint default</option>
+                      <option value="meshy-7">meshy-7</option>
+                      <option value="meshy-n1">meshy-n1 (2K ref-only)</option>
+                      <option value="meshy-6-lite">meshy-6-lite</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Pose Mode</span>
+                    <select id="sel-meshy-pose">
+                      <option value="" selected>none (as-is)</option>
+                      <option value="a-pose">a-pose</option>
+                      <option value="t-pose">t-pose</option>
+                    </select>
+                  </label>
+                </div>
+
+                <label class="field">
+                  <span>Texture Prompt (optional, max 800 chars)</span>
+                  <textarea
+                    id="inp-meshy-texprompt"
+                    class="prompt-textarea"
+                    rows="2"
+                    maxlength="800"
+                    placeholder="Optional material/surface texture guidance…"
+                  ></textarea>
+                </label>
+
+                <div class="toggles-row">
+                  <label><input type="checkbox" id="chk-meshy-rig" /> Auto-Rig Humanoid (+$0.20)</label>
+                  <label><input type="checkbox" id="chk-meshy-fingers" /> Rig Fingers</label>
+                  <label><input type="checkbox" id="chk-meshy-anim" /> Animation (+$0.12)</label>
+                </div>
+
+                <div id="meshy-rig-opts" class="params-grid hidden">
+                  <label class="field">
+                    <span>Skeleton Template</span>
+                    <select id="sel-meshy-skeleton">
+                      <option value="" selected>meshyrig (default)</option>
+                      <option value="blender_rigify_basic_human">blender_rigify_basic_human</option>
+                      <option value="mixamo">mixamo</option>
+                      <option value="ue5_mannequin">ue5_mannequin</option>
+                      <option value="unity_humanoid">unity_humanoid</option>
+                      <option value="maya_human_ik">maya_human_ik</option>
+                      <option value="max_biped">max_biped</option>
+                      <option value="cc5_hd_neutral_base">cc5_hd_neutral_base</option>
+                      <option value="daz_genesis9">daz_genesis9</option>
+                    </select>
+                  </label>
+                  <label class="field">
+                    <span>Height (m)</span>
+                    <input id="inp-meshy-height" type="number" step="0.05" min="0.2" max="10" value="1.7" />
+                  </label>
+                  <label class="field">
+                    <span>Anim Action ID (0–696)</span>
+                    <input id="inp-meshy-animid" type="number" min="0" max="696" step="1" value="92" />
+                  </label>
+                  <label class="field">
+                    <span>Safety Checker</span>
+                    <select id="sel-meshy-safety">
+                      <option value="true" selected>enabled</option>
+                      <option value="false">disabled</option>
+                    </select>
+                  </label>
+                </div>
+              </div>
+            </details>
+
+            <details class="insp-more inspector-details" id="more-meshy-payload">
+              <summary class="insp-more-head">
+                <span><span class="sec-chev">▸</span> 📡 Outbound <code>meshy/v7.1/image-to-3d</code> Summary</span>
+                <span id="meshy-inspector-cost" class="wb-mono">$1.20</span>
+              </summary>
+              <div id="meshy-inspector-body" class="inspector-body"></div>
+            </details>
+          </div>
+        </details>
+
+        <!-- Generated Meshy 3D Assets List -->
+        <details class="insp-section" id="sec-meshy-assets" open>
+          <summary class="insp-section-head">
+            <span class="insp-sec-title"><span class="sec-chev">▸</span> Generated 3D Meshes (<code>assets/meshy</code>)</span>
+            <span id="badge-meshy-cnt" class="sec-meta-pill">0</span>
+          </summary>
+          <div class="insp-section-body">
+            <div id="meshy-assets-list" class="jobs-list">
+              <div class="empty-placeholder">No Meshy 3D meshes yet — select an Input Image above or drop a <code>.glb</code> file.</div>
+            </div>
+          </div>
+        </details>
+      </div>
+
+      <!-- =========================================================
            TAB 3: FPS Camera, Splat Culling/Editing & Cloud 3DGS Trainer
            ========================================================= -->
       <div id="panel-fps-splat" class="composer-scroll hidden" aria-label="FPS &amp; Splat Inspector">
@@ -891,6 +1096,7 @@
           <div class="insp-section-body drawer-body">
             <div class="mode-pills" id="splat-source-pills">
               <button type="button" class="mode-pill active" data-src="video">🎬 From Video</button>
+              <button type="button" class="mode-pill" data-src="images">🖼️ From Images</button>
               <button type="button" class="mode-pill" data-src="blender">🧊 From Blender 5.3</button>
             </div>
 
@@ -898,6 +1104,16 @@
               <select id="sel-splat-video" class="video-picker-select">
                 <option value="">— Select workspace video —</option>
               </select>
+            </div>
+
+            <div id="splat-src-images-box" class="cond-video-card hidden">
+              <select id="sel-splat-images-dir" class="video-picker-select">
+                <option value="">— Select workspace image folder —</option>
+              </select>
+              <input id="inp-splat-images-path" type="text" placeholder="or folder path (e.g. assets/inputs/pelle)" />
+            </div>
+
+            <div id="splat-src-cam-prior-box" class="cond-video-card">
               <select id="sel-splat-known-cams" class="video-picker-select">
                 <option value="">— Auto Solve Poses (VGGT / COLMAP) —</option>
                 <option value="__blender_active__">🎥 Active Blender Camera Prior</option>
@@ -1052,6 +1268,6 @@
     </button>
   </main>
 
-  <script src="/assets/app.js"></script>
+  <script src="/assets/app.js?v=meshy71"></script>
 </body>
 </html>

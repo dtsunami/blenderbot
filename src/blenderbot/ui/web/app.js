@@ -7,12 +7,26 @@
     window.location.hash === "#fps" ||
     !!initialSceneParam;
 
-  const token = urlParams.get("token") || sessionStorage.getItem("bb_token") || "";
+  let token =
+    urlParams.get("token") ||
+    sessionStorage.getItem("bb_token") ||
+    localStorage.getItem("bb_token") ||
+    "";
   if (urlParams.get("token")) {
-    sessionStorage.setItem("bb_token", token);
+    try { sessionStorage.setItem("bb_token", token); } catch (_e) {}
+    try { localStorage.setItem("bb_token", token); } catch (_e) {}
     urlParams.delete("token");
     const cleanQ = urlParams.toString();
-    window.history.replaceState({}, "", window.location.pathname + (cleanQ ? `?${cleanQ}` : ""));
+    window.history.replaceState({}, "", window.location.pathname + (cleanQ ? `?${cleanQ}` : "") + (window.location.hash || ""));
+  } else if (token) {
+    try { sessionStorage.setItem("bb_token", token); } catch (_e) {}
+    try { localStorage.setItem("bb_token", token); } catch (_e) {}
+  }
+
+  function setActiveToken(newTok) {
+    token = String(newTok || "").trim();
+    try { sessionStorage.setItem("bb_token", token); } catch (_e) {}
+    try { localStorage.setItem("bb_token", token); } catch (_e) {}
   }
 
   function withTokenUrl(rawUrl) {
@@ -21,6 +35,7 @@
     return `${rawUrl}${sep}token=${encodeURIComponent(token)}`;
   }
 
+  let authWarnShown = false;
   async function apiFetch(path, opts = {}) {
     const headers = Object.assign({}, opts.headers || {});
     if (token) headers["Authorization"] = `Bearer ${token}`;
@@ -30,7 +45,16 @@
     }
     const resp = await fetch(path, Object.assign({}, opts, { headers }));
     const data = await resp.json().catch(() => ({}));
+    if (resp.status === 401 && !authWarnShown) {
+      authWarnShown = true;
+      const fb = el("btn-fal-key");
+      if (fb) { fb.textContent = "Session: Auth Needed"; fb.className = "pill pill-btn pill-err"; }
+      const ob = el("btn-or-key");
+      if (ob) { ob.textContent = "Run /web in REPL"; ob.className = "pill pill-btn pill-warn"; }
+      showToast("Web session token missing or expired — run /web or /meshy in blenderbot REPL to open an authenticated tab.", true);
+    }
     if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+    authWarnShown = false;
     return data;
   }
 
@@ -133,20 +157,25 @@
     centerKind: "3d", // "3d" | "media" | "compare"
     active3DId: "__courtyard__",
     activeSplatJob: null,
+    activeMeshyJob: null,
     stageItem: null,
 
-    // Right Inspector Tab: "seedance" | "seedream" | "fps" | "copilot"
+    // Right Inspector Tab: "seedance" | "seedream" | "meshy" | "fps" | "copilot"
     inspectorTab:
       bootInFps || window.location.hash === "#splat"
         ? "fps"
+        : window.location.hash === "#meshy"
+        ? "meshy"
         : window.location.hash === "#seedream"
         ? "seedream"
         : "seedance",
 
-    // Seedance & Seedream Conditioning
+    // Seedance, Seedream & Meshy Conditioning
     mode: "standard",
     seedreamMode: "standard",
     seedreamRefs: [],
+    meshyInputImage: null,
+    meshyTextureImage: null,
     costPerSec: 0.1028,
     sourceVideo: null,
     sourceVideoProbe: null,
@@ -159,9 +188,10 @@
     refImages: [],
     refAudio: null,
 
-    // Jobs, Splats & Co-Pilot
+    // Jobs, Splats, Meshy & Co-Pilot
     splatSourceMode: "video",
     splatJobs: new Map(),
+    meshyJobs: new Map(),
     jobs: new Map(),
     exportedShots: [],
     promptHistory: JSON.parse(localStorage.getItem("bb_seedance_prompts") || "[]"),
@@ -479,6 +509,7 @@
     const panelMap = {
       seedance: "panel-seedance-composer",
       seedream: "panel-seedream-composer",
+      meshy: "panel-meshy-composer",
       fps: "panel-fps-splat",
       copilot: "panel-copilot-jobs",
     };
@@ -509,24 +540,28 @@
 
   // --- Right Inspector Tabs ---
   function switchInspectorTab(tab) {
-    state.inspectorTab = ["seedance", "seedream", "fps", "copilot"].includes(tab) ? tab : "seedance";
+    state.inspectorTab = ["seedance", "seedream", "meshy", "fps", "copilot"].includes(tab) ? tab : "seedance";
     el("tab-mode-seedance").classList.toggle("active", state.inspectorTab === "seedance");
     el("tab-mode-seedream").classList.toggle("active", state.inspectorTab === "seedream");
+    el("tab-mode-meshy")?.classList.toggle("active", state.inspectorTab === "meshy");
     el("tab-mode-fps").classList.toggle("active", state.inspectorTab === "fps");
     el("tab-mode-copilot").classList.toggle("active", state.inspectorTab === "copilot");
 
     el("panel-seedance-composer").classList.toggle("hidden", state.inspectorTab !== "seedance");
     el("panel-seedream-composer").classList.toggle("hidden", state.inspectorTab !== "seedream");
+    el("panel-meshy-composer")?.classList.toggle("hidden", state.inspectorTab !== "meshy");
     el("panel-fps-splat").classList.toggle("hidden", state.inspectorTab !== "fps");
     el("panel-copilot-jobs").classList.toggle("hidden", state.inspectorTab !== "copilot");
 
     if (state.inspectorTab === "seedream") updateSeedreamInspector();
+    if (state.inspectorTab === "meshy") updateMeshyInspector();
     if (state.inspectorTab === "seedance") updatePricingAndInspector();
     renderHierarchyTree();
   }
 
   el("tab-mode-seedance").addEventListener("click", () => switchInspectorTab("seedance"));
   el("tab-mode-seedream").addEventListener("click", () => switchInspectorTab("seedream"));
+  el("tab-mode-meshy")?.addEventListener("click", () => switchInspectorTab("meshy"));
   el("tab-mode-fps").addEventListener("click", () => switchInspectorTab("fps"));
   el("tab-mode-copilot").addEventListener("click", () => switchInspectorTab("copilot"));
 
@@ -670,6 +705,8 @@
     if (state.firstFrame && state.firstFrame.path === it.path) roles.push({ label: "1ST", full: "1ST FRAME", primary: false });
     if (state.lastFrame && state.lastFrame.path === it.path) roles.push({ label: "LAST", full: "LAST FRAME", primary: false });
     if (state.seedreamRefs.some((r) => r.path === it.path)) roles.push({ label: "SR", full: "SEEDREAM REF", primary: state.inspectorTab === "seedream" });
+    if (state.meshyInputImage && state.meshyInputImage.path === it.path) roles.push({ label: "3D", full: "MESHY INPUT", primary: state.inspectorTab === "meshy" });
+    if (state.meshyTextureImage && state.meshyTextureImage.path === it.path) roles.push({ label: "TEX", full: "MESHY TEXTURE", primary: false });
     if (state.refImages.some((r) => r.path === it.path)) roles.push({ label: "+REF", full: "+REF", primary: false });
     if (state.refVideos.some((v) => v.path === it.path)) roles.push({ label: "+VID", full: "+REF VID", primary: false });
     if (state.refAudio && state.refAudio.path === it.path) roles.push({ label: "AUD", full: "AUDIO", primary: false });
@@ -687,6 +724,7 @@
   function folderSemanticIcon(segName, isOpen) {
     const low = segName.toLowerCase();
     if (low === "splats") return "🌐";
+    if (low === "meshy") return "🧊";
     if (low === "seedance") return "🎬";
     if (low === "seedream") return "🎨";
     if (low === "renders") return "🖼";
@@ -697,12 +735,13 @@
   function folderSortRank(segName) {
     const low = segName.toLowerCase();
     if (low === "assets") return 1;
-    if (low === "splats") return 2;
-    if (low === "seedance") return 3;
-    if (low === "seedream") return 4;
-    if (low === "renders") return 5;
-    if (low === "shots") return 6;
-    if (low === "inputs") return 7;
+    if (low === "meshy") return 2;
+    if (low === "splats") return 3;
+    if (low === "seedance") return 4;
+    if (low === "seedream") return 5;
+    if (low === "renders") return 6;
+    if (low === "shots") return 7;
+    if (low === "inputs") return 8;
     return 10;
   }
 
@@ -843,6 +882,20 @@
         }
         insertLeafAtFolder(folder, { leafType: "splat", job: j });
       });
+
+      const meshys = Array.from(state.meshyJobs.values())
+        .filter((m) => m.stage === "completed" && (!q || m.job_id.toLowerCase().includes(q) || String(m.prompt || "").toLowerCase().includes(q)))
+        .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+
+      meshys.forEach((m) => {
+        let folder = "assets/meshy";
+        if (m.output_rel && m.output_rel.includes("/")) {
+          const parts = m.output_rel.replace(/\\/g, "/").split("/");
+          if (parts.length >= 3) folder = parts.slice(0, -2).join("/");
+          else folder = parts.slice(0, -1).join("/");
+        }
+        insertLeafAtFolder(folder, { leafType: "meshy", job: m });
+      });
     }
 
     // Add Workspace Media (Videos, Images, Audio) into their nested folder paths
@@ -856,6 +909,65 @@
     }
 
     const renderLeafRow = (entry, depth) => {
+      if (entry.leafType === "meshy") {
+        const m = entry.job;
+        const row = document.createElement("div");
+        const sceneKey = `meshy:${m.job_id}`;
+        const isAct = state.centerKind === "3d" && state.active3DId === sceneKey;
+        row.className = `vsc-tree-row tree-item${isAct ? " active-stage" : ""}`;
+        row.tabIndex = 0;
+        row.setAttribute("role", "treeitem");
+
+        const subLbl = m.triangles_total
+          ? `${(m.triangles_total / 1000).toFixed(1)}k tris`
+          : "GLB";
+        const iconHtml = m.thumbnail_url
+          ? `<span class="vsc-node-icon has-thumb"><img src="${withTokenUrl(m.thumbnail_url)}" loading="lazy" alt="" /></span>`
+          : `<span class="vsc-node-icon">🧊</span>`;
+
+        row.innerHTML = `
+          ${makeIndentGuidesHtml(depth)}
+          <span class="vsc-twistie spacer">·</span>
+          ${iconHtml}
+          <span class="vsc-label-wrap">
+            <span class="tree-name" title="${escapeHtml(m.job_id)}">${escapeHtml(m.job_id)}</span>
+          </span>
+          <span class="tree-sub">${escapeHtml(subLbl)}</span>
+          <span class="tree-quick-btns"></span>
+        `;
+
+        const qBtns = row.querySelector(".tree-quick-btns");
+        const mkBtn = (lbl, title, fn) => {
+          const b = document.createElement("button");
+          b.type = "button";
+          b.textContent = lbl;
+          if (title) b.title = title;
+          b.addEventListener("click", (e) => { e.stopPropagation(); fn(); });
+          qBtns.appendChild(b);
+        };
+        mkBtn("🎮 FPS", "Inspect 3D Mesh in FPS Mode", () => open3DSceneInCenter(sceneKey, true));
+        mkBtn("→ BL", "Import .glb into Blender 5.3", () => importMeshyToBlender(m.job_id));
+
+        row.addEventListener("click", () => open3DSceneInCenter(sceneKey, false));
+        row.addEventListener("mouseenter", () => {
+          const specs = [
+            ["Type", "Meshy 7.1 3D Mesh (.glb)"],
+            ["Triangles", Number(m.triangles_total || 0).toLocaleString()],
+          ];
+          if (m.request_id) specs.push(["fal Request", String(m.request_id)]);
+          if (m.cost_usd) specs.push(["Est. Cost", `$${Number(m.cost_usd).toFixed(2)}`]);
+          showHoverTooltip(row, {
+            imageUrl: m.thumbnail_url ? withTokenUrl(m.thumbnail_url) : null,
+            glyph: "🧊",
+            title: m.job_id,
+            path: m.output_rel || `assets/meshy/${m.job_id}/model.glb`,
+            specs,
+          });
+        });
+        row.addEventListener("mouseleave", hideHoverTooltip);
+        return row;
+      }
+
       if (entry.leafType === "splat") {
         const j = entry.job;
         const row = document.createElement("div");
@@ -979,9 +1091,14 @@
         const is1 = state.firstFrame && state.firstFrame.path === it.path;
         const isL = state.lastFrame && state.lastFrame.path === it.path;
         const isSr = state.seedreamRefs.some((r) => r.path === it.path);
+        const isM3d = state.meshyInputImage && state.meshyInputImage.path === it.path;
         addQ(is1 ? "✓ 1st" : "1st", is1 ? "active-orange" : "", "Set as Seedance First Frame", () => setFirstFrame(it));
         addQ(isL ? "✓ Last" : "Last", isL ? "active-orange" : "", "Set as Seedance Last Frame", () => setLastFrame(it));
         addQ(isSr ? "✓ SR" : "🎨 SR", isSr ? "active-green" : "", "Toggle Seedream Reference", () => toggleSeedreamRef(it));
+        addQ(isM3d ? "✓ 3D" : "🧊 3D", isM3d ? "active-green" : "", "Send to Meshy 7.1 Image-to-3D (Shift+Click sets Texture Guide)", () => {
+          setMeshyInputImage(it);
+          switchInspectorTab("meshy");
+        });
       } else if (it.kind === "video") {
         const isV1 = state.sourceVideo && state.sourceVideo.path === it.path;
         const isV2 = state.sourceVideo2 && state.sourceVideo2.path === it.path;
@@ -1216,6 +1333,7 @@
     el("btn-stage-use-first").classList.toggle("hidden", item.kind !== "image");
     el("btn-stage-use-last").classList.toggle("hidden", item.kind !== "image");
     el("btn-stage-use-sr").classList.toggle("hidden", item.kind !== "image");
+    el("btn-stage-use-meshy")?.classList.toggle("hidden", item.kind !== "image");
     el("btn-stage-use-vid").classList.toggle("hidden", item.kind !== "video");
     el("btn-stage-ref-vid").classList.toggle("hidden", item.kind !== "video");
     el("btn-stage-to-splat").classList.toggle("hidden", item.kind !== "video");
@@ -1233,7 +1351,12 @@
     state.stageItem = null;
     state.active3DId = sceneId || "__courtyard__";
 
-    const splatJob = state.splatJobs.get(state.active3DId) || null;
+    const isMeshy = String(state.active3DId).startsWith("meshy:");
+    const meshyId = isMeshy ? String(state.active3DId).slice(6) : "";
+    const meshyJob = isMeshy ? state.meshyJobs.get(meshyId) || null : null;
+    state.activeMeshyJob = meshyJob;
+
+    const splatJob = !isMeshy ? state.splatJobs.get(state.active3DId) || null : null;
     state.activeSplatJob = splatJob;
 
     el("theater-splat-canvas").classList.remove("hidden");
@@ -1241,11 +1364,25 @@
     el("theater-splat-hud").classList.remove("hidden");
     el("stage-media-btns").classList.add("hidden");
     el("stage-3d-btns").classList.remove("hidden");
+    el("btn-stage-save-splat").classList.toggle("hidden", isMeshy);
+
+    const glbDl = el("link-stage-download-glb");
+    if (glbDl) {
+      if (meshyJob && meshyJob.glb_url) {
+        glbDl.href = `${withTokenUrl(meshyJob.glb_url)}&download=1`;
+        glbDl.download = `${meshyJob.job_id}.glb`;
+        glbDl.classList.remove("hidden");
+      } else {
+        glbDl.classList.add("hidden");
+      }
+    }
 
     const builtIn = BUILTIN_3D_STAGES.find((s) => s.id === state.active3DId);
-    el("stage-kind-badge").textContent = splatJob ? "3DGS SPLAT" : "3D STAGE";
-    el("stage-title").textContent = builtIn ? builtIn.name : state.active3DId;
-    el("theater-meta").textContent = splatJob
+    el("stage-kind-badge").textContent = meshyJob ? "MESHY 3D GLB" : splatJob ? "3DGS SPLAT" : "3D STAGE";
+    el("stage-title").textContent = meshyJob ? meshyJob.job_id : builtIn ? builtIn.name : state.active3DId;
+    el("theater-meta").textContent = meshyJob
+      ? `${Number(meshyJob.triangles_total || 0).toLocaleString()} tris${meshyJob.cost_usd ? ` · $${Number(meshyJob.cost_usd).toFixed(2)}` : ""}`
+      : splatJob
       ? `${Number(splatJob.n_gaussians || 0).toLocaleString()} pts${splatJob.psnr ? ` · ${splatJob.psnr} dB` : ""}`
       : builtIn
       ? builtIn.sub
@@ -1313,6 +1450,12 @@
         updateSeedreamInspector();
         switchInspectorTab("seedream");
         showToast(`🎨 Captured 3D View → Seedream Reference (${item.name})`);
+      } else if (role === "meshy") {
+        state.meshyInputImage = item;
+        renderMeshySlots();
+        updateMeshyInspector();
+        switchInspectorTab("meshy");
+        showToast(`🧊 Captured 3D View → Meshy 7.1 Input (${item.name})`);
       }
       renderHierarchyTree();
     } catch (err) {
@@ -1323,6 +1466,7 @@
   el("btn-3d-to-first").addEventListener("click", () => captureCenter3DIntoRole("first"));
   el("btn-3d-to-last").addEventListener("click", () => captureCenter3DIntoRole("last"));
   el("btn-3d-to-seedream").addEventListener("click", () => captureCenter3DIntoRole("seedream"));
+  el("btn-3d-to-meshy")?.addEventListener("click", () => captureCenter3DIntoRole("meshy"));
   el("btn-grab3d-first").addEventListener("click", (e) => {
     e.stopPropagation();
     if (state.centerKind !== "3d") open3DSceneInCenter(state.active3DId, false).then(() => captureCenter3DIntoRole("first"));
@@ -1337,6 +1481,11 @@
     if (state.centerKind !== "3d") open3DSceneInCenter(state.active3DId, false).then(() => captureCenter3DIntoRole("seedream"));
     else captureCenter3DIntoRole("seedream");
   });
+  el("btn-meshy-grab3d")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (state.centerKind !== "3d") open3DSceneInCenter(state.active3DId, false).then(() => captureCenter3DIntoRole("meshy"));
+    else captureCenter3DIntoRole("meshy");
+  });
 
   // Center Media Action Buttons
   el("btn-stage-use-first").addEventListener("click", () => state.stageItem && setFirstFrame(state.stageItem));
@@ -1345,6 +1494,12 @@
     if (state.stageItem) {
       toggleSeedreamRef(state.stageItem);
       switchInspectorTab("seedream");
+    }
+  });
+  el("btn-stage-use-meshy")?.addEventListener("click", () => {
+    if (state.stageItem) {
+      setMeshyInputImage(state.stageItem, true);
+      switchInspectorTab("meshy");
     }
   });
   el("btn-stage-use-vid").addEventListener("click", () => state.stageItem && setSourceVideo(state.stageItem));
@@ -1360,7 +1515,8 @@
 
   el("btn-stage-save-splat").addEventListener("click", () => window._bbEngine && window._bbEngine.saveSplat(false));
   el("btn-stage-import-bl").addEventListener("click", () => {
-    if (state.activeSplatJob) importSplatToBlender(state.activeSplatJob.job_id);
+    if (state.activeMeshyJob) importMeshyToBlender(state.activeMeshyJob.job_id);
+    else if (state.activeSplatJob) importSplatToBlender(state.activeSplatJob.job_id);
     else if (window._bbEngine) window._bbEngine.saveSplat(true);
   });
 
@@ -1848,6 +2004,274 @@
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); submitSeedream(); }
   });
 
+  // --- Meshy 7.1 Image-to-3D Studio (fal Queue API) ---
+  function setMeshyInputImage(item, forceSet = false) {
+    if (!item) state.meshyInputImage = null;
+    else if (!forceSet && state.meshyInputImage && state.meshyInputImage.path === item.path) state.meshyInputImage = null;
+    else state.meshyInputImage = item;
+    renderMeshySlots();
+    renderHierarchyTree();
+    updateMeshyInspector();
+  }
+
+  function setMeshyTextureImage(item) {
+    state.meshyTextureImage = item && state.meshyTextureImage && state.meshyTextureImage.path === item.path ? null : item;
+    renderMeshySlots();
+    renderHierarchyTree();
+    updateMeshyInspector();
+  }
+
+  function renderMeshySlots() {
+    if (!el("slot-meshy-img")) return;
+    el("btn-clear-meshy-img")?.classList.toggle("hidden", !state.meshyInputImage);
+    el("slot-meshy-img")?.classList.toggle("filled", !!state.meshyInputImage);
+    el("slot-meshy-img-body").innerHTML = state.meshyInputImage
+      ? `<img src="${withTokenUrl(state.meshyInputImage.url)}" alt="meshy-input" /><div class="slot-caption">${escapeHtml(state.meshyInputImage.name)}</div>`
+      : `<span class="empty-placeholder">Click <b>🧊 3D</b> on any image or <b>📸 3D</b></span>`;
+
+    el("btn-clear-meshy-teximg")?.classList.toggle("hidden", !state.meshyTextureImage);
+    el("slot-meshy-teximg")?.classList.toggle("filled", !!state.meshyTextureImage);
+    el("slot-meshy-teximg-body").innerHTML = state.meshyTextureImage
+      ? `<img src="${withTokenUrl(state.meshyTextureImage.url)}" alt="meshy-tex" /><div class="slot-caption">${escapeHtml(state.meshyTextureImage.name)}</div>`
+      : `<span class="empty-placeholder">Optional front texture guide</span>`;
+  }
+
+  el("slot-meshy-img")?.addEventListener("click", () => {
+    if (state.meshyInputImage) openMediaInCenter(state.meshyInputImage);
+  });
+  el("slot-meshy-teximg")?.addEventListener("click", () => {
+    if (state.meshyTextureImage) openMediaInCenter(state.meshyTextureImage);
+    else if (state.stageItem && state.stageItem.kind === "image") setMeshyTextureImage(state.stageItem);
+  });
+  el("btn-clear-meshy-img")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    setMeshyInputImage(null);
+  });
+  el("btn-clear-meshy-teximg")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    setMeshyTextureImage(null);
+  });
+
+  function updateMeshyInspector() {
+    const body = el("meshy-inspector-body");
+    if (!body) return;
+    const texOn = el("chk-meshy-texture")?.checked ?? true;
+    const remeshOn = el("chk-meshy-remesh")?.checked ?? true;
+    let pbrOn = el("chk-meshy-pbr")?.checked ?? false;
+    const texModel = el("sel-meshy-texmodel")?.value || "";
+    let topo = el("sel-meshy-topology")?.value || "triangle";
+
+    // Enforce meshy-n1 schema constraints live in UI
+    if (texOn && texModel === "meshy-n1") {
+      if (pbrOn) {
+        pbrOn = false;
+        if (el("chk-meshy-pbr")) el("chk-meshy-pbr").checked = false;
+      }
+      if (topo === "quad" && remeshOn) {
+        topo = "triangle";
+        if (el("sel-meshy-topology")) el("sel-meshy-topology").value = "triangle";
+      }
+    }
+
+    const rigOn = el("chk-meshy-rig")?.checked ?? false;
+    let animOn = el("chk-meshy-anim")?.checked ?? false;
+    if (animOn && !rigOn) {
+      if (el("chk-meshy-rig")) el("chk-meshy-rig").checked = true;
+    }
+    const effRig = el("chk-meshy-rig")?.checked ?? false;
+    const effAnim = effRig && (el("chk-meshy-anim")?.checked ?? false);
+    el("meshy-rig-opts")?.classList.toggle("hidden", !effRig);
+
+    const estCost = 0.8 + (texOn ? 0.4 : 0.0) + (effRig ? 0.2 : 0.0) + (effAnim ? 0.12 : 0.0);
+    if (el("meshy-est-cost-label")) el("meshy-est-cost-label").textContent = `$${estCost.toFixed(2)} USD`;
+    if (el("meshy-inspector-cost")) el("meshy-inspector-cost").textContent = `$${estCost.toFixed(2)}`;
+
+    const poly = Number(el("inp-meshy-polycount")?.value || 30000);
+    const sym = el("sel-meshy-symmetry")?.value || "auto";
+    const geomRes = el("sel-meshy-geomres")?.value || "standard";
+    const pose = el("sel-meshy-pose")?.value || "";
+    const skel = el("sel-meshy-skeleton")?.value || "meshyrig";
+    const imgLbl = state.meshyInputImage ? state.meshyInputImage.name : "(select input image)";
+
+    body.innerHTML = `
+      <div class="insp-row"><span class="insp-key">endpoint:</span><span class="insp-val">meshy/v7.1/image-to-3d (fal Queue)</span></div>
+      <div class="insp-row"><span class="insp-key">image_url:</span><span class="insp-val ${state.meshyInputImage ? "ok" : ""}">${escapeHtml(imgLbl)}</span></div>
+      <div class="insp-row"><span class="insp-key">geometry:</span><span class="insp-val">${escapeHtml(topo)} · ${poly.toLocaleString()} polys · sym=${escapeHtml(sym)} · res=${escapeHtml(geomRes)}</span></div>
+      <div class="insp-row"><span class="insp-key">shading:</span><span class="insp-val">${texOn ? `textured (${texModel || "default"}${pbrOn ? " + PBR" : ""})` : "untextured mesh ($0.80)"}</span></div>
+      ${effRig ? `<div class="insp-row"><span class="insp-key">rigging:</span><span class="insp-val ok">${escapeHtml(skel)}${pose ? ` · ${escapeHtml(pose)}` : ""}${effAnim ? ` · anim #${el("inp-meshy-animid")?.value || 92}` : ""}</span></div>` : ""}
+    `;
+  }
+
+  [
+    "sel-meshy-topology",
+    "inp-meshy-polycount",
+    "sel-meshy-symmetry",
+    "sel-meshy-geomres",
+    "chk-meshy-remesh",
+    "chk-meshy-texture",
+    "chk-meshy-pbr",
+    "sel-meshy-texmodel",
+    "sel-meshy-pose",
+    "chk-meshy-rig",
+    "chk-meshy-fingers",
+    "chk-meshy-anim",
+    "sel-meshy-skeleton",
+    "inp-meshy-height",
+    "inp-meshy-animid",
+  ].forEach((id) => {
+    el(id)?.addEventListener("change", updateMeshyInspector);
+    el(id)?.addEventListener("input", updateMeshyInspector);
+  });
+
+  async function importMeshyToBlender(jobId, variant = "auto") {
+    showToast(`Importing Meshy '${jobId}' (.glb) into Blender 5.3…`);
+    try {
+      const res = await apiFetch("/api/meshy/import", {
+        method: "POST",
+        json: { job_id: jobId, variant, place_on_ground: true },
+      });
+      const names = (res.imported?.imported_objects || []).join(", ");
+      showToast(`Imported into Blender 5.3: ${names || jobId}`);
+      refreshState();
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  }
+
+  function renderMeshyAssetsList() {
+    const listEl = el("meshy-assets-list");
+    if (!listEl) return;
+    const arr = Array.from(state.meshyJobs.values()).sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+    if (el("badge-meshy-cnt")) el("badge-meshy-cnt").textContent = String(arr.length);
+    if (!arr.length) {
+      listEl.innerHTML = `<div class="empty-placeholder">No Meshy 3D meshes yet — select an Input Image above or drop a <code>.glb</code> file.</div>`;
+      return;
+    }
+    listEl.innerHTML = "";
+    arr.forEach((m) => {
+      const active = !["completed", "failed", "cancelled"].includes(m.stage);
+      const cls = m.stage === "completed" ? "completed" : m.stage === "failed" ? "failed" : active ? "running" : "";
+      const card = document.createElement("div");
+      card.className = `job-card ${cls}`;
+      const costBadge = m.cost_usd ? `<span class="job-cost-pill">$${Number(m.cost_usd).toFixed(2)}</span>` : "";
+      const trisBadge = m.triangles_total ? ` · ${(m.triangles_total / 1000).toFixed(1)}k tris` : "";
+      card.innerHTML = `
+        <div class="job-top">
+          <span>🧊 ${escapeHtml(m.job_id)} · <code>${escapeHtml(m.stage)}</code>${escapeHtml(trisBadge)}</span>
+          <span>
+            ${costBadge}
+            ${m.stage === "completed" ? `<button type="button" class="btn btn-secondary btn-xs btn-imp-meshy" title="Import .glb into Blender 5.3">→ BL</button>` : ""}
+            ${active ? `<button type="button" class="btn btn-ghost btn-xs btn-cancel-meshy">Cancel</button>` : ""}
+          </span>
+        </div>
+        <div class="job-prompt">${escapeHtml(m.error ? "⚠ " + m.error : (m.request_id ? `req: ${m.request_id} · ` : "") + (m.prompt || m.output_rel))}</div>
+      `;
+      card.querySelector(".btn-imp-meshy")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        importMeshyToBlender(m.job_id);
+      });
+      card.querySelector(".btn-cancel-meshy")?.addEventListener("click", (e) => {
+        e.stopPropagation();
+        apiFetch(`/api/meshy/cancel/${encodeURIComponent(m.job_id)}`, { method: "POST" }).catch(() => {});
+      });
+      card.addEventListener("click", () => {
+        if (m.stage === "completed") open3DSceneInCenter(`meshy:${m.job_id}`, false);
+      });
+      listEl.appendChild(card);
+    });
+  }
+
+  async function submitMeshy() {
+    let inputImg = state.meshyInputImage;
+    if (!inputImg && state.centerKind === "media" && state.stageItem && state.stageItem.kind === "image") {
+      inputImg = state.stageItem;
+      state.meshyInputImage = inputImg;
+      renderMeshySlots();
+    }
+    if (!inputImg) {
+      showToast("Select an Input Image first (click 🧊 3D on an image or 📸 3D).", true);
+      return;
+    }
+    const texPrompt = (el("inp-meshy-texprompt")?.value || "").trim();
+    const texModel = el("sel-meshy-texmodel")?.value || "";
+    if (texModel === "meshy-n1" && texPrompt) {
+      showToast("meshy-n1 uses reference images only — clear Texture Prompt or switch Texture Model.", true);
+      return;
+    }
+
+    const btn = el("btn-generate-meshy");
+    btn.disabled = true;
+    try {
+      const res = await apiFetch("/api/meshy/generate", {
+        method: "POST",
+        json: {
+          image: inputImg.path,
+          topology: el("sel-meshy-topology")?.value || "triangle",
+          target_polycount: Number(el("inp-meshy-polycount")?.value || 30000),
+          symmetry_mode: el("sel-meshy-symmetry")?.value || "auto",
+          geometry_resolution: el("sel-meshy-geomres")?.value || null,
+          should_remesh: el("chk-meshy-remesh")?.checked ?? true,
+          should_texture: el("chk-meshy-texture")?.checked ?? true,
+          texture_model: texModel || null,
+          enable_pbr: el("chk-meshy-pbr")?.checked ?? false,
+          pose_mode: el("sel-meshy-pose")?.value || "",
+          texture_prompt: texPrompt || null,
+          texture_image: state.meshyTextureImage ? state.meshyTextureImage.path : null,
+          enable_rigging: el("chk-meshy-rig")?.checked ?? false,
+          include_fingers: el("chk-meshy-fingers")?.checked ?? false,
+          skeleton_template: el("sel-meshy-skeleton")?.value || null,
+          rigging_height_meters: Number(el("inp-meshy-height")?.value || 1.7),
+          enable_animation: el("chk-meshy-anim")?.checked ?? false,
+          animation_action_id: Number(el("inp-meshy-animid")?.value || 92),
+          enable_safety_checker: (el("sel-meshy-safety")?.value || "true") === "true",
+          auto_import: el("chk-meshy-autoimport")?.checked ?? true,
+        },
+      });
+      if (res.job) handleMeshyJobUpdate(res.job, false);
+      showToast(`Submitted Meshy 7.1 job ${res.job?.job_id || ""} to fal queue…`);
+    } catch (err) {
+      showToast(err.message, true);
+      if (err.message.includes("FAL_KEY")) el("fal-key-drawer")?.classList.remove("hidden");
+    } finally {
+      btn.disabled = false;
+    }
+  }
+  el("btn-generate-meshy")?.addEventListener("click", submitMeshy);
+
+  const announcedMeshyDone = new Set();
+  function handleMeshyJobUpdate(m, fromPoll = false) {
+    if (!m || !m.job_id) return;
+    const prev = state.meshyJobs.get(m.job_id);
+    state.meshyJobs.set(m.job_id, m);
+    if (!fromPoll) {
+      renderMeshyAssetsList();
+      renderJobs();
+      renderHierarchyTree();
+    }
+
+    const active = !["completed", "failed", "cancelled"].includes(m.stage);
+    const liveCard = el("meshy-live-card");
+    if (liveCard && (active || (prev && prev.stage !== "completed" && m.stage === "completed"))) {
+      liveCard.classList.remove("hidden");
+      const qPos = m.queue_position !== null && m.queue_position !== undefined ? ` (pos #${m.queue_position})` : "";
+      el("meshy-live-title").textContent = `${m.job_id}${m.request_id ? ` · ${m.request_id.slice(0, 10)}` : ""}`;
+      el("meshy-live-stage").textContent = `${String(m.stage).toUpperCase()}${qPos} · ${Number(m.elapsed_sec || 0).toFixed(0)}s`;
+      if (Array.isArray(m.logs) && m.logs.length) {
+        el("meshy-live-logs").textContent = m.logs.slice(-4).join("\n");
+      }
+    }
+
+    if (m.stage === "completed" && prev && prev.stage !== "completed" && !announcedMeshyDone.has(m.job_id)) {
+      announcedMeshyDone.add(m.job_id);
+      refreshMedia();
+      refreshState();
+      open3DSceneInCenter(`meshy:${m.job_id}`, false);
+      showToast(`🧊 Meshy 7.1 3D Mesh ready: ${m.job_id} (${Number(m.triangles_total || 0).toLocaleString()} tris)`);
+    } else if (m.stage === "failed" && m.error && (!prev || prev.stage !== "failed")) {
+      showToast(m.error, true);
+    }
+  }
+
   // =========================================================================
   // UNIFIED UPLOADS, BLENDER CAPTURE, JOBS, CO-PILOT & SSE
   // =========================================================================
@@ -1857,6 +2281,27 @@
       const low = file.name.toLowerCase();
       if (low.endsWith(".ply") || low.endsWith(".splat")) {
         if (window._bbEngine) await window._bbEngine.importLocalSplatFile(file);
+        continue;
+      }
+      if (low.endsWith(".glb")) {
+        try {
+          showToast(`Importing 3D mesh ${file.name}…`);
+          const buf = await file.arrayBuffer();
+          const rGlb = await fetch(`/api/meshy/upload_glb?filename=${encodeURIComponent(file.name)}`, {
+            method: "POST",
+            headers: Object.assign({ "X-Filename": file.name }, token ? { Authorization: `Bearer ${token}` } : {}),
+            body: buf,
+          });
+          const dGlb = await rGlb.json();
+          if (!rGlb.ok) throw new Error(dGlb.error || `HTTP ${rGlb.status}`);
+          state.meshyJobs.set(dGlb.job.job_id, dGlb.job);
+          renderMeshyAssetsList();
+          renderHierarchyTree();
+          await open3DSceneInCenter(`meshy:${dGlb.job.job_id}`, false);
+          showToast(`Loaded 3D mesh '${dGlb.job.job_id}' (${Number(dGlb.job.triangles_total || 0).toLocaleString()} tris)`);
+        } catch (err) {
+          showToast(`GLB upload failed: ${err.message}`, true);
+        }
         continue;
       }
       try {
@@ -1926,7 +2371,9 @@
 
   function renderJobs() {
     const jobsList = el("jobs-list");
-    const arr = Array.from(state.jobs.values()).sort((a, b) => b.created_at - a.created_at);
+    const sdArr = Array.from(state.jobs.values()).map((j) => Object.assign({ _jkind: "media" }, j));
+    const mArr = Array.from(state.meshyJobs.values()).map((m) => Object.assign({ _jkind: "meshy" }, m));
+    const arr = [...sdArr, ...mArr].sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
     const runningCnt = arr.filter((j) => !["completed", "failed", "cancelled"].includes(j.stage)).length;
     const badge = el("badge-jobs-cnt");
     if (badge) {
@@ -1943,19 +2390,25 @@
       const cls = j.stage === "completed" ? "completed" : j.stage === "failed" ? "failed" : active ? "running" : "";
       const card = document.createElement("div");
       card.className = `job-card ${cls}`;
-      const costBadge = j.cost_usd ? `<span class="job-cost-pill">$${Number(j.cost_usd).toFixed(4)}</span>` : "";
+      const idLbl = j._jkind === "meshy" ? `🧊 ${j.job_id}` : j.local_id;
+      const costBadge = j.cost_usd ? `<span class="job-cost-pill">$${Number(j.cost_usd).toFixed(j._jkind === "meshy" ? 2 : 4)}</span>` : "";
       card.innerHTML = `
         <div class="job-top">
-          <span>${escapeHtml(j.local_id)} · <code>${escapeHtml(j.stage)}</code></span>
+          <span>${escapeHtml(idLbl)} · <code>${escapeHtml(j.stage)}</code></span>
           <span>${costBadge} ${active ? `<button type="button" class="btn btn-ghost btn-xs btn-cancel-job">Cancel</button>` : ""}</span>
         </div>
         <div class="job-prompt">${escapeHtml(j.error ? "⚠ " + j.error : j.prompt || j.output_rel)}</div>
       `;
       card.querySelector(".btn-cancel-job")?.addEventListener("click", (e) => {
         e.stopPropagation();
-        apiFetch(`/api/seedance/cancel/${j.local_id}`, { method: "POST" }).catch(() => {});
+        const cancelUrl = j._jkind === "meshy" ? `/api/meshy/cancel/${encodeURIComponent(j.job_id)}` : `/api/seedance/cancel/${j.local_id}`;
+        apiFetch(cancelUrl, { method: "POST" }).catch(() => {});
       });
       card.addEventListener("click", () => {
+        if (j._jkind === "meshy" && j.stage === "completed") {
+          open3DSceneInCenter(`meshy:${j.job_id}`, false);
+          return;
+        }
         if (j.stage === "completed" && j.media_url) {
           const isImg = /\.(png|jpe?g|webp)$/i.test(j.output_rel || "") || String(j.local_id).startsWith("sr-");
           openMediaInCenter({
@@ -2067,6 +2520,7 @@
   });
 
   el("btn-or-key").addEventListener("click", () => {
+    el("fal-key-drawer")?.classList.add("hidden");
     el("key-drawer").classList.toggle("hidden");
     if (!el("key-drawer").classList.contains("hidden")) el("input-or-key").focus();
   });
@@ -2079,6 +2533,26 @@
       el("input-or-key").value = "";
       el("key-drawer").classList.add("hidden");
       showToast("Saved OPENROUTER_API_KEY");
+      refreshState();
+    } catch (err) {
+      showToast(err.message, true);
+    }
+  });
+
+  el("btn-fal-key")?.addEventListener("click", () => {
+    el("key-drawer").classList.add("hidden");
+    el("fal-key-drawer")?.classList.toggle("hidden");
+    if (!el("fal-key-drawer")?.classList.contains("hidden")) el("input-fal-key")?.focus();
+  });
+  el("btn-close-fal-key")?.addEventListener("click", () => el("fal-key-drawer")?.classList.add("hidden"));
+  el("btn-save-fal-key")?.addEventListener("click", async () => {
+    const k = (el("input-fal-key")?.value || "").trim();
+    if (!k) return;
+    try {
+      await apiFetch("/api/keys/fal", { method: "POST", json: { key: k, save: true } });
+      el("input-fal-key").value = "";
+      el("fal-key-drawer")?.classList.add("hidden");
+      showToast("Saved FAL_KEY");
       refreshState();
     } catch (err) {
       showToast(err.message, true);
@@ -2146,6 +2620,17 @@
       okBtn.className = "pill pill-btn pill-warn";
     }
 
+    const falBtn = el("btn-fal-key");
+    if (falBtn) {
+      if (s.fal?.configured) {
+        falBtn.textContent = `fal: ready`;
+        falBtn.className = "pill pill-btn pill-ok";
+      } else {
+        falBtn.textContent = "fal: Set Key";
+        falBtn.className = "pill pill-btn pill-warn";
+      }
+    }
+
     if (s.health) {
       const hs = s.health.status || "healthy";
       el("pill-health").textContent = `Health: ${hs}`;
@@ -2156,17 +2641,30 @@
     }
     setAgentBusyUi(!!s.busy);
 
-    if (Array.isArray(s.jobs)) { s.jobs.forEach((j) => handleJobUpdate(j, true)); renderJobs(); }
+    if (Array.isArray(s.meshy_jobs)) {
+      s.meshy_jobs.forEach((mj) => handleMeshyJobUpdate(mj, true));
+      renderMeshyAssetsList();
+    }
+    if (Array.isArray(s.jobs)) { s.jobs.forEach((j) => handleJobUpdate(j, true)); }
+    renderJobs();
     if (Array.isArray(s.splat_jobs)) {
       s.splat_jobs.forEach((sj) => state.splatJobs.set(sj.job_id, sj));
       populateKnownCamsDropdown();
-      renderHierarchyTree();
     }
+    renderHierarchyTree();
     updatePricingAndInspector();
   }
 
   async function refreshState() {
-    try { applyTopState(await apiFetch("/api/state")); } catch (_e) {}
+    try {
+      applyTopState(await apiFetch("/api/state"));
+    } catch (err) {
+      const fb = el("btn-fal-key");
+      if (fb && fb.textContent.includes("checking")) {
+        fb.textContent = String(err.message || "").includes("401") ? "fal: Auth Needed" : "fal: Offline";
+        fb.className = "pill pill-btn pill-warn";
+      }
+    }
   }
 
   async function refreshMedia() {
@@ -2175,6 +2673,7 @@
       state.mediaItems = data.items || [];
       populateSourceVideoDropdown();
       populateSplatVideoDropdown();
+      populateSplatImagesDropdown();
       renderHierarchyTree();
     } catch (_e) {}
   }
@@ -2214,6 +2713,7 @@
       if (typeof ev.seq === "number" && ev.seq > lastEventSeq) lastEventSeq = ev.seq;
       const { type, data } = ev;
       if (type === "seedance-job" && data) handleJobUpdate(data, false);
+      else if (type === "meshy-job" && data) handleMeshyJobUpdate(data, false);
       else if (type === "splat-job" && data) handleSplatJobUpdate(data);
       else if (type === "splat-telemetry" && data && window._bbPushSplatTelemetry) window._bbPushSplatTelemetry(data);
       else if (type === "splat-render" && data && window._bbOnSplatRenderProgress) window._bbOnSplatRenderProgress(data);
@@ -2261,13 +2761,17 @@
   }
 
   function setSplatSourceMode(mode) {
-    state.splatSourceMode = mode === "blender" ? "blender" : "video";
+    state.splatSourceMode = mode === "blender" ? "blender" : mode === "images" ? "images" : "video";
     const isBl = state.splatSourceMode === "blender";
+    const isImg = state.splatSourceMode === "images";
     el("splat-source-pills").querySelectorAll(".mode-pill").forEach((b) => {
       b.classList.toggle("active", b.dataset.src === state.splatSourceMode);
     });
-    el("splat-src-video-box").classList.toggle("hidden", isBl);
-    el("splat-src-blender-box").classList.toggle("hidden", !isBl);
+    el("splat-src-video-box")?.classList.toggle("hidden", state.splatSourceMode !== "video");
+    el("splat-src-images-box")?.classList.toggle("hidden", !isImg);
+    el("splat-src-cam-prior-box")?.classList.toggle("hidden", isBl);
+    el("splat-src-blender-box")?.classList.toggle("hidden", !isBl);
+    if (isImg) populateSplatImagesDropdown();
     updateSplatCostEstimate();
   }
   el("splat-source-pills").addEventListener("click", (e) => {
@@ -2289,6 +2793,33 @@
     });
     if (prev && videos.some((v) => v.path === prev)) sel.value = prev;
     else if (videos.length) sel.value = videos[0].path;
+  }
+
+  function populateSplatImagesDropdown() {
+    const sel = el("sel-splat-images-dir");
+    if (!sel) return;
+    const prev = sel.value;
+    const counts = new Map();
+    state.mediaItems
+      .filter((it) => it.kind === "image" && typeof it.path === "string")
+      .forEach((it) => {
+        const norm = it.path.replace(/\\/g, "/");
+        const slash = norm.lastIndexOf("/");
+        const dir = slash > 0 ? norm.slice(0, slash) : ".";
+        counts.set(dir, (counts.get(dir) || 0) + 1);
+      });
+    const folders = Array.from(counts.entries())
+      .filter(([, n]) => n >= 3)
+      .sort((a, b) => b[1] - a[1]);
+    sel.innerHTML = `<option value="">— Select workspace image folder (≥3 imgs) —</option>`;
+    folders.forEach(([dir, n]) => {
+      const opt = document.createElement("option");
+      opt.value = dir;
+      opt.textContent = `📁 ${dir} (${n} images)`;
+      sel.appendChild(opt);
+    });
+    if (prev && folders.some(([d]) => d === prev)) sel.value = prev;
+    else if (folders.length) sel.value = folders[0][0];
   }
 
   function populateKnownCamsDropdown() {
@@ -2319,7 +2850,8 @@
     const iters = Math.max(200, Number(el("inp-splat-iters").value || 5000));
     const gpu = el("sel-splat-gpu").value || "H100";
     const rateHr = gpu === "L40S" ? 1.95 : 3.95;
-    const estSec = (state.splatSourceMode === "video" ? 8 : 2) + (iters / 2000) * (gpu === "L40S" ? 36 : 20);
+    const poseSec = state.splatSourceMode === "blender" ? 2 : 8;
+    const estSec = poseSec + (iters / 2000) * (gpu === "L40S" ? 36 : 20);
     el("splat-est-cost").textContent = `~$${((estSec / 3600) * rateHr).toFixed(3)} (${gpu})`;
   }
   el("inp-splat-iters").addEventListener("input", updateSplatCostEstimate);
@@ -2347,6 +2879,12 @@
     if (state.splatSourceMode === "video") {
       payload.video_path = el("sel-splat-video").value;
       if (!payload.video_path) return showToast("Select a source video first.", true);
+      if (knownCamVal) payload.known_cameras_job = knownCamVal;
+    } else if (state.splatSourceMode === "images") {
+      const customFolder = (el("inp-splat-images-path")?.value || "").trim();
+      const pickedFolder = el("sel-splat-images-dir")?.value || "";
+      payload.images_path = customFolder || pickedFolder;
+      if (!payload.images_path) return showToast("Select or enter an image folder first.", true);
       if (knownCamVal) payload.known_cameras_job = knownCamVal;
     } else {
       payload.num_views = Number(el("inp-splat-views").value || 28);
@@ -3874,6 +4412,36 @@
         return;
       }
 
+      // Meshy 7.1 `.glb` 3D Mesh Stage (`meshy:<job_id>`)
+      if (String(choice).startsWith("meshy:")) {
+        const mId = String(choice).slice(6);
+        try {
+          const res = await apiFetch(`/api/meshy/triangles/${encodeURIComponent(mId)}`);
+          splatCount = 0; positions = null; flagData = null; undoStack = []; redoStack = [];
+          st.activeJobId = ""; st.hasOrigBackup = false;
+          // Build checkerboard Z=0 ground + append parsed Meshy GLB triangles
+          buildSolidStage("blank_grid");
+          if (res.vertex_floats?.length) {
+            const glbFloats = new Float32Array(res.vertex_floats);
+            const merged = new Float32Array(baseMeshFloats.length + glbFloats.length);
+            merged.set(baseMeshFloats, 0);
+            merged.set(glbFloats, baseMeshFloats.length);
+            baseMeshFloats = merged;
+            if (res.world_aabb) {
+              baseColliders = [{ min: res.world_aabb.min, max: res.world_aabb.max }];
+              sceneCenter = res.world_aabb.center.slice();
+              const sz = res.world_aabb.size;
+              sceneRadius = Math.max(1.2, Math.hypot(sz[0], sz[1], sz[2]) * 0.65);
+            }
+            solidDirty = true;
+          }
+          st.showSolid = true; el("chk-show-solid").checked = true;
+          teleportPreset("hero");
+          el("badge-splat-stats").textContent = `🧊 ${Number(res.total_triangles || res.triangles || 0).toLocaleString()} tris (.glb)`;
+        } catch (e) { showToast(e.message, true); }
+        return;
+      }
+
       // Workspace Splat Job
       try {
         const ens = await apiFetch(`/api/splats/ensure_splat/${encodeURIComponent(choice)}`, { method: "POST", json: {} });
@@ -4417,8 +4985,10 @@
     populateSeedreamModels();
     renderConditioningSlots();
     renderSeedreamRefs();
+    renderMeshySlots();
     updatePricingAndInspector();
     updateSeedreamInspector();
+    updateMeshyInspector();
     updateSplatCostEstimate();
     switchInspectorTab(state.inspectorTab);
 

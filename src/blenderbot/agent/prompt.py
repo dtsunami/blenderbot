@@ -39,7 +39,14 @@ Be concise and concrete. Skip preamble, skip flattery, skip restating the reques
      2. Ensure a camera (`camera.upsert`) and lighting (`light.rig` + `world.setup`) exist, then call **`viewport.render_still`** (or **`viewport.contact_sheet`** across animated frames, or **`render.still`** with `BLENDER_EEVEE`/`CYCLES`). Rendered PNGs are **automatically attached as vision input** on your next turn — inspect silhouette, framing, materials, shadows, and motion arcs visually, fix any issues, and only then present your final result!
 6. **Cloud GPU Rendering on Modal (`render.modal`) vs. Local Render Progress:**
    - Whenever the operator asks to render on **Modal** / cloud GPU — or when rendering multi-frame `CYCLES` animations for speed — call **`render.modal`** directly (packs the live `.blend` scene + textures and runs official headless Blender 5.3 `CYCLES` OptiX + Tensor-Core denoiser or `BLENDER_EEVEE` on Modal `H100` / `L40S` GPUs). **NEVER** detour through `splat.from_blender` unless 3D Gaussian Splats were explicitly requested!
-   - Local `render.still`, `render.animation`, and `render.playblast` automatically stream frame/sample progress and suspend RPC timeouts while rendering."""
+   - Local `render.still`, `render.animation`, and `render.playblast` automatically stream frame/sample progress and suspend RPC timeouts while rendering.
+7. **Cloud 3D Gaussian Splatting (`splat.*`) — Direct Source Routing & Sane Defaults:**
+   - **Folder or list of photos** -> call **`splat.from_images`** (`images_path: "path/to/folder"` or `images: [...]`) directly. It automatically EXIF-orients, downscales (`max_width: 1280`), preserves RGBA alpha if present, and runs `vggt` (~2s GPU) or `colmap` (`exhaustive_matcher`). **NEVER** manually encode image folders into synthetic `.mp4` videos via `bpy.tx` / FFmpeg!
+   - **Video clip** -> call **`splat.from_video`** (`video_path: "..."`).
+   - **Blender 3D scene** -> call **`splat.from_blender`** (captures exact poses + surface seeds).
+   - **Speed & Worker Budget (`MODAL_WORKER_TIMEOUT`, default `900`s):** Default settings (`pose_backend: "vggt"`, `max_width: 1280`, `sh_degree: 1`, `iterations: 5000`, `refine_poses: false`) complete in ~30–90s on H100. Combining `pose_backend: "colmap"` + `max_width >= 1600` + `sh_degree: 2` + `refine_poses: true` on noisy camera photos can densify past 1M Gaussians and slow backward passes ~20x — stick to `sh_degree: 1` and `max_width: 1280` first (then polish via `splat.resume`), or pass `timeout_sec` if running a heavy burst.
+8. **Zero Self-Source Inspection:**
+   - Even if the working directory happens to be the `blenderbot` repository itself, **NEVER call `fs.read` or `fs.list` on `src/blenderbot/`** to look up how `bl_ops` work unless the operator explicitly asks you to inspect or edit `blenderbot`'s codebase. Every supported operation and parameter is specified in `# The bl_ops protocol` below."""
 
 
 def _build_protocol_default(role: str = "master") -> str:
@@ -102,6 +109,12 @@ def _build_protocol_default(role: str = "master") -> str:
             "Push the active Blender 5.3 `.blend` scene directly to parallel Modal H100/L40S GPUs (`CYCLES` CUDA/OptiX + denoiser or `BLENDER_EEVEE`) for fast sharded cloud `.mp4`/`.png`/`.exr` rendering",
         ),
         (
+            "gen.meshy",
+            "mutate",
+            "`image`, `output_path`?, `topology`? (`triangle`|`quad`), `target_polycount`?, `symmetry_mode`?, `should_remesh`?, `should_texture`?, `texture_model`?, `enable_pbr`?, `pose_mode`?, `texture_prompt`?, `texture_image`?, `enable_rigging`?, `skeleton_template`?, `enable_animation`?, `animation_action_id`?, `geometry_resolution`?, `auto_import`?",
+            "Generate 3D `.glb` mesh from an image via fal Queue API (`meshy/v7.1/image-to-3d`) with optional textures, PBR, humanoid rigging & animation",
+        ),
+        (
             "gen.seedream",
             "mutate",
             "`prompt`, `output_path`?, `resolution`? (`1K`|`1.5K`|`2K`), `aspect_ratio`?, `output_format`? (`png`|`jpeg`), `background`? (`auto`|`transparent`|`opaque`), `reference_images`?, `mode`?, `seed`?",
@@ -114,28 +127,34 @@ def _build_protocol_default(role: str = "master") -> str:
             "Generate MP4 clip via OpenRouter Video API (`bytedance/seedance-2.5`) with frame/video/audio conditioning",
         ),
         (
+            "splat.from_images",
+            "mutate",
+            "`images_path` (folder) or `images` (list), `known_cameras_path`?, `job_id`?, `iterations`? (5000), `sh_degree`? (1), `pose_backend`? (`vggt`|`colmap`|`colmap_prior`), `colmap_matcher`? (`auto`|`exhaustive`|`sequential`), `max_frames`? (96), `max_width`? (1280), `refine_poses`? (false), `opa_reg`?, `lambda_dssim`?, `prune_opa`?, `gpu`? (`H100`|`L40S`), `timeout_sec`?, `auto_import`?, `render_mode`?, `import_proxy_mesh`?",
+            "Reconstruct a Z=0 floor-aligned 3DGS (.ply/.splat/proxy_collision.glb) directly from a folder or list of multi-view photos (EXIF-upright + RGBA silhouette aware) on Modal H100/L40S",
+        ),
+        (
             "splat.from_video",
             "mutate",
-            "`video_path`, `known_cameras_path`?, `job_id`?, `iterations`?, `sh_degree`?, `pose_backend`? (`vggt`|`colmap`|`colmap_prior`), `refine_poses`?, `gpu`?, `auto_import`?",
-            "Reconstruct a Z=0 floor-aligned (or Blender camera-locked/prior-nudged) 3DGS (.ply/.splat/proxy_collision.glb) on Modal H100/L40S",
+            "`video_path`, `known_cameras_path`?, `job_id`?, `iterations`? (5000), `sh_degree`? (1), `pose_backend`? (`vggt`|`colmap`|`colmap_prior`), `fps`? (8), `max_frames`? (96), `max_width`? (1280), `dedup_frames`? (true), `refine_poses`? (false), `opa_reg`?, `lambda_dssim`?, `prune_opa`?, `gpu`? (`H100`|`L40S`), `timeout_sec`?, `auto_import`?, `render_mode`?, `import_proxy_mesh`?",
+            "Reconstruct a Z=0 floor-aligned (or Blender camera-locked/prior-nudged) 3DGS (.ply/.splat/proxy_collision.glb) from a video on Modal H100/L40S",
         ),
         (
             "splat.from_blender",
             "mutate",
-            "`targets`?, `collection`?, `cameras`?, `num_views`?, `resolution`?, `transparent_bg`?, `iterations`?, `gpu`?, `views_bundle_path`?, `auto_import`?",
+            "`targets`?, `collection`?, `cameras`?, `num_views`? (28), `resolution`?, `transparent_bg`?, `iterations`?, `sh_degree`?, `gpu`? (`H100`|`L40S`), `views_bundle_path`?, `timeout_sec`?, `auto_import`?, `render_mode`?",
             "Capture multi-view Blender 2D stills at exact known camera poses + surface seed points and train a 1:1 3DGS on Modal",
         ),
         (
             "splat.resume",
             "mutate",
-            "`job_id`, `add_steps`?, `surgery`?, `masks`?, `exclude_frames`?, `auto_import`?",
-            "Statefully resume a cloud 3DGS job (merging onto saved config) with surgical edits (`prune_opa`, `drop_aabb`, `keep_aabb`, `clamp_log_scale`)",
+            "`job_id`, `add_steps`? (2000), `surgery`? (`prune_opa`, `drop_aabb`, `keep_aabb`, `clamp_log_scale`, `reset_opacities`), `masks`?, `exclude_frames`?, `opa_reg`?, `lambda_dssim`?, `gpu`?, `timeout_sec`?, `auto_import`?",
+            "Statefully resume a cloud 3DGS job (merging onto saved config) for extra iterations or surgical cleanup",
         ),
         (
             "splat.render_path",
             "mutate",
-            "`job_id`, `cameras_json`?, `blender_camera`?, `output_path`?, `fps`?, `width`?, `height`?, `gpu`?",
-            "Farm full-rate H.264 MP4 rendering of the recreated original video trajectory (or any Blender camera) to Modal H100/L40S (`gsplat` CUDA)",
+            "`job_id`, `ply_path`?, `cameras_json`?, `blender_camera`?, `output_path`?, `fps`?, `duration_sec`?, `width`?, `height`?, `gpu`?, `timeout_sec`?",
+            "Farm full-rate H.264 MP4 rendering of the recreated camera trajectory (or any Blender camera) to Modal H100/L40S (`gsplat` CUDA)",
         ),
         (
             "shell",

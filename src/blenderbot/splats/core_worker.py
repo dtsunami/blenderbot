@@ -29,6 +29,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from .client import SUPPORTED_IMAGE_EXTS, _natural_sort_key, unpack_images_bundle
 from .config import ExtractConfig, PoseConfig, SplatConfig, SurgerySpec
 from .proxy_mesh import build_proxy_glb_bytes
 from .sim3 import (
@@ -356,8 +357,10 @@ def solve_poses_colmap(
     work_dir: Path,
     cfg: PoseConfig,
     prior_intrinsics: tuple[float, float, float, float] | None = None,
+    *,
+    is_image_set: bool = False,
 ) -> tuple[list[dict[str, Any]], np.ndarray, np.ndarray]:
-    """Run COLMAP sequential SfM (`PINHOLE` + optional Blender `K` lock) and parse binary outputs."""
+    """Run COLMAP SfM (`PINHOLE` + exhaustive/sequential matching) and parse binary outputs."""
     sfm_dir = work_dir / "colmap"
     db_path = sfm_dir / "database.db"
     sparse_dir = sfm_dir / "sparse"
@@ -374,28 +377,53 @@ def solve_poses_colmap(
             tail = (proc.stdout + "\n" + proc.stderr)[-800:]
             raise RuntimeError(f"COLMAP {step_name} failed:\n{tail}")
 
+    img_files = [
+        p for p in frames_dir.iterdir()
+        if p.is_file() and p.suffix.lower() in SUPPORTED_IMAGE_EXTS
+    ]
+    unique_dims: set[tuple[int, int]] = set()
+    for p in img_files[:64]:
+        try:
+            with Image.open(p) as im_chk:
+                unique_dims.add((im_chk.width, im_chk.height))
+        except OSError:
+            pass
+    single_cam = "1" if (len(unique_dims) <= 1 or prior_intrinsics is not None) else "0"
+
     cam_model = "PINHOLE" if getattr(cfg, "lock_pinhole_intrinsics", True) or prior_intrinsics else "OPENCV"
     feat_args = [
         "feature_extractor",
         "--database_path", str(db_path),
         "--image_path", str(frames_dir),
-        "--ImageReader.single_camera", "1",
+        "--ImageReader.single_camera", single_cam,
         "--ImageReader.camera_model", cam_model,
         "--SiftExtraction.use_gpu", "0",
         "--SiftExtraction.num_threads", "16",
     ]
-    if prior_intrinsics is not None:
+    if prior_intrinsics is not None and single_cam == "1":
         fx_p, fy_p, cx_p, cy_p = prior_intrinsics
         feat_args.extend(["--ImageReader.camera_params", f"{fx_p:.4f},{fy_p:.4f},{cx_p:.4f},{cy_p:.4f}"])
     _colmap(feat_args, "feature_extractor")
 
-    _colmap([
-        "sequential_matcher",
-        "--database_path", str(db_path),
-        "--SequentialMatching.overlap", "12",
-        "--SiftMatching.use_gpu", "0",
-        "--SiftMatching.num_threads", "16",
-    ], "sequential_matcher")
+    matcher_mode = str(getattr(cfg, "matcher", "auto") or "auto").strip().lower()
+    use_exhaustive = matcher_mode == "exhaustive" or (
+        matcher_mode == "auto" and ((is_image_set and len(img_files) <= 80) or len(img_files) <= 32)
+    )
+    if use_exhaustive:
+        _colmap([
+            "exhaustive_matcher",
+            "--database_path", str(db_path),
+            "--SiftMatching.use_gpu", "0",
+            "--SiftMatching.num_threads", "16",
+        ], "exhaustive_matcher")
+    else:
+        _colmap([
+            "sequential_matcher",
+            "--database_path", str(db_path),
+            "--SequentialMatching.overlap", "12",
+            "--SiftMatching.use_gpu", "0",
+            "--SiftMatching.num_threads", "16",
+        ], "sequential_matcher")
 
     mapper_args = [
         "mapper",
@@ -464,7 +492,7 @@ def solve_poses_colmap(
             f.seek(n_pts2d * 24, os.SEEK_CUR)
             raw_imgs.append((name, (qw, qx, qy, qz), (tx, ty, tz), cid))
 
-    raw_imgs.sort(key=lambda r: r[0])
+    raw_imgs.sort(key=lambda r: _natural_sort_key(r[0]))
     cam_records: list[dict[str, Any]] = []
     from .sim3 import quat_to_rotmat
 
@@ -1010,6 +1038,7 @@ def run_splat_job_stream(
     models_dir: Path | None = None,
     mp4_bytes: bytes | None = None,
     views_tar_gz: bytes | None = None,
+    images_tar_gz: bytes | None = None,
     known_cameras_json: str | None = None,
     cfg: SplatConfig | None = None,
     cfg_overrides: dict[str, Any] | None = None,
@@ -1025,8 +1054,9 @@ def run_splat_job_stream(
 
     Supports:
       1. `from_video` (`mp4_bytes` provided): FFmpeg -> VGGT/COLMAP -> RANSAC Z=0 Sim3 -> gsplat
-      2. `from_blender` (`views_tar_gz` provided): Ground-truth Blender cameras + surface seed cloud -> gsplat
-      3. `resume` (both None): Reloads `/jobs/{job_id}/frames_u8.pt` + `ckpt_latest.pt` (~0.3s or 0.0s HBM)
+      2. `from_images` (`images_tar_gz` provided): EXIF-normalized multi-view images -> VGGT/COLMAP -> gsplat
+      3. `from_blender` (`views_tar_gz` provided): Ground-truth Blender cameras + surface seed cloud -> gsplat
+      4. `resume` (all None): Reloads `/jobs/{job_id}/frames_u8.pt` + `ckpt_latest.pt` (~0.3s or 0.0s HBM)
     """
     from gsplat import rasterization
     from gsplat.strategy import DefaultStrategy
@@ -1061,7 +1091,7 @@ def run_splat_job_stream(
             raw_m = base64.b64decode(mb64)
             (masks_dir / mname).write_bytes(raw_m)
 
-    is_resume = (mp4_bytes is None) and (views_tar_gz is None)
+    is_resume = (mp4_bytes is None) and (views_tar_gz is None) and (images_tar_gz is None)
     eff_cfg = cfg or SplatConfig()
     macro_timings: dict[str, float] = {}
     alphas_gpu: torch.Tensor | None = None
@@ -1094,23 +1124,31 @@ def run_splat_job_stream(
                 "elapsed_s": macro_timings["extract_s"],
             }
         else:
-            # ── Video Reconstruction Mode: Stage 1 (Extract + Exact PTS) + Stage 2 (Pose / Known-Lock) ──
-            has_alpha = False
-            mp4_path = work_shm / "source.mp4"
-            mp4_path.write_bytes(mp4_bytes)  # type: ignore[arg-type]
-
-            t0 = time.perf_counter()
+            # ── Video or Multi-View Image Set Mode: Stage 1 (Extract/Unpack) + Stage 2 (Pose / Known-Lock) ──
+            is_image_set = images_tar_gz is not None
             frames_dir = work_shm / "frames"
-            frame_paths, pts_by_name, video_meta = extract_frames_with_meta(
-                mp4_path, frames_dir, eff_cfg.extract
-            )
+            t0 = time.perf_counter()
+            if is_image_set:
+                assert images_tar_gz is not None
+                frame_paths, pts_by_name, video_meta, has_alpha = unpack_images_bundle(
+                    images_tar_gz, frames_dir, eff_cfg.extract
+                )
+            else:
+                has_alpha = False
+                mp4_path = work_shm / "source.mp4"
+                mp4_path.write_bytes(mp4_bytes)  # type: ignore[arg-type]
+                frame_paths, pts_by_name, video_meta = extract_frames_with_meta(
+                    mp4_path, frames_dir, eff_cfg.extract
+                )
             macro_timings["extract_s"] = round(time.perf_counter() - t0, 3)
             yield {
                 "event": "stage",
                 "stage": "extract",
                 "job_id": job_id,
                 "device": dev_name,
+                "source": "images" if is_image_set else "video",
                 "frames": len(frame_paths),
+                "transparent_bg": has_alpha,
                 "video_meta": video_meta,
                 "elapsed_s": macro_timings["extract_s"],
             }
@@ -1157,7 +1195,11 @@ def run_splat_job_stream(
                 if eff_cfg.pose.backend in ("colmap", "colmap_prior"):
                     try:
                         cam_records, raw_xyz, raw_rgb = solve_poses_colmap(
-                            frames_dir, work_shm, eff_cfg.pose, prior_intrinsics=prior_intr
+                            frames_dir,
+                            work_shm,
+                            eff_cfg.pose,
+                            prior_intrinsics=prior_intr,
+                            is_image_set=is_image_set,
                         )
                         if len(cam_records) < max(3, len(frame_paths) // 4):
                             raise RuntimeError(f"COLMAP registered only {len(cam_records)}/{len(frame_paths)} frames")
@@ -1217,10 +1259,22 @@ def run_splat_job_stream(
 
         # Build aligned OpenCV viewmats/Ks & Blender `cameras.json`
         t_align = time.perf_counter()
+        w0_target = int(cam_records[0]["width"])
+        h0_target = int(cam_records[0]["height"])
         bl_cameras_list: list[dict[str, Any]] = []
         viewmats_list: list[np.ndarray] = []
         ks_list: list[np.ndarray] = []
         for c in cam_records:
+            cw, ch = int(c["width"]), int(c["height"])
+            if (cw, ch) != (w0_target, h0_target) and cw > 0 and ch > 0:
+                sx = w0_target / float(cw)
+                sy = h0_target / float(ch)
+                c["fx"] = float(c["fx"]) * sx
+                c["cx"] = float(c["cx"]) * sx
+                c["fy"] = float(c["fy"]) * sy
+                c["cy"] = float(c["cy"]) * sy
+                c["width"] = w0_target
+                c["height"] = h0_target
             rc_new, tc_new = apply_sim3_to_camera_w2c(sim3, c["R_w2c"], c["t_w2c"])
             vm = np.eye(4, dtype=np.float32)
             vm[:3, :3] = np.array(rc_new, dtype=np.float32)

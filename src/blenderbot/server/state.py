@@ -190,6 +190,61 @@ class SplatJobRecord:
 
 
 @dataclass
+class MeshyJobRecord:
+    job_id: str
+    prompt: str
+    model: str
+    image_rel: str
+    output_rel: str
+    created_at: float
+    stage: str = "queued"
+    request_id: str | None = None
+    queue_position: int | None = None
+    logs: list[str] = field(default_factory=list)
+    elapsed_sec: float = 0.0
+    cost_usd: float = 0.0
+    error: str | None = None
+    glb_url: str | None = None
+    thumbnail_rel: str | None = None
+    thumbnail_url: str | None = None
+    rigged_glb_rel: str | None = None
+    animation_glb_rel: str | None = None
+    triangles_total: int = 0
+    world_aabb: dict[str, Any] | None = None
+    conditioning: dict[str, Any] = field(default_factory=dict)
+    imported_objects: list[str] = field(default_factory=list)
+    cancel_ev: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    task: asyncio.Task[Any] | None = field(default=None, repr=False)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "job_id": self.job_id,
+            "local_id": self.job_id,
+            "request_id": self.request_id,
+            "prompt": self.prompt,
+            "model": self.model,
+            "image_rel": self.image_rel,
+            "output_rel": self.output_rel,
+            "created_at": self.created_at,
+            "stage": self.stage,
+            "queue_position": self.queue_position,
+            "logs": self.logs[-10:],
+            "elapsed_sec": round(self.elapsed_sec, 1),
+            "cost_usd": round(self.cost_usd, 4),
+            "error": self.error,
+            "glb_url": self.glb_url,
+            "thumbnail_rel": self.thumbnail_rel,
+            "thumbnail_url": self.thumbnail_url,
+            "rigged_glb_rel": self.rigged_glb_rel,
+            "animation_glb_rel": self.animation_glb_rel,
+            "triangles_total": self.triangles_total,
+            "world_aabb": self.world_aabb,
+            "conditioning": self.conditioning,
+            "imported_objects": self.imported_objects,
+        }
+
+
+@dataclass
 class WebState:
     session: Session
     submit_fn: Callable[[str, str], Any]
@@ -201,6 +256,8 @@ class WebState:
     job_order: list[str] = field(default_factory=list)
     splat_jobs: dict[str, SplatJobRecord] = field(default_factory=dict)
     splat_job_order: list[str] = field(default_factory=list)
+    meshy_jobs: dict[str, MeshyJobRecord] = field(default_factory=dict)
+    meshy_job_order: list[str] = field(default_factory=list)
 
     def media_url_for(self, path: Path) -> str:
         rel = self.session.sandbox.rel(path).replace("\\", "/")
@@ -384,6 +441,97 @@ class WebState:
                     "blender_render_url": self.media_url_for(blender_mp4) if blender_mp4.is_file() else None,
                     "stage_timings": st_timings,
                     "imported_object": None,
+                }
+            )
+        return out[:max_items]
+
+    def new_meshy_job(
+        self,
+        *,
+        job_id: str,
+        prompt: str,
+        model: str,
+        image_rel: str,
+        output_rel: str,
+    ) -> MeshyJobRecord:
+        rec = MeshyJobRecord(
+            job_id=job_id,
+            prompt=prompt,
+            model=model,
+            image_rel=image_rel,
+            output_rel=output_rel,
+            created_at=time.time(),
+        )
+        self.meshy_jobs[job_id] = rec
+        if job_id not in self.meshy_job_order:
+            self.meshy_job_order.insert(0, job_id)
+        return rec
+
+    def scan_meshy_jobs(self, max_items: int = 40) -> list[dict[str, Any]]:
+        """Merge active in-memory Meshy 7.1 jobs with persisted `assets/meshy/*` `.glb` artifacts."""
+        out: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        cwd = self.session.cfg.cwd
+
+        for jid in self.meshy_job_order:
+            rec = self.meshy_jobs.get(jid)
+            if rec is not None:
+                out.append(rec.to_dict())
+                seen.add(jid)
+
+        meshy_root = cwd / "assets" / "meshy"
+        if not meshy_root.is_dir():
+            return out[:max_items]
+
+        disk_dirs = sorted(
+            (d for d in meshy_root.iterdir() if d.is_dir() and d.name not in seen),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for d in disk_dirs[:max_items]:
+            glb_p = d / "model.glb"
+            if not glb_p.is_file():
+                glb_candidates = sorted(d.glob("*.glb"))
+                glb_p = glb_candidates[0] if glb_candidates else glb_p
+            if not glb_p.is_file():
+                continue
+            thumb_p = d / "preview.png"
+            rig_p = d / "rigged_character.glb"
+            anim_p = d / "animation.glb"
+            meta_p = d / "meshy_meta.json"
+            meta: dict[str, Any] = {}
+            if meta_p.is_file():
+                try:
+                    meta = json.loads(meta_p.read_text(encoding="utf-8"))
+                except Exception:  # noqa: BLE001
+                    meta = {}
+
+            cond = dict(meta.get("conditioning") or {})
+            out.append(
+                {
+                    "job_id": d.name,
+                    "local_id": d.name,
+                    "request_id": meta.get("request_id"),
+                    "prompt": str(cond.get("image") or d.name),
+                    "model": str(meta.get("model") or "meshy/v7.1/image-to-3d"),
+                    "image_rel": str(cond.get("image") or ""),
+                    "output_rel": self.session.sandbox.rel(glb_p).replace("\\", "/"),
+                    "created_at": float(meta.get("created_at") or glb_p.stat().st_mtime),
+                    "stage": "completed",
+                    "queue_position": None,
+                    "logs": [],
+                    "elapsed_sec": round(float(meta.get("elapsed_sec") or 0.0), 1),
+                    "cost_usd": round(float(meta.get("cost_usd") or 0.0), 4),
+                    "error": None,
+                    "glb_url": self.media_url_for(glb_p),
+                    "thumbnail_rel": self.session.sandbox.rel(thumb_p).replace("\\", "/") if thumb_p.is_file() else None,
+                    "thumbnail_url": self.media_url_for(thumb_p) if thumb_p.is_file() else None,
+                    "rigged_glb_rel": self.session.sandbox.rel(rig_p).replace("\\", "/") if rig_p.is_file() else None,
+                    "animation_glb_rel": self.session.sandbox.rel(anim_p).replace("\\", "/") if anim_p.is_file() else None,
+                    "triangles_total": int(meta.get("triangles_total") or 0),
+                    "world_aabb": meta.get("world_aabb"),
+                    "conditioning": cond,
+                    "imported_objects": [],
                 }
             )
         return out[:max_items]

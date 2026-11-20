@@ -21,6 +21,7 @@ HOME_ONLY_VARS = ("BLENDERBOT_BASE_URL", "DAVAG_BASE_URL", "DAVAI_BASE_URL", "OP
 DEFAULT_MAX_TOKENS = 32_000
 DEFAULT_WEB_PORT = 7880
 DEFAULT_BRIDGE_PORT = 18766
+DEFAULT_MODAL_WORKER_TIMEOUT = 900
 
 # Lookup order per provider: BLENDERBOT_* first, standard SDK names, then DAVAG_*/DAVAI_*
 # so existing `~/.davai/.env` or `~/.davag/.env` keys work out-of-the-box with zero re-entry!
@@ -57,8 +58,19 @@ KEY_VARS: dict[str, tuple[str, ...]] = {
         "DAVAG_OPENROUTER_API_KEY",
         "DAVAI_OPENROUTER_API_KEY",
     ),
+    "fal": (
+        "FAL_KEY",
+        "BLENDERBOT_FAL_KEY",
+        "FAL_API_KEY",
+        "BLENDERBOT_FAL_API_KEY",
+        "DAVAG_FAL_KEY",
+        "DAVAI_FAL_KEY",
+        "DAVAG_FAL_API_KEY",
+        "DAVAI_FAL_API_KEY",
+    ),
 }
 
+KEY_TARGETS: tuple[str, ...] = (*PROVIDERS, "fal")
 FALLBACK_KEYS: frozenset[str] = frozenset(var for group in KEY_VARS.values() for var in group)
 
 
@@ -117,6 +129,37 @@ def _parse_float(v: str | None, default: float) -> float:
         return float(str(v).strip())
     except ValueError:
         return default
+
+
+def resolve_modal_worker_timeout(
+    environ: dict[str, str] | None = None,
+    *,
+    cwd: str | Path | None = None,
+    home: str | Path | None = None,
+    default: int = DEFAULT_MODAL_WORKER_TIMEOUT,
+) -> int:
+    """Resolve `MODAL_WORKER_TIMEOUT` (s) from `environ`, `./.env`, or `$BLENDERBOT_HOME/.env`."""
+    env = dict(os.environ if environ is None else environ)
+    raw = (
+        env.get("MODAL_WORKER_TIMEOUT")
+        or env.get("BLENDERBOT_MODAL_WORKER_TIMEOUT")
+        or ""
+    ).strip()
+    if not raw:
+        eff_cwd = Path(cwd or os.getcwd()).resolve()
+        eff_home = Path(home).resolve() if home else resolve_home(env)
+        for env_file in (eff_cwd / ".env", eff_home / ".env"):
+            file_vars = read_env(env_file)
+            cand = (
+                file_vars.get("MODAL_WORKER_TIMEOUT")
+                or file_vars.get("BLENDERBOT_MODAL_WORKER_TIMEOUT")
+                or ""
+            ).strip()
+            if cand:
+                raw = cand
+                break
+    parsed = _parse_positive_int(raw, "MODAL_WORKER_TIMEOUT") if raw else None
+    return parsed if parsed is not None else default
 
 
 def resolve_limits(
@@ -226,12 +269,14 @@ class Config:
     web_token: str | None
     web_open: bool
     shell_timeout: float
+    modal_worker_timeout: int = DEFAULT_MODAL_WORKER_TIMEOUT
     ro_dirs: list[Path] = field(default_factory=list)
     agents_files: list[str] = field(default_factory=list)
     agents_budget: int | None = None
     role: str = "master"
     image_model: str = "bytedance-seed/seedream-5-5"
     video_model: str = "bytedance/seedance-2.5"
+    meshy_model: str = "meshy/v7.1/image-to-3d"
     keys: dict[str, str | None] = field(default_factory=dict)
     key_origins: dict[str, dict[str, str | None]] = field(default_factory=dict)
     var_origins: dict[str, str] = field(default_factory=dict)
@@ -257,6 +302,7 @@ class Config:
             "base_url": self.base_url,
             "transport": self.transport,
             "bridge": {"host": self.bridge_host, "port": self.bridge_port},
+            "modal_worker_timeout": self.modal_worker_timeout,
             "video_model": self.video_model,
             "web": {
                 "enabled": self.web_enabled,
@@ -466,6 +512,14 @@ def load_config(
     web_token = merged.get("BLENDERBOT_WEB_TOKEN", "").strip() or None
 
     shell_timeout = _parse_float(merged.get("BLENDERBOT_SHELL_TIMEOUT"), 120.0)
+    raw_modal_timeout = (
+        merged.get("MODAL_WORKER_TIMEOUT")
+        or merged.get("BLENDERBOT_MODAL_WORKER_TIMEOUT")
+    )
+    modal_worker_timeout = (
+        _parse_positive_int(raw_modal_timeout, "MODAL_WORKER_TIMEOUT")
+        or DEFAULT_MODAL_WORKER_TIMEOUT
+    )
 
     ro_raw = merged.get("BLENDERBOT_RO_DIRS") or merged.get("DAVAI_RO_DIRS") or ""
     ro_dirs = [Path(p.strip()).resolve() for p in ro_raw.split(os.pathsep) if p.strip()]
@@ -487,6 +541,10 @@ def load_config(
     video_model = (
         merged.get("BLENDERBOT_VIDEO_MODEL", "bytedance/seedance-2.5").strip()
         or "bytedance/seedance-2.5"
+    )
+    meshy_model = (
+        merged.get("BLENDERBOT_MESHY_MODEL", "meshy/v7.1/image-to-3d").strip()
+        or "meshy/v7.1/image-to-3d"
     )
 
     return Config(
@@ -515,12 +573,14 @@ def load_config(
         web_token=web_token,
         web_open=web_open,
         shell_timeout=shell_timeout,
+        modal_worker_timeout=modal_worker_timeout,
         ro_dirs=ro_dirs,
         agents_files=agents_files,
         agents_budget=agents_budget,
         role=role,
         image_model=image_model,
         video_model=video_model,
+        meshy_model=meshy_model,
         keys=keys,
         key_origins=key_origins,
         var_origins=origins,

@@ -28,6 +28,10 @@ from .state import WebState
 
 WEB_STATIC_DIR = Path(__file__).resolve().parents[1] / "ui" / "web"
 _PROACTOR_PATCHED = False
+_NO_STORE_HEADERS = {
+    "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+    "Pragma": "no-cache",
+}
 
 
 def is_benign_socket_disconnect(exc: BaseException | None) -> bool:
@@ -151,11 +155,11 @@ def create_fastapi_app(state: WebState) -> FastAPI:
 
     @app.get("/", include_in_schema=False)
     async def serve_index() -> FileResponse:
-        return FileResponse(WEB_STATIC_DIR / "index.html")
+        return FileResponse(WEB_STATIC_DIR / "index.html", headers=_NO_STORE_HEADERS)
 
     @app.get("/fps", include_in_schema=False)
     async def serve_fps_studio() -> FileResponse:
-        return FileResponse(WEB_STATIC_DIR / "index.html")
+        return FileResponse(WEB_STATIC_DIR / "index.html", headers=_NO_STORE_HEADERS)
 
     @app.get("/favicon.svg", include_in_schema=False)
     @app.get("/favicon.ico", include_in_schema=False)
@@ -167,7 +171,7 @@ def create_fastapi_app(state: WebState) -> FastAPI:
         target = (WEB_STATIC_DIR / Path(name).name).resolve()
         if target.parent != WEB_STATIC_DIR or not target.is_file():
             return JSONResponse({"error": "not found"}, status_code=404)
-        return FileResponse(target)
+        return FileResponse(target, headers=_NO_STORE_HEADERS)
 
     app.include_router(api_router, default_response_class=SafeJSONResponse)
     return app

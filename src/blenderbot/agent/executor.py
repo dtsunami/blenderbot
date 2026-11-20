@@ -159,6 +159,41 @@ def plan_batch(
                         )
             elif call.op in JOURNAL_OPS:
                 pass
+            elif call.op == "gen.meshy":
+                p = call.params
+                raw_im = str(p.get("image") or p.get("image_url") or "").strip()
+                if not raw_im:
+                    errors.append(
+                        {
+                            "index": call.index,
+                            "op": call.op,
+                            "message": "gen.meshy requires 'image' (workspace path, https:// URL, or data: URI)",
+                        }
+                    )
+                elif not raw_im.startswith(("https://", "http://", "data:")):
+                    rf_m = sandbox.resolve_for_read(raw_im)
+                    if not rf_m.is_file():
+                        errors.append(
+                            {
+                                "index": call.index,
+                                "op": call.op,
+                                "message": f"{sandbox.rel(rf_m)} does not exist",
+                            }
+                        )
+                if p.get("texture_image") and not str(p["texture_image"]).startswith(
+                    ("https://", "http://", "data:")
+                ):
+                    tf_m = sandbox.resolve_for_read(str(p["texture_image"]))
+                    if not tf_m.is_file():
+                        errors.append(
+                            {
+                                "index": call.index,
+                                "op": call.op,
+                                "message": f"{sandbox.rel(tf_m)} does not exist",
+                            }
+                        )
+                if p.get("output_path"):
+                    sandbox.resolve_for_write(str(p["output_path"]))
             elif call.op == "gen.seedream":
                 p = call.params
                 if not str(p.get("prompt") or "").strip():
@@ -228,10 +263,94 @@ def plan_batch(
                     )
                 else:
                     vf = sandbox.resolve_for_read(str(p["video_path"]))
-                    if not vf.is_file():
+                    if vf.is_dir():
+                        errors.append(
+                            {
+                                "index": call.index,
+                                "op": call.op,
+                                "message": (
+                                    f"{sandbox.rel(vf)} is a directory — use splat.from_images with "
+                                    f"images_path='{sandbox.rel(vf)}'"
+                                ),
+                            }
+                        )
+                    elif not vf.is_file():
                         errors.append(
                             {"index": call.index, "op": call.op, "message": f"{sandbox.rel(vf)} does not exist"}
                         )
+                if p.get("known_cameras_path"):
+                    kf = sandbox.resolve_for_read(str(p["known_cameras_path"]))
+                    if not kf.is_file():
+                        errors.append(
+                            {"index": call.index, "op": call.op, "message": f"{sandbox.rel(kf)} does not exist"}
+                        )
+                if p.get("output_dir"):
+                    sandbox.resolve_for_write(str(p["output_dir"]))
+            elif call.op == "splat.from_images":
+                from blenderbot.splats.client import discover_image_files
+
+                p = call.params
+                raw_dir_p = p.get("images_path") or p.get("folder") or p.get("path")
+                raw_list_p = p.get("images")
+                if not raw_dir_p and not raw_list_p:
+                    errors.append(
+                        {
+                            "index": call.index,
+                            "op": call.op,
+                            "message": "splat.from_images requires 'images_path' (directory) or 'images' (list of paths)",
+                        }
+                    )
+                else:
+                    res_dir: Path | None = None
+                    res_list: list[Path] | None = None
+                    if raw_dir_p:
+                        cand_p = sandbox.resolve_for_read(str(raw_dir_p))
+                        if cand_p.is_file():
+                            res_list = [cand_p]
+                        elif not cand_p.is_dir():
+                            errors.append(
+                                {
+                                    "index": call.index,
+                                    "op": call.op,
+                                    "message": f"{sandbox.rel(cand_p)} does not exist",
+                                }
+                            )
+                        else:
+                            res_dir = cand_p
+                    if raw_list_p:
+                        if not isinstance(raw_list_p, list):
+                            errors.append(
+                                {
+                                    "index": call.index,
+                                    "op": call.op,
+                                    "message": "splat.from_images 'images' must be a list of file paths",
+                                }
+                            )
+                        else:
+                            res_list = list(res_list or [])
+                            for item_p in raw_list_p:
+                                ip = sandbox.resolve_for_read(str(item_p))
+                                if not ip.exists():
+                                    errors.append(
+                                        {
+                                            "index": call.index,
+                                            "op": call.op,
+                                            "message": f"{sandbox.rel(ip)} does not exist",
+                                        }
+                                    )
+                                else:
+                                    res_list.append(ip)
+                    if not errors and (res_dir is not None or res_list):
+                        try:
+                            discover_image_files(images_path=res_dir, image_paths=res_list)
+                        except (FileNotFoundError, ValueError) as img_err:
+                            errors.append(
+                                {
+                                    "index": call.index,
+                                    "op": call.op,
+                                    "message": str(img_err),
+                                }
+                            )
                 if p.get("known_cameras_path"):
                     kf = sandbox.resolve_for_read(str(p["known_cameras_path"]))
                     if not kf.is_file():
@@ -504,6 +623,14 @@ def _needs_blend_checkpoint(calls: list[OpCall]) -> bool:
     for c in calls:
         if c.op in non_scene_mutators:
             continue
+        if c.op in (
+            "gen.meshy",
+            "splat.from_video",
+            "splat.from_images",
+            "splat.from_blender",
+            "splat.resume",
+        ) and bool(c.params.get("auto_import", False)):
+            return True
         spec = get_op(c.op)
         if spec and (spec.snapshot_blend or spec.tier in ("mutate", "destructive", "eval")):
             return True
@@ -698,6 +825,109 @@ async def execute_batch(
                     res = await journal.redo_next(
                         transport, steps=int(call.params.get("steps", 1))
                     )
+            elif call.op == "gen.meshy":
+                from blenderbot.media_gen.meshy import (
+                    DEFAULT_MESHY_MODEL,
+                    default_meshy_job_dir,
+                    generate_meshy_3d,
+                )
+
+                fal_key_m = (
+                    (cfg.keys.get("fal") if cfg else None)
+                    or os.environ.get("FAL_KEY")
+                    or os.environ.get("FAL_API_KEY")
+                    or ""
+                )
+                p = call.params
+                raw_im = str(p.get("image") or p.get("image_url") or "").strip()
+                src_im: str | Path = (
+                    raw_im
+                    if raw_im.startswith(("https://", "http://", "data:"))
+                    else sandbox.resolve_for_read(raw_im)
+                )
+                tex_im: str | Path | None = None
+                if p.get("texture_image") or p.get("texture_image_url"):
+                    raw_ti = str(p.get("texture_image") or p.get("texture_image_url")).strip()
+                    tex_im = (
+                        raw_ti
+                        if raw_ti.startswith(("https://", "http://", "data:"))
+                        else sandbox.resolve_for_read(raw_ti)
+                    )
+
+                if p.get("output_path"):
+                    out_glb_m = sandbox.resolve_for_write(str(p["output_path"]))
+                    if out_glb_m.suffix.lower() != ".glb":
+                        out_glb_m = out_glb_m.with_suffix(".glb")
+                    job_dir_m = out_glb_m.parent
+                else:
+                    stem_m = src_im.stem if isinstance(src_im, Path) else "meshy"
+                    _, job_dir_m = default_meshy_job_dir(sandbox.cwd, stem=stem_m)
+                    out_glb_m = job_dir_m / "model.glb"
+
+                bf_m = journal.snapshot_file(out_glb_m)
+                res = await generate_meshy_3d(
+                    api_key=fal_key_m,
+                    output_dir=job_dir_m,
+                    output_path=out_glb_m,
+                    image=src_im,
+                    model=str(
+                        p.get("model")
+                        or (cfg.meshy_model if cfg else DEFAULT_MESHY_MODEL)
+                    ),
+                    topology=str(p.get("topology") or "triangle"),
+                    target_polycount=int(p.get("target_polycount") or 30000),
+                    symmetry_mode=str(p.get("symmetry_mode") or "auto"),
+                    should_remesh=bool(p.get("should_remesh", True)),
+                    should_texture=bool(p.get("should_texture", True)),
+                    texture_model=str(p["texture_model"]) if p.get("texture_model") else None,
+                    enable_pbr=bool(p.get("enable_pbr", False)),
+                    pose_mode=str(p.get("pose_mode") or ""),
+                    texture_prompt=str(p["texture_prompt"]) if p.get("texture_prompt") else None,
+                    texture_image=tex_im,
+                    enable_rigging=bool(p.get("enable_rigging", False)),
+                    rigging_height_meters=float(p.get("rigging_height_meters", 1.7)),
+                    skeleton_template=str(p["skeleton_template"]) if p.get("skeleton_template") else None,
+                    include_fingers=bool(p.get("include_fingers", False)),
+                    enable_animation=bool(p.get("enable_animation", False)),
+                    animation_action_id=int(p.get("animation_action_id", 92)),
+                    enable_safety_checker=bool(p.get("enable_safety_checker", True)),
+                    geometry_resolution=str(p["geometry_resolution"]) if p.get("geometry_resolution") else None,
+                    timeout_sec=float(p.get("timeout_sec", 900.0)),
+                    on_progress=on_progress,
+                )
+                actual_glb_m = Path(str(res["glb_path"]))
+                before_files.append(bf_m)
+                after_files.append(journal.snapshot_file(actual_glb_m))
+                mutated_ops_names.append(f"gen.meshy({sandbox.rel(actual_glb_m)})")
+
+                if bool(p.get("auto_import", False)) and transport is not None:
+                    imp_target_m = (
+                        Path(str(res["animation_glb_path"]))
+                        if res.get("animation_glb_path")
+                        else Path(str(res["rigged_glb_path"]))
+                        if res.get("rigged_glb_path")
+                        else actual_glb_m
+                    )
+                    imp_res_m = await _call_transport_with_progress(
+                        transport,
+                        "asset.import",
+                        {
+                            "filepath": str(imp_target_m),
+                            "collection": str(p.get("collection") or "MeshyAssets"),
+                            "place_on_ground": True,
+                        },
+                        timeout=120.0,
+                        on_progress=on_progress,
+                    )
+                    res["blender_imported"] = imp_res_m
+
+                if res.get("thumbnail_path"):
+                    tp_m = Path(str(res["thumbnail_path"]))
+                    if tp_m.is_file() and bool(p.get("attach_to_context", True)):
+                        sandbox.allow_read_file(tp_m)
+                        attached_media.append(
+                            {"kind": "image", "path": str(tp_m), "op": call.op}
+                        )
             elif call.op == "gen.seedream":
                 from blenderbot.media_gen.seedream import (
                     default_seedream_output_path,
@@ -804,19 +1034,45 @@ async def execute_batch(
                 after_files.append(journal.snapshot_file(out_sd))
                 mutated_ops_names.append(f"gen.seedance({sandbox.rel(out_sd)})")
                 attached_media.extend(_collect_media_attachments(call, res, sandbox))
-            elif call.op in ("splat.from_video", "splat.from_blender", "splat.resume"):
-                from blenderbot.splats.client import make_job_id, run_modal_splat_job
+            elif call.op in ("splat.from_video", "splat.from_images", "splat.from_blender", "splat.resume"):
+                from blenderbot.splats.client import (
+                    discover_image_files,
+                    make_job_id,
+                    run_modal_splat_job,
+                )
                 from blenderbot.splats.config import SplatConfig, SurgerySpec
 
                 p = call.params
                 is_res_op = call.op == "splat.resume"
+                skip_override_keys = {
+                    "config",
+                    "surgery",
+                    "masks",
+                    "exclude_frames",
+                    "images",
+                    "images_path",
+                    "folder",
+                    "path",
+                    "video_path",
+                    "known_cameras_path",
+                    "output_dir",
+                    "timeout_sec",
+                    "auto_import",
+                    "attach_to_context",
+                    "render_mode",
+                    "max_points",
+                    "import_proxy_mesh",
+                    "name",
+                }
                 raw_overrides = dict(p.get("config") or {})
                 for fk, fv in p.items():
-                    if fk not in ("config", "surgery", "masks", "exclude_frames") and fv is not None:
+                    if fk not in skip_override_keys and fv is not None:
                         raw_overrides.setdefault(fk, fv)
                 splat_cfg = None if is_res_op else SplatConfig.from_dict(raw_overrides)
 
                 video_p: Path | None = None
+                images_dir_p: Path | None = None
+                images_list_p: list[Path] | None = None
                 bundle_p: Path | None = None
                 known_cams_p: Path | None = None
                 if call.op == "splat.from_video":
@@ -824,6 +1080,25 @@ async def execute_batch(
                     if p.get("known_cameras_path"):
                         known_cams_p = sandbox.resolve_for_read(str(p["known_cameras_path"]))
                     job_id = str(p.get("job_id") or make_job_id(video_p))
+                elif call.op == "splat.from_images":
+                    raw_dir_p = p.get("images_path") or p.get("folder") or p.get("path")
+                    if raw_dir_p:
+                        cand_p = sandbox.resolve_for_read(str(raw_dir_p))
+                        if cand_p.is_dir():
+                            images_dir_p = cand_p
+                        else:
+                            images_list_p = [cand_p]
+                    if p.get("images"):
+                        images_list_p = list(images_list_p or []) + [
+                            sandbox.resolve_for_read(str(x)) for x in p["images"]
+                        ]
+                    checked_imgs = discover_image_files(
+                        images_path=images_dir_p, image_paths=images_list_p
+                    )
+                    if p.get("known_cameras_path"):
+                        known_cams_p = sandbox.resolve_for_read(str(p["known_cameras_path"]))
+                    stem_src = images_dir_p if images_dir_p is not None else checked_imgs[0].parent
+                    job_id = str(p.get("job_id") or make_job_id(stem_src))
                 elif call.op == "splat.from_blender":
                     job_id = str(p.get("job_id") or make_job_id(Path("blender_scene")))
                 else:
@@ -835,6 +1110,21 @@ async def execute_batch(
                     else (sandbox.cwd / "assets" / "splats" / job_id)
                 )
                 out_dir.mkdir(parents=True, exist_ok=True)
+                if video_p is not None:
+                    (out_dir / "job_source.json").write_text(
+                        json.dumps({"video_rel": sandbox.rel(video_p), "created_at": os.path.getmtime(video_p)}, indent=2),
+                        encoding="utf-8",
+                    )
+                elif call.op == "splat.from_images":
+                    src_rel = (
+                        sandbox.rel(images_dir_p)
+                        if images_dir_p is not None
+                        else [sandbox.rel(ip) for ip in (images_list_p or [])]
+                    )
+                    (out_dir / "job_source.json").write_text(
+                        json.dumps({"images_rel": src_rel, "count": len(checked_imgs)}, indent=2),
+                        encoding="utf-8",
+                    )
 
                 if call.op == "splat.from_blender":
                     if p.get("views_bundle_path"):
@@ -875,10 +1165,17 @@ async def execute_batch(
                     }
                 surg_spec = SurgerySpec.from_dict(p["surgery"]) if p.get("surgery") else None
 
+                eff_modal_timeout = (
+                    float(p["timeout_sec"])
+                    if p.get("timeout_sec") is not None
+                    else (cfg.modal_worker_timeout if cfg is not None else None)
+                )
                 splat_res = await run_modal_splat_job(
                     output_dir=out_dir,
                     job_id=job_id,
                     video_path=video_p,
+                    images_path=images_dir_p,
+                    image_paths=images_list_p,
                     views_bundle_path=bundle_p,
                     known_cameras_path=known_cams_p,
                     cfg=splat_cfg,
@@ -887,6 +1184,7 @@ async def execute_batch(
                     surgery=surg_spec,
                     masks_paths=masks_map,
                     exclude_frames=[str(x) for x in p["exclude_frames"]] if p.get("exclude_frames") else None,
+                    timeout_sec=eff_modal_timeout,
                     on_event=on_progress,
                 )
 
@@ -966,12 +1264,18 @@ async def execute_batch(
                     if p.get("output_path")
                     else (ply_fb.parent / "renders" / "modal_recreated.mp4")
                 )
+                eff_ren_timeout = (
+                    float(p["timeout_sec"])
+                    if p.get("timeout_sec") is not None
+                    else (cfg.modal_worker_timeout if cfg is not None else None)
+                )
                 r_res = await run_modal_splat_render(
                     job_id=job_id,
                     output_mp4=out_mp4,
                     trajectory_doc=traj_doc,
                     ply_fallback_path=ply_fb if ply_fb.is_file() else None,
                     gpu=str(p.get("gpu") or "H100"),
+                    timeout_sec=eff_ren_timeout,
                     on_event=on_progress,
                 )
                 res = {
@@ -1076,6 +1380,11 @@ async def execute_batch(
                         scene=str(p["scene"]) if p.get("scene") else None,
                         quality=str(p.get("quality") or "HIGH"),
                         shards=int(p["shards"]) if p.get("shards") is not None else None,
+                        timeout_sec=(
+                            float(p["timeout_sec"])
+                            if p.get("timeout_sec") is not None
+                            else (cfg.modal_worker_timeout if cfg is not None else None)
+                        ),
                         on_event=on_progress,
                     )
                 finally:

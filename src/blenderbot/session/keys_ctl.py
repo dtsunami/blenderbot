@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from blenderbot.config.env import PROVIDERS, key_var_for
+from blenderbot.config.env import KEY_TARGETS, key_var_for
 from blenderbot.config.envfile import env_file_path, set_env_vars
 from blenderbot.providers import mask_key
 
@@ -12,7 +12,7 @@ from blenderbot.providers import mask_key
 def key_state(session: Any) -> list[dict[str, Any]]:
     cfg = session.cfg
     out: list[dict[str, Any]] = []
-    for p in PROVIDERS:
+    for p in KEY_TARGETS:
         val = cfg.keys.get(p)
         origin = cfg.key_origins.get(p) or {}
         out.append(
