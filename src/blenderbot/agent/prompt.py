@@ -36,7 +36,10 @@ Be concise and concrete. Skip preamble, skip flattery, skip restating the reques
 5. **Programmatic + Visual Self-Verification Loop:**
    - Before concluding any non-trivial modeling, layout, or animation task:
      1. Run **`scene.audit`** (`meshes`, `fail_on_non_manifold`, `check_collisions`, `subject`, `ground`, `camera`, `contact_tolerance_mm`, `frustum_margin`) to verify clean manifold geometry, positive applied scales, zero unwanted intersections, ground contact, and full-AABB camera framing.
-     2. Ensure a camera (`camera.upsert`) and lighting (`light.rig` + `world.setup`) exist, then call **`viewport.render_still`** (or **`viewport.contact_sheet`** across animated frames, or **`render.still`** with `BLENDER_EEVEE`/`CYCLES`). Rendered PNGs are **automatically attached as vision input** on your next turn — inspect silhouette, framing, materials, shadows, and motion arcs visually, fix any issues, and only then present your final result!"""
+     2. Ensure a camera (`camera.upsert`) and lighting (`light.rig` + `world.setup`) exist, then call **`viewport.render_still`** (or **`viewport.contact_sheet`** across animated frames, or **`render.still`** with `BLENDER_EEVEE`/`CYCLES`). Rendered PNGs are **automatically attached as vision input** on your next turn — inspect silhouette, framing, materials, shadows, and motion arcs visually, fix any issues, and only then present your final result!
+6. **Cloud GPU Rendering on Modal (`render.modal`) vs. Local Render Progress:**
+   - Whenever the operator asks to render on **Modal** / cloud GPU — or when rendering multi-frame `CYCLES` animations for speed — call **`render.modal`** directly (packs the live `.blend` scene + textures and runs official headless Blender 5.3 `CYCLES` OptiX + Tensor-Core denoiser or `BLENDER_EEVEE` on Modal `H100` / `L40S` GPUs). **NEVER** detour through `splat.from_blender` unless 3D Gaussian Splats were explicitly requested!
+   - Local `render.still`, `render.animation`, and `render.playblast` automatically stream frame/sample progress and suspend RPC timeouts while rendering."""
 
 
 def _build_protocol_default(role: str = "master") -> str:
@@ -91,6 +94,12 @@ def _build_protocol_default(role: str = "master") -> str:
             "mutate",
             "`path`, `old`, `new`, `all`?",
             "Replace exact text in workspace file (sandboxed & journaled)",
+        ),
+        (
+            "render.modal",
+            "mutate",
+            "`output_path`?, `mode`? (`animation`|`still`), `engine`? (`CYCLES`|`BLENDER_EEVEE`|`BLENDER_WORKBENCH`), `gpu`? (`H100`|`L40S`), `shards`? (auto up to 8 parallel GPUs), `samples`?, `denoise`?, `resolution`?, `frame`?, `frame_start`?, `frame_end`?, `camera`?, `quality`?, `blend_path`?",
+            "Push the active Blender 5.3 `.blend` scene directly to parallel Modal H100/L40S GPUs (`CYCLES` CUDA/OptiX + denoiser or `BLENDER_EEVEE`) for fast sharded cloud `.mp4`/`.png`/`.exr` rendering",
         ),
         (
             "gen.seedream",

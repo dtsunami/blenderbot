@@ -278,6 +278,28 @@ def plan_batch(
                     )
                 if p.get("output_dir"):
                     sandbox.resolve_for_write(str(p["output_dir"]))
+            elif call.op == "render.modal":
+                p = call.params
+                if p.get("blend_path"):
+                    bf_p = sandbox.resolve_for_read(str(p["blend_path"]))
+                    if not bf_p.is_file():
+                        errors.append(
+                            {
+                                "index": call.index,
+                                "op": call.op,
+                                "message": f"{sandbox.rel(bf_p)} does not exist",
+                            }
+                        )
+                elif not has_transport:
+                    errors.append(
+                        {
+                            "index": call.index,
+                            "op": call.op,
+                            "message": "render.modal requires Blender connected (or pass 'blend_path')",
+                        }
+                    )
+                if p.get("output_path"):
+                    sandbox.resolve_for_write(str(p["output_path"]))
             elif call.op == "splat.resume":
                 p = call.params
                 if not p.get("job_id"):
@@ -529,12 +551,58 @@ def _normalize_blender_params(call: OpCall, sandbox: Sandbox) -> dict[str, Any]:
     return params
 
 
+LOCAL_RENDER_SUSPEND_OPS = frozenset(
+    {
+        "render.animation",
+        "render.playblast",
+        "render.still",
+        "viewport.render_still",
+        "viewport.contact_sheet",
+        "splat.capture_views",
+    }
+)
+
+
 def _op_timeout_for(op_name: str, params: dict[str, Any]) -> float:
     if op_name in ("render.animation", "render.playblast", "splat.capture_views"):
         return float(params.get("timeout_sec", 300.0))
     if op_name in ("render.still", "viewport.contact_sheet", "bpy.tx", "bpy.eval", "anim.bake", "splat.import"):
         return float(params.get("timeout_sec", 180.0))
     return 90.0
+
+
+def _wants_modal_render(call: OpCall) -> bool:
+    if call.op == "render.modal":
+        return True
+    if call.op in ("render.animation", "render.still", "render.playblast"):
+        p = call.params
+        if bool(p.get("modal", False)):
+            return True
+        if str(p.get("backend") or "").strip().lower() == "modal":
+            return True
+    return False
+
+
+async def _call_transport_with_progress(
+    transport: BlenderTransport,
+    op_name: str,
+    params: dict[str, Any],
+    *,
+    timeout: float,
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    suspend = op_name in LOCAL_RENDER_SUSPEND_OPS and params.get("timeout_sec") is None
+    try:
+        return await transport.call(
+            op_name,
+            params,
+            timeout=timeout,
+            on_progress=on_progress,
+            suspend_timeout=suspend,
+        )
+    except TypeError:
+        # Fallback for any minimal test/mock transport implementing `call(op, params, *, timeout)`
+        return await transport.call(op_name, params, timeout=timeout)
 
 
 def _collect_media_attachments(
@@ -550,9 +618,9 @@ def _collect_media_attachments(
     sandbox.allow_read_file(out_p)
     ext = out_p.suffix.lower()
 
-    # Default `attach_to_context` is True for viewport stills, contact sheets, Seedream images, and PNG/JPG `render.still`
+    # Default `attach_to_context` is True for viewport stills, contact sheets, Seedream images, and PNG/JPG `render.still` / `render.modal` stills
     default_attach = call.op in ("viewport.render_still", "viewport.contact_sheet", "gen.seedream") or (
-        call.op == "render.still" and ext in (".png", ".jpg", ".jpeg", ".webp")
+        call.op in ("render.still", "render.modal") and ext in (".png", ".jpg", ".jpeg", ".webp")
     )
     want_attach = bool(call.params.get("attach_to_context", default_attach))
     if not want_attach:
@@ -578,6 +646,7 @@ async def execute_batch(
     auto_checkpoint: bool = True,
     approve: ApproveHook | None = None,
     actor: str = "agent",
+    on_progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> BatchOutcome:
     eff_role = role or (cfg.role if cfg else "master")
     plan_errors = plan_batch(
@@ -789,10 +858,12 @@ async def execute_batch(
                         ):
                             if ck in p and p[ck] is not None:
                                 cap_params[ck] = p[ck]
-                        await transport.call(
+                        await _call_transport_with_progress(
+                            transport,
                             "splat.capture_views",
                             cap_params,
                             timeout=float(p.get("capture_timeout_sec", 300.0)),
+                            on_progress=on_progress,
                         )
 
                 masks_map: dict[str, Path] | None = None
@@ -816,6 +887,7 @@ async def execute_batch(
                     surgery=surg_spec,
                     masks_paths=masks_map,
                     exclude_frames=[str(x) for x in p["exclude_frames"]] if p.get("exclude_frames") else None,
+                    on_event=on_progress,
                 )
 
                 imported_info: dict[str, Any] | None = None
@@ -900,6 +972,7 @@ async def execute_batch(
                     trajectory_doc=traj_doc,
                     ply_fallback_path=ply_fb if ply_fb.is_file() else None,
                     gpu=str(p.get("gpu") or "H100"),
+                    on_event=on_progress,
                 )
                 res = {
                     "job_id": job_id,
@@ -914,11 +987,145 @@ async def execute_batch(
                 if bool(p.get("attach_to_context", False)):
                     attached_media.extend(_collect_media_attachments(call, {"output_path": str(r_res.output_mp4)}, sandbox))
                 mutated_ops_names.append(f"splat.render_path({sandbox.rel(r_res.output_mp4)})")
+            elif _wants_modal_render(call):
+                import tempfile
+
+                from blenderbot.splats.blender_render import run_modal_blender_render
+
+                p = call.params
+                if call.op == "render.still":
+                    eff_mode = "still"
+                elif call.op in ("render.animation", "render.playblast"):
+                    eff_mode = "animation"
+                else:
+                    raw_m = str(p.get("mode") or "").strip().lower()
+                    if raw_m in ("still", "animation"):
+                        eff_mode = raw_m
+                    else:
+                        ext_hint = Path(str(p.get("output_path") or "")).suffix.lower()
+                        eff_mode = (
+                            "still"
+                            if (ext_hint in (".png", ".exr", ".jpg", ".jpeg") or p.get("frame") is not None)
+                            else "animation"
+                        )
+
+                renders_dir = sandbox.cwd / "renders"
+                renders_dir.mkdir(parents=True, exist_ok=True)
+                if p.get("output_path"):
+                    out_mr = sandbox.resolve_for_write(str(p["output_path"]))
+                else:
+                    out_mr = renders_dir / (
+                        "modal_still.png" if eff_mode == "still" else "modal_walkthrough.mp4"
+                    )
+                if eff_mode == "animation" and out_mr.suffix.lower() != ".mp4":
+                    out_mr = out_mr.with_suffix(".mp4")
+                elif eff_mode == "still" and out_mr.suffix.lower() not in (".png", ".exr", ".jpg", ".jpeg"):
+                    out_mr = out_mr.with_suffix(".png")
+
+                tmp_blend_cleanup: Path | None = None
+                packed_range: list[int] | None = None
+                if p.get("blend_path"):
+                    blend_src = sandbox.resolve_for_read(str(p["blend_path"]))
+                else:
+                    assert transport is not None
+                    tmp_fd, tmp_name = tempfile.mkstemp(prefix="bb_modal_", suffix=".blend")
+                    os.close(tmp_fd)
+                    tmp_blend_cleanup = Path(tmp_name)
+                    pack_info = await _call_transport_with_progress(
+                        transport,
+                        "scene.pack_for_cloud",
+                        {"output_path": str(tmp_blend_cleanup)},
+                        timeout=120.0,
+                        on_progress=on_progress,
+                    )
+                    if isinstance(pack_info.get("frame_range"), list) and len(pack_info["frame_range"]) == 2:
+                        packed_range = [int(pack_info["frame_range"][0]), int(pack_info["frame_range"][1])]
+                    blend_src = tmp_blend_cleanup
+
+                eff_f_start = (
+                    int(p["frame_start"])
+                    if p.get("frame_start") is not None
+                    else (packed_range[0] if packed_range else None)
+                )
+                eff_f_end = (
+                    int(p["frame_end"])
+                    if p.get("frame_end") is not None
+                    else (packed_range[1] if packed_range else None)
+                )
+
+                bf_mr = journal.snapshot_file(out_mr)
+                try:
+                    default_eng = "BLENDER_WORKBENCH" if call.op == "render.playblast" else "CYCLES"
+                    mr_res = await run_modal_blender_render(
+                        blend_path=blend_src,
+                        output_path=out_mr,
+                        mode=eff_mode,
+                        engine=str(p.get("engine") or default_eng),
+                        fmt=str(p["format"]) if p.get("format") else None,
+                        gpu=str(p.get("gpu") or "H100"),
+                        samples=int(p["samples"]) if p.get("samples") is not None else None,
+                        denoise=bool(p.get("denoise", True)),
+                        use_persistent_data=bool(p.get("use_persistent_data", True)),
+                        film_transparent=bool(p["film_transparent"]) if p.get("film_transparent") is not None else None,
+                        resolution=list(p["resolution"]) if p.get("resolution") else None,
+                        frame=int(p["frame"]) if p.get("frame") is not None else None,
+                        frame_start=eff_f_start,
+                        frame_end=eff_f_end,
+                        frame_step=int(p["frame_step"]) if p.get("frame_step") is not None else None,
+                        camera=str(p["camera"]) if p.get("camera") else None,
+                        scene=str(p["scene"]) if p.get("scene") else None,
+                        quality=str(p.get("quality") or "HIGH"),
+                        shards=int(p["shards"]) if p.get("shards") is not None else None,
+                        on_event=on_progress,
+                    )
+                finally:
+                    if tmp_blend_cleanup is not None:
+                        with contextlib.suppress(OSError):
+                            tmp_blend_cleanup.unlink()
+
+                before_files.append(bf_mr)
+                after_files.append(journal.snapshot_file(mr_res.output_path, log_event=False))
+                mutated_ops_names.append(f"render.modal({sandbox.rel(mr_res.output_path)})")
+
+                res = {
+                    "output_path": str(mr_res.output_path),
+                    "rel_path": sandbox.rel(mr_res.output_path),
+                    "mode": mr_res.mode,
+                    "engine": mr_res.engine,
+                    "backend": mr_res.backend,
+                    "device": mr_res.device,
+                    "shards": mr_res.shards,
+                    "camera": mr_res.camera,
+                    "frames": mr_res.frames,
+                    "fps": round(mr_res.fps, 4),
+                    "resolution": [mr_res.width, mr_res.height],
+                    "wall_s": mr_res.wall_s,
+                    "blender_render_s": mr_res.blender_render_s,
+                    "render_fps": mr_res.render_fps,
+                    "ms_per_frame": mr_res.ms_per_frame,
+                    "cost_usd": mr_res.cost_usd,
+                }
+                attached_media.extend(_collect_media_attachments(call, res, sandbox))
+                # If animation finished and `attach_preview: true` (default True when video isn't attached),
+                # save & attach the mid-point frame PNG so vision models visually verify the Modal render!
+                if (
+                    mr_res.mode == "animation"
+                    and mr_res.preview_png_bytes
+                    and bool(p.get("attach_preview", not bool(p.get("attach_to_context", False))))
+                ):
+                    prev_p = mr_res.output_path.with_name(f"{mr_res.output_path.stem}_modal_mid.png")
+                    prev_p.write_bytes(mr_res.preview_png_bytes)
+                    sandbox.allow_read_file(prev_p)
+                    attached_media.append({"kind": "image", "path": str(prev_p), "op": "render.modal"})
             else:
                 assert transport is not None
                 call_params = _normalize_blender_params(call, sandbox)
-                res = await transport.call(
-                    call.op, call_params, timeout=_op_timeout_for(call.op, call.params)
+                res = await _call_transport_with_progress(
+                    transport,
+                    call.op,
+                    call_params,
+                    timeout=_op_timeout_for(call.op, call.params),
+                    on_progress=on_progress,
                 )
                 spec_c = get_op(call.op)
                 if spec_c and spec_c.tier != "read":
@@ -997,8 +1204,12 @@ async def execute_batch(
             else:
                 assert transport is not None
                 call_params = _normalize_blender_params(call, sandbox)
-                res = await transport.call(
-                    call.op, call_params, timeout=_op_timeout_for(call.op, call.params)
+                res = await _call_transport_with_progress(
+                    transport,
+                    call.op,
+                    call_params,
+                    timeout=_op_timeout_for(call.op, call.params),
+                    on_progress=on_progress,
                 )
                 mutated_ops_names.append(call.op)
                 attached_media.extend(_collect_media_attachments(call, res, sandbox))

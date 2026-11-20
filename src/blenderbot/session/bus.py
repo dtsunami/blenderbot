@@ -14,6 +14,7 @@ FORWARD_EVENTS: tuple[str, ...] = (
     "turn-start",
     "turn-end",
     "ops-parsed",
+    "op-progress",
     "ops-result",
     "artifact",
     "usage",
@@ -142,6 +143,14 @@ class SessionBus:
         elif ev_type == "ops-parsed":
             n = len(data) if isinstance(data, list) else 1
             s["status"] = f"running {n} op{'s' if n != 1 else ''}"
+        elif ev_type == "op-progress" and isinstance(data, dict):
+            if data.get("done_frames") is not None and data.get("total_frames"):
+                s["status"] = (
+                    f"{data.get('op', 'render')} {data['done_frames']}/{data['total_frames']} "
+                    f"({data.get('pct', 0)}%)"
+                )
+            elif data.get("step") is not None and data.get("total_steps"):
+                s["status"] = f"splat step {data['step']}/{data['total_steps']}"
         elif ev_type == "ops-result":
             s["status"] = None
         elif ev_type == "compact-start":

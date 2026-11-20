@@ -110,12 +110,24 @@ class HeadlessTransport(BlenderTransport):
         return await self._client.call("system.ping", timeout=5.0)
 
     async def call(
-        self, op_name: str, params: dict[str, Any] | None = None, *, timeout: float = 120.0
+        self,
+        op_name: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float = 120.0,
+        on_progress: Any = None,
+        suspend_timeout: bool = False,
     ) -> dict[str, Any]:
         if self._client is None or self._proc is None or self._proc.poll() is not None:
             await self.start()
         assert self._client is not None
-        return await self._client.call(op_name, params, timeout=timeout)
+        return await self._client.call(
+            op_name,
+            params,
+            timeout=timeout,
+            on_progress=on_progress,
+            suspend_timeout=suspend_timeout,
+        )
 
     async def close(self) -> None:
         client = self._client

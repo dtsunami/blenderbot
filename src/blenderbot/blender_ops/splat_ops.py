@@ -380,6 +380,8 @@ def op_splat_capture_views(ctx: OpContext, params: dict[str, Any]) -> dict[str, 
                         poses.append(Vector((px, py, pz)))
                 cam_list = [(temp_cam_obj, pos) for pos in poses]
 
+            ctx.set_suspend_timeout(True)
+            total_views = max(1, len(cam_list))
             for idx, (cam_obj, pos_vec) in enumerate(cam_list):
                 if pos_vec is not None:
                     cam_obj.location = pos_vec
@@ -410,6 +412,19 @@ def op_splat_capture_views(ctx: OpContext, params: dict[str, Any]) -> dict[str, 
                 sc.camera = cam_obj
                 r.filepath = str(img_path)
                 bpy.ops.render.render(write_still=True)
+                ctx.report_progress(
+                    {
+                        "phase": "frame_done",
+                        "op": "splat.capture_views",
+                        "engine": engine,
+                        "frame": idx + 1,
+                        "done_frames": idx + 1,
+                        "total_frames": total_views,
+                        "pct": round(100.0 * (idx + 1) / total_views, 1),
+                        "elapsed_s": round(time.perf_counter() - t0, 2),
+                        "suspend_timeout": True,
+                    }
+                )
 
                 views_manifest.append({
                     "frame_index": idx,

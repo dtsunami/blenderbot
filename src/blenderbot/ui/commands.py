@@ -703,6 +703,45 @@ async def handle_command(
         try:
             renders_dir = session.cfg.cwd / "renders"
             renders_dir.mkdir(parents=True, exist_ok=True)
+            upper_args = [a.upper() for a in args]
+            if "MODAL" in upper_args:
+                from blenderbot.agent.executor import execute_batch
+                from blenderbot.agent.parser import OpCall
+
+                is_anim = any(x in upper_args for x in ("ANIM", "ANIMATION", "MP4"))
+                gpu_choice = "L40S" if "L40S" in upper_args else "H100"
+                out_m = renders_dir / ("modal_preview.mp4" if is_anim else "modal_still.png")
+                m_params: dict[str, Any] = {
+                    "output_path": str(out_m),
+                    "mode": "animation" if is_anim else "still",
+                    "engine": "BLENDER_EEVEE" if "BLENDER_EEVEE" in upper_args or "EEVEE" in upper_args else "CYCLES",
+                    "gpu": gpu_choice,
+                }
+                for a in args:
+                    if a.lstrip("-").isdigit():
+                        m_params["frame"] = int(a)
+                outcome = await execute_batch(
+                    [OpCall(index=0, op="render.modal", params=m_params)],
+                    sandbox=session.sandbox,
+                    journal=session.journal,
+                    transport=session.transport,
+                    cfg=session.cfg,
+                    actor="operator",
+                )
+                if outcome.status != "ok":
+                    raise RuntimeError(outcome.errors[0]["message"] if outcome.errors else outcome.status)
+                mr = outcome.results[0]["result"]
+                push(
+                    {
+                        "type": "notice",
+                        "message": (
+                            f"Modal {mr['device']} ({mr['backend']}) rendered {mr['frames']}f in "
+                            f"{mr['wall_s']}s (${mr['cost_usd']}) -> {mr['rel_path']}"
+                        ),
+                    }
+                )
+                return {"handled": True}
+
             params: dict[str, Any] = {"output_path": str(renders_dir / "still_preview.png")}
             for a in args:
                 if a.lstrip("-").isdigit():
@@ -714,7 +753,9 @@ async def handle_command(
                 if params.get("engine") == "BLENDER_WORKBENCH"
                 else "render.still"
             )
-            res = await session.transport.call(op_name, params, timeout=180.0)
+            res = await session.transport.call(
+                op_name, params, timeout=180.0, suspend_timeout=True
+            )
             out_p = Path(str(res["output_path"]))
             session.sandbox.allow_read_file(out_p)
             tok_note = ""

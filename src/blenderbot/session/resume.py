@@ -209,7 +209,7 @@ def restore_ledger_from_lines(lines: list[str], ledger: Ledger) -> int:
         data = ev.get("data") or {}
         if etype == "user" and data.get("text"):
             u_txt = sanitize_utf8_str(str(data["text"]))
-            ledger.add(seg_type="user", label=u_txt[:48], role="user", text=u_txt)
+            ledger.add(seg_type="user", label=u_txt[:200].replace("\n", " "), role="user", text=u_txt)
             restored += 1
         elif etype == "steer" and data.get("text"):
             s_txt = sanitize_utf8_str(str(data["text"]))

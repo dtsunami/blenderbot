@@ -409,11 +409,33 @@ async def run_tui_loop(
             )
         )
 
+    def _on_op_progress(p: dict[str, Any]) -> None:
+        nonlocal activity_label
+        if not isinstance(p, dict):
+            return
+        op_lbl = str(p.get("op") or p.get("stage") or "render")
+        if p.get("done_frames") is not None and p.get("total_frames"):
+            done_f = int(p["done_frames"])
+            tot_f = int(p["total_frames"])
+            pct = p.get("pct", 0.0)
+            ms_f = f" · {p['ms_per_frame']}ms/f" if p.get("ms_per_frame") else ""
+            eta = f" · ETA {p['eta_s']}s" if p.get("eta_s") else ""
+            dev = f" [{p['device']}]" if p.get("device") else ""
+            activity_label = f"{op_lbl}{dev} frame {done_f}/{tot_f} ({pct}%){ms_f}{eta}…"
+        elif p.get("phase") == "render_stats" and p.get("stats"):
+            activity_label = f"{op_lbl} f{p.get('frame', '?')} · {str(p['stats'])[:64]}…"
+        elif p.get("step") is not None and p.get("total_steps"):
+            activity_label = (
+                f"Modal 3DGS step {p['step']}/{p['total_steps']} "
+                f"(PSNR {p.get('psnr', 0)} dB)…"
+            )
+
     session.agent.on("turn-start", _on_turn_start)
     session.agent.on("thinking", _on_thinking)
     session.agent.on("text", _on_text)
     session.agent.on("turn-end", _on_turn_end)
     session.agent.on("ops-parsed", _on_ops_parsed)
+    session.agent.on("op-progress", _on_op_progress)
     session.agent.on("ops-result", _on_ops_result)
     session.agent.on("artifact", _on_artifact)
     session.agent.on("approval-request", _on_approval_request)

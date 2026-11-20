@@ -60,6 +60,7 @@ BUILDER_EXTRA_OPS = READ_ONLY_EXTRA_OPS | frozenset(
         "fs.replace",
         "journal.undo",
         "journal.redo",
+        "render.modal",
         "gen.seedream",
         "gen.seedance",
         "splat.from_video",

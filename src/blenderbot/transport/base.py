@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -21,7 +22,13 @@ class BlenderTransport(ABC):
 
     @abstractmethod
     async def call(
-        self, op_name: str, params: dict[str, Any] | None = None, *, timeout: float = 120.0
+        self,
+        op_name: str,
+        params: dict[str, Any] | None = None,
+        *,
+        timeout: float = 120.0,
+        on_progress: Callable[[dict[str, Any]], None] | None = None,
+        suspend_timeout: bool = False,
     ) -> dict[str, Any]:
         """Execute a registered `blender_ops` operation and return its JSON-serializable dict."""
 

@@ -68,6 +68,7 @@ EVENTS: tuple[str, ...] = (
     "turn-end",
     "usage",
     "ops-parsed",
+    "op-progress",
     "ops-result",
     "artifact",
     "approval-request",
@@ -547,7 +548,7 @@ class Agent(EventEmitter):
 
             self.ledger.add(
                 seg_type="user",
-                label=user_prompt[:48].replace("\n", " "),
+                label=user_prompt[:200].replace("\n", " "),
                 role="user",
                 text=prompt_with_state,
             )
@@ -808,6 +809,25 @@ class Agent(EventEmitter):
                         ops=[c.op for c in ops],
                     )
 
+                last_flight_note = 0.0
+
+                def _on_op_progress(pdata: dict[str, Any], _fl: Any = flight) -> None:
+                    nonlocal last_flight_note
+                    if _fl is not None:
+                        _fl.touch()
+                        now_m = time.monotonic()
+                        if pdata.get("phase") == "frame_done" and (now_m - last_flight_note) >= 8.0:
+                            last_flight_note = now_m
+                            _fl.note(
+                                "render-progress",
+                                op=pdata.get("op"),
+                                done_frames=pdata.get("done_frames"),
+                                total_frames=pdata.get("total_frames"),
+                                pct=pdata.get("pct"),
+                                eta_s=pdata.get("eta_s"),
+                            )
+                    self.emit("op-progress", pdata)
+
                 outcome = await execute_batch(
                     ops,
                     sandbox=self.sandbox,
@@ -818,6 +838,7 @@ class Agent(EventEmitter):
                     yolo=self.cfg.yolo,
                     shell_timeout=self.cfg.shell_timeout,
                     approve=self._request_approval,
+                    on_progress=_on_op_progress,
                 )
                 self.stats["ops"] += len(ops)
                 for r_item in outcome.results:

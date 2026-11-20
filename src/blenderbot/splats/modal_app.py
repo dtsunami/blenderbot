@@ -20,6 +20,7 @@ import modal
 APP_NAME = "blenderbot-splat"
 MODELS_VOL_NAME = "blenderbot-splat-models"
 JOBS_VOL_NAME = "blenderbot-splat-jobs"
+BLENDER_CACHE_VOL_NAME = "blenderbot-blender-cache"
 CTL_DICT_NAME = "blenderbot-splat-ctl"
 
 GPU_HOURLY_USD: dict[str, float] = {
@@ -30,6 +31,7 @@ GPU_HOURLY_USD: dict[str, float] = {
 
 models_vol = modal.Volume.from_name(MODELS_VOL_NAME, create_if_missing=True)
 jobs_vol = modal.Volume.from_name(JOBS_VOL_NAME, create_if_missing=True)
+blender_cache_vol = modal.Volume.from_name(BLENDER_CACHE_VOL_NAME, create_if_missing=True)
 ctl_dict = modal.Dict.from_name(CTL_DICT_NAME, create_if_missing=True)
 
 
@@ -246,3 +248,161 @@ class SplatWorker(_BaseSplatWorker):
 )
 class SplatWorkerL40S(_BaseSplatWorker):
     """Cost-optimized L40S (48 GB Ada, $1.95/hr) peer worker."""
+
+
+def _install_blender_linux() -> None:
+    """Download & verify official Blender 5.3 Linux x64 release into `/opt/blender`."""
+    import re
+    import shutil
+    import urllib.request
+
+    candidate_urls = [
+        "https://download.blender.org/release/Blender5.3/blender-5.3.0-linux-x64.tar.xz",
+        "https://mirrors.ocf.berkeley.edu/blender/release/Blender5.3/blender-5.3.0-linux-x64.tar.xz",
+        "https://mirrors.dotsrc.org/blender/release/Blender5.3/blender-5.3.0-linux-x64.tar.xz",
+    ]
+    # Also dynamically check release directory index in case a newer 5.3.x patch exists
+    for idx_url in (
+        "https://download.blender.org/release/Blender5.3/",
+        "https://download.blender.org/release/Blender5.2/",
+        "https://download.blender.org/release/Blender5.1/",
+    ):
+        try:
+            req = urllib.request.Request(idx_url, headers={"User-Agent": "blenderbot-modal/1.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+            matches = sorted(
+                set(re.findall(r'blender-\d+\.\d+\.\d+-linux-x64\.tar\.xz', html)),
+                reverse=True,
+            )
+            for m in matches:
+                u = idx_url + m
+                if u not in candidate_urls:
+                    candidate_urls.append(u)
+        except Exception:  # noqa: BLE001, S112
+            continue
+
+    tar_dst = Path("/tmp/blender-linux-x64.tar.xz")
+    downloaded_from = None
+    for url in candidate_urls:
+        try:
+            print(f"Trying Blender Linux x64 tarball: {url}")
+            res = subprocess.run(
+                ["curl", "-fSL", "--retry", "3", "--connect-timeout", "15", "-o", str(tar_dst), url],
+                check=False,
+            )
+            if res.returncode == 0 and tar_dst.is_file() and tar_dst.stat().st_size > 100_000_000:
+                downloaded_from = url
+                break
+        except Exception:  # noqa: BLE001, S112
+            continue
+
+    if not downloaded_from:
+        raise RuntimeError(f"Could not download Blender 5.x Linux x64 from any mirror: {candidate_urls[:4]}")
+
+    opt_bl = Path("/opt/blender")
+    shutil.rmtree(opt_bl, ignore_errors=True)
+    opt_bl.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["tar", "-xJf", str(tar_dst), "-C", str(opt_bl), "--strip-components=1"],
+        check=True,
+    )
+    tar_dst.unlink(missing_ok=True)
+
+    usr_bin = Path("/usr/local/bin/blender")
+    usr_bin.unlink(missing_ok=True)
+    usr_bin.symlink_to(opt_bl / "blender")
+
+    ver_out = subprocess.run(
+        [str(opt_bl / "blender"), "--version"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    print(f"BLENDER_LINUX_OK ({downloaded_from}):\n{ver_out.stdout.splitlines()[0]}")
+
+
+blender_render_image = (
+    modal.Image.from_registry("nvidia/cuda:12.4.1-runtime-ubuntu22.04", add_python="3.11")
+    .env({
+        "NVIDIA_DRIVER_CAPABILITIES": "all",
+        "OPTIX_CACHE_PATH": "/blender_cache/optix",
+        "CUDA_CACHE_PATH": "/blender_cache/cuda",
+    })
+    .apt_install(
+        "curl",
+        "xz-utils",
+        "ca-certificates",
+        "ffmpeg",
+        "libx11-6",
+        "libxi6",
+        "libxxf86vm1",
+        "libxfixes3",
+        "libxrender1",
+        "libxkbcommon0",
+        "libxkbcommon-x11-0",
+        "libsm6",
+        "libice6",
+        "libgl1",
+        "libegl1",
+        "libopengl0",
+        "libglvnd0",
+        "libgomp1",
+        "libdbus-1-3",
+        "fontconfig",
+    )
+    .run_function(_install_blender_linux, cpu=8.0)
+    .add_local_python_source("blenderbot")
+)
+
+
+class _BaseBlenderRenderWorker:
+    """Headless Blender 5.3 GPU renderer (`CYCLES` OptiX/CUDA + `BLENDER_EEVEE` EGL)."""
+
+    @modal.method()
+    def render_stream(
+        self,
+        *,
+        blend_gz: bytes,
+        render_spec: dict[str, Any],
+        gpu: str = "H100",
+    ) -> Iterator[dict[str, Any]]:
+        from blenderbot.splats.blender_render import run_blender_modal_render_stream
+
+        blender_cache_vol.reload()
+        rate = GPU_HOURLY_USD.get(gpu.upper(), 3.95)
+        for ev in run_blender_modal_render_stream(
+            blend_gz=blend_gz,
+            render_spec=render_spec,
+            gpu_hourly_usd=rate,
+        ):
+            if ev.get("event") == "render_done" and ev.get("backend") == "OPTIX":
+                try:
+                    blender_cache_vol.commit()
+                except Exception:  # noqa: BLE001, S110
+                    pass
+            yield ev
+
+
+@app.cls(
+    image=blender_render_image,
+    gpu="H100",
+    cpu=8.0,
+    volumes={"/blender_cache": blender_cache_vol},
+    scaledown_window=90,
+    timeout=1800,
+)
+class BlenderRenderWorker(_BaseBlenderRenderWorker):
+    """Primary H100 (80 GB HBM3) Blender 5.3 Cycles OptiX / EEVEE cloud renderer."""
+
+
+@app.cls(
+    image=blender_render_image,
+    gpu="L40S",
+    cpu=8.0,
+    volumes={"/blender_cache": blender_cache_vol},
+    scaledown_window=90,
+    timeout=1800,
+)
+class BlenderRenderWorkerL40S(_BaseBlenderRenderWorker):
+    """Cost-optimized L40S (48 GB Ada RT-Core, $1.95/hr) Blender 5.3 cloud renderer."""

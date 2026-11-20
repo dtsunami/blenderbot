@@ -546,6 +546,60 @@ def op_scene_save(ctx: OpContext, params: dict[str, Any]) -> dict[str, Any]:
 
 
 @blender_op(
+    "scene.pack_for_cloud",
+    tier="read",
+    summary="Export a self-contained compressed `.blend` copy (packing external image/HDRI textures) for Modal cloud GPU rendering.",
+    params_doc={
+        "output_path": "Destination temporary `.blend` file path",
+    },
+)
+def op_scene_pack_for_cloud(ctx: OpContext, params: dict[str, Any]) -> dict[str, Any]:
+    import tempfile
+
+    bpy = ctx.bpy
+    sc = ctx.scene
+    raw_out = str(params.get("output_path") or "").strip()
+    dest = (
+        Path(raw_out).resolve()
+        if raw_out
+        else Path(tempfile.gettempdir()) / f"blenderbot_cloud_{os.getpid()}.blend"
+    )
+    if dest.suffix.lower() != ".blend":
+        dest = dest.with_suffix(".blend")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+
+    packed_images = 0
+    for img in bpy.data.images:
+        if getattr(img, "source", "") in ("FILE", "TILED") and not getattr(img, "packed_file", None):
+            try:
+                fp_abs = Path(bpy.path.abspath(img.filepath)) if img.filepath else None
+                if fp_abs is not None and fp_abs.is_file():
+                    img.pack()
+                    packed_images += 1
+            except Exception:  # noqa: BLE001, S112
+                continue
+
+    bpy.ops.wm.save_as_mainfile(
+        filepath=str(dest),
+        copy=True,
+        compress=True,
+        check_existing=False,
+    )
+    fps = effective_fps(sc)
+    return {
+        "blend_path": str(dest),
+        "size_bytes": dest.stat().st_size if dest.is_file() else 0,
+        "packed_images": packed_images,
+        "scene": sc.name,
+        "camera": sc.camera.name if sc.camera else None,
+        "engine": str(sc.render.engine),
+        "fps": round(fps, 4),
+        "frame_range": [int(sc.frame_start), int(sc.frame_end)],
+        "resolution": [int(sc.render.resolution_x), int(sc.render.resolution_y)],
+    }
+
+
+@blender_op(
     "scene.open",
     tier="destructive",
     snapshot_blend=True,

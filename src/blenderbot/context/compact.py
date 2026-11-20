@@ -58,16 +58,30 @@ async def compact_ledger(
                 seg.tokens = estimate_text_tokens(clipped)
                 truncated += 1
 
-        # Pass 3: Condense oldest unpinned turns if still above target
+        # Pass 3: Condense oldest unpinned turns if still above target.
+        # CRITICAL: Never condense the latest `user` instruction (`last_user_idx`), even across
+        # long 20+ step autonomous tool loops, and preserve full user request text (not 48-char
+        # labels) when summarizing older turns so multi-part instructions are never clipped.
         summarized = 0
         if ledger.usage_fraction > eff_target and len(ledger.segments) > 8:
+            last_user_idx = max(
+                (i for i, s in enumerate(ledger.segments) if s.type == "user"),
+                default=-1,
+            )
             candidates = [
                 i
                 for i, s in enumerate(ledger.segments[:-6])
-                if not s.pinned and s.type not in PROTECTED_TYPES
+                if i != last_user_idx and not s.pinned and s.type not in PROTECTED_TYPES
             ]
             if len(candidates) >= 2:
                 slice_segs = [ledger.segments[i] for i in candidates[: min(8, len(candidates))]]
+
+                def _clean_user_body(raw_txt: str) -> str:
+                    txt = str(raw_txt or "").strip()
+                    if txt.startswith("[Blender Live:") and "\n\n" in txt:
+                        txt = txt.split("\n\n", 1)[1].strip()
+                    return txt[:1500]
+
                 transcript_text = "\n\n".join(
                     f"[{s.role.upper()} - {s.label}]\n{s.part.get('text', '[media]')[:1500]}"
                     for s in slice_segs
@@ -76,7 +90,12 @@ async def compact_ledger(
                 if callable(summarizer):
                     summary_body = await summarizer(transcript_text)
                 else:
-                    lines = [f"- {s.role}: {s.label}" for s in slice_segs]
+                    lines = []
+                    for s in slice_segs:
+                        if s.type == "user" and s.part.get("type") == "text":
+                            lines.append(f"- user: {_clean_user_body(str(s.part.get('text', ''))) or s.label}")
+                        else:
+                            lines.append(f"- {s.role}: {s.label}")
                     summary_body = "[Earlier session summary]\n" + "\n".join(lines)
 
                 drop_ids = {s.id for s in slice_segs}

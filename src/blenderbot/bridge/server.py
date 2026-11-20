@@ -41,6 +41,10 @@ from .protocol import (
 class _PendingRPC:
     op: str
     params: dict[str, Any]
+    stream_progress: bool = False
+    suspend_timeout: bool = False
+    last_activity_at: float = field(default_factory=time.monotonic)
+    progress_q: queue.Queue[dict[str, Any]] = field(default_factory=queue.Queue)
     done: threading.Event = field(default_factory=threading.Event)
     response: dict[str, Any] = field(default_factory=dict)
 
@@ -95,7 +99,20 @@ class _BridgeConnectionHandler(socketserver.StreamRequestHandler):
 
                 params = msg.get("params") or {}
                 timeout = float(msg.get("timeout", 120.0))
-                resp = bridge.enqueue_and_wait(op_name, params, timeout=timeout)
+                stream_progress = bool(msg.get("stream_progress", False))
+                suspend_timeout = bool(msg.get("suspend_timeout", False))
+
+                def _emit_prog(pdata: dict[str, Any], _rid: Any = req_id) -> None:
+                    self._send({"id": _rid, "event": "progress", "data": pdata})
+
+                resp = bridge.enqueue_and_wait(
+                    op_name,
+                    params,
+                    timeout=timeout,
+                    stream_progress=stream_progress,
+                    suspend_timeout=suspend_timeout,
+                    on_progress=_emit_prog if stream_progress else None,
+                )
                 self._send({"id": req_id, **resp})
             except Exception as err:  # noqa: BLE001
                 self._send(
@@ -183,35 +200,106 @@ class BlenderBridgeServer:
         self._wake.set()
 
     def enqueue_and_wait(
-        self, op_name: str, params: dict[str, Any], *, timeout: float = 120.0
+        self,
+        op_name: str,
+        params: dict[str, Any],
+        *,
+        timeout: float = 120.0,
+        stream_progress: bool = False,
+        suspend_timeout: bool = False,
+        on_progress: Any = None,
     ) -> dict[str, Any]:
         if self.stopped:
             return {
                 "ok": False,
                 "error": {"code": "STOPPED", "message": "Bridge server is shutting down"},
             }
-        rpc = _PendingRPC(op=op_name, params=params)
+        t0 = time.monotonic()
+        rpc = _PendingRPC(
+            op=op_name,
+            params=params,
+            stream_progress=bool(stream_progress and on_progress is not None),
+            suspend_timeout=bool(suspend_timeout),
+            last_activity_at=t0,
+        )
         self._queue.put(rpc)
         self._wake.set()
-        if not rpc.done.wait(timeout=max(1.0, timeout)):
-            return {
-                "ok": False,
-                "error": {
-                    "code": "TIMEOUT",
-                    "message": f'Main-thread execution of "{op_name}" timed out after {timeout:.1f}s',
-                },
-            }
-        return rpc.response
+
+        eff_timeout = max(1.0, float(timeout))
+        last_sent_at = t0
+
+        def _flush_progress_queue() -> bool:
+            nonlocal last_sent_at
+            emitted = False
+            while True:
+                try:
+                    item = rpc.progress_q.get_nowait()
+                except queue.Empty:
+                    break
+                if on_progress is not None:
+                    on_progress(item)
+                    last_sent_at = time.monotonic()
+                    emitted = True
+            return emitted
+
+        while True:
+            finished = rpc.done.wait(timeout=0.25)
+            _flush_progress_queue()
+            if finished:
+                _flush_progress_queue()
+                return rpc.response
+
+            now = time.monotonic()
+            if rpc.suspend_timeout:
+                # Active local render: suspend timeout & emit periodic keepalive heartbeats
+                if on_progress is not None and (now - last_sent_at) >= 2.0:
+                    on_progress(
+                        {
+                            "phase": "heartbeat",
+                            "op": op_name,
+                            "elapsed_s": round(now - t0, 1),
+                            "suspend_timeout": True,
+                        }
+                    )
+                    last_sent_at = now
+                continue
+
+            if (now - rpc.last_activity_at) >= eff_timeout:
+                return {
+                    "ok": False,
+                    "error": {
+                        "code": "TIMEOUT",
+                        "message": f'Main-thread execution of "{op_name}" timed out after {eff_timeout:.1f}s',
+                    },
+                }
 
     def drain_pending(self, *, max_items: int = 32) -> int:
         """Execute queued RPCs strictly on Blender's main thread."""
         processed = 0
-        ctx = OpContext(bpy=self.bpy, mode=self.mode, snaps_dir=self.snaps_dir)
         while processed < max_items:
             try:
                 rpc = self._queue.get_nowait()
             except queue.Empty:
                 break
+
+            def _report_progress(data: dict[str, Any], _rpc: _PendingRPC = rpc) -> None:
+                _rpc.last_activity_at = time.monotonic()
+                if data.get("suspend_timeout"):
+                    _rpc.suspend_timeout = True
+                if _rpc.stream_progress:
+                    _rpc.progress_q.put(dict(data))
+
+            def _set_suspend(enabled: bool, _rpc: _PendingRPC = rpc) -> None:
+                _rpc.suspend_timeout = bool(enabled)
+                _rpc.last_activity_at = time.monotonic()
+
+            ctx = OpContext(
+                bpy=self.bpy,
+                mode=self.mode,
+                snaps_dir=self.snaps_dir,
+                progress_fn=_report_progress,
+                suspend_timeout_fn=_set_suspend,
+            )
             try:
                 res = dispatch_op(ctx, rpc.op, rpc.params)
                 rpc.response = {"ok": True, "result": res}

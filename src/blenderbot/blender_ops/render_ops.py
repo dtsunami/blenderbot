@@ -2,15 +2,147 @@
 
 from __future__ import annotations
 
+import contextlib
 import shutil
 import subprocess
 import tempfile
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 from .helpers import effective_fps
 from .schema import OpContext, OpError, blender_op
+
+
+@contextlib.contextmanager
+def _monitor_local_render(
+    ctx: OpContext,
+    op_name: str,
+    *,
+    frame_start: int,
+    frame_end: int,
+    engine: str,
+) -> Iterator[None]:
+    """Attach `bpy.app.handlers` render callbacks to stream live progress & suspend RPC timeouts."""
+    bpy = ctx.bpy
+    total_frames = max(1, int(frame_end) - int(frame_start) + 1)
+    t_start = time.perf_counter()
+    state: dict[str, Any] = {
+        "cur_frame": int(frame_start),
+        "done_frames": 0,
+        "frame_t0": t_start,
+        "last_stats_t": 0.0,
+    }
+
+    ctx.set_suspend_timeout(True)
+    ctx.report_progress(
+        {
+            "phase": "starting",
+            "op": op_name,
+            "engine": engine,
+            "frame": int(frame_start),
+            "done_frames": 0,
+            "total_frames": total_frames,
+            "pct": 0.0,
+            "elapsed_s": 0.0,
+            "suspend_timeout": True,
+        }
+    )
+
+    handlers = getattr(bpy.app, "handlers", None)
+
+    def _on_render_pre(sc_arg: Any, *_rest: Any) -> None:
+        now = time.perf_counter()
+        fr = int(getattr(sc_arg, "frame_current", state["cur_frame"]))
+        state["cur_frame"] = fr
+        state["frame_t0"] = now
+        done_n = int(state["done_frames"])
+        ctx.report_progress(
+            {
+                "phase": "frame_start",
+                "op": op_name,
+                "engine": engine,
+                "frame": fr,
+                "done_frames": done_n,
+                "total_frames": total_frames,
+                "pct": round(100.0 * done_n / total_frames, 1),
+                "elapsed_s": round(now - t_start, 2),
+                "suspend_timeout": True,
+            }
+        )
+
+    def _on_render_stats(stats_arg: Any, *_rest: Any) -> None:
+        now = time.perf_counter()
+        if (now - float(state["last_stats_t"])) < 0.8:
+            return
+        state["last_stats_t"] = now
+        s_txt = str(stats_arg or "").strip()
+        done_n = int(state["done_frames"])
+        ctx.report_progress(
+            {
+                "phase": "render_stats",
+                "op": op_name,
+                "engine": engine,
+                "frame": int(state["cur_frame"]),
+                "done_frames": done_n,
+                "total_frames": total_frames,
+                "pct": round(100.0 * done_n / total_frames, 1),
+                "stats": s_txt[:140],
+                "elapsed_s": round(now - t_start, 2),
+                "suspend_timeout": True,
+            }
+        )
+
+    def _on_render_post(sc_arg: Any, *_rest: Any) -> None:
+        now = time.perf_counter()
+        fr = int(getattr(sc_arg, "frame_current", state["cur_frame"]))
+        done_n = int(state["done_frames"]) + 1
+        state["done_frames"] = done_n
+        elapsed_s = now - t_start
+        frame_ms = round((now - float(state["frame_t0"])) * 1000.0, 1)
+        avg_s = elapsed_s / max(1, done_n)
+        rem_n = max(0, total_frames - done_n)
+        ctx.report_progress(
+            {
+                "phase": "frame_done",
+                "op": op_name,
+                "engine": engine,
+                "frame": fr,
+                "done_frames": done_n,
+                "total_frames": total_frames,
+                "pct": round(100.0 * done_n / total_frames, 1),
+                "frame_ms": frame_ms,
+                "ms_per_frame": round(avg_s * 1000.0, 1),
+                "eta_s": round(rem_n * avg_s, 1),
+                "elapsed_s": round(elapsed_s, 2),
+                "suspend_timeout": True,
+            }
+        )
+
+    if handlers is not None:
+        for h_attr, fn in (
+            ("render_pre", _on_render_pre),
+            ("render_stats", _on_render_stats),
+            ("render_post", _on_render_post),
+        ):
+            h_list = getattr(handlers, h_attr, None)
+            if isinstance(h_list, list):
+                h_list.append(fn)
+
+    try:
+        yield
+    finally:
+        if handlers is not None:
+            for h_attr, fn in (
+                ("render_pre", _on_render_pre),
+                ("render_stats", _on_render_stats),
+                ("render_post", _on_render_post),
+            ):
+                h_list = getattr(handlers, h_attr, None)
+                if isinstance(h_list, list) and fn in h_list:
+                    h_list.remove(fn)
+        ctx.set_suspend_timeout(False)
 
 
 def _ensure_active_camera(sc: Any, camera_name: str | None = None) -> Any:
@@ -81,7 +213,11 @@ def op_viewport_render_still(ctx: OpContext, params: dict[str, Any]) -> dict[str
         r.image_settings.file_format = "PNG"
         r.image_settings.color_mode = "RGB"
         r.filepath = str(out_path)
-        bpy.ops.render.render(write_still=True)
+        cur_f = int(sc.frame_current)
+        with _monitor_local_render(
+            ctx, "viewport.render_still", frame_start=cur_f, frame_end=cur_f, engine=str(r.engine)
+        ):
+            bpy.ops.render.render(write_still=True)
     finally:
         r.engine = orig_engine
         r.resolution_x, r.resolution_y, r.resolution_percentage = orig_res
@@ -201,14 +337,21 @@ def op_viewport_contact_sheet(ctx: OpContext, params: dict[str, Any]) -> dict[st
             r.use_stamp_note = True
             r.stamp_font_size = max(12, round(tile_h * 0.055))
 
-            for idx, fr in enumerate(sample_frames):
-                sc.frame_set(fr)
-                t_sec = (fr - f_start) / fps if fps > 0 else 0.0
-                r.stamp_note_text = f"f{fr:04d} ({t_sec:.2f}s)"
-                tp = tmp_root / f"tile_{idx:03d}.png"
-                r.filepath = str(tp)
-                bpy.ops.render.render(write_still=True)
-                tile_paths.append(tp)
+            with _monitor_local_render(
+                ctx,
+                "viewport.contact_sheet",
+                frame_start=1,
+                frame_end=len(sample_frames),
+                engine=str(r.engine),
+            ):
+                for idx, fr in enumerate(sample_frames):
+                    sc.frame_set(fr)
+                    t_sec = (fr - f_start) / fps if fps > 0 else 0.0
+                    r.stamp_note_text = f"f{fr:04d} ({t_sec:.2f}s)"
+                    tp = tmp_root / f"tile_{idx:03d}.png"
+                    r.filepath = str(tp)
+                    bpy.ops.render.render(write_still=True)
+                    tile_paths.append(tp)
         finally:
             r.engine = orig_engine
             r.resolution_x, r.resolution_y, r.resolution_percentage = orig_res
@@ -345,7 +488,14 @@ def op_render_playblast(ctx: OpContext, params: dict[str, Any]) -> dict[str, Any
         r.ffmpeg.audio_codec = "NONE"
 
         r.filepath = str(out_path)
-        bpy.ops.render.render(animation=True)
+        with _monitor_local_render(
+            ctx,
+            "render.animation",
+            frame_start=int(sc.frame_start),
+            frame_end=int(sc.frame_end),
+            engine=str(r.engine),
+        ):
+            bpy.ops.render.render(animation=True)
     finally:
         actual_frames = sc.frame_end - sc.frame_start + 1
         actual_res = [int(r.resolution_x), int(r.resolution_y)]
@@ -474,7 +624,11 @@ def op_render_still(ctx: OpContext, params: dict[str, Any]) -> dict[str, Any]:
             r.image_settings.color_mode = "RGBA" if transparent else "RGB"
 
         r.filepath = str(out_path)
-        bpy.ops.render.render(write_still=True)
+        cur_f = int(sc.frame_current)
+        with _monitor_local_render(
+            ctx, "render.still", frame_start=cur_f, frame_end=cur_f, engine=target_engine
+        ):
+            bpy.ops.render.render(write_still=True)
     finally:
         actual_res = [int(r.resolution_x), int(r.resolution_y)]
         rendered_frame = int(sc.frame_current)
@@ -594,7 +748,14 @@ def op_render_animation(ctx: OpContext, params: dict[str, Any]) -> dict[str, Any
         r.image_settings.file_format = "PNG"
         r.image_settings.color_mode = "RGBA" if transparent else "RGB"
         r.filepath = str(prefix_path)
-        bpy.ops.render.render(animation=True)
+        with _monitor_local_render(
+            ctx,
+            "render.animation",
+            frame_start=int(sc.frame_start),
+            frame_end=int(sc.frame_end),
+            engine=target_engine,
+        ):
+            bpy.ops.render.render(animation=True)
     finally:
         actual_frames = sc.frame_end - sc.frame_start + 1
         actual_res = [int(r.resolution_x), int(r.resolution_y)]

@@ -24,6 +24,22 @@ class OpContext:
     bpy: Any
     mode: str = "headless"  # "gui" | "headless"
     snaps_dir: str | None = None
+    progress_fn: Callable[[dict[str, Any]], None] | None = None
+    suspend_timeout_fn: Callable[[bool], None] | None = None
+
+    def report_progress(self, data: dict[str, Any]) -> None:
+        if self.progress_fn is not None:
+            try:
+                self.progress_fn(data)
+            except Exception:  # noqa: BLE001, S110
+                pass
+
+    def set_suspend_timeout(self, enabled: bool = True) -> None:
+        if self.suspend_timeout_fn is not None:
+            try:
+                self.suspend_timeout_fn(bool(enabled))
+            except Exception:  # noqa: BLE001, S110
+                pass
 
     @property
     def scene(self) -> Any:
