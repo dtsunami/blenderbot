@@ -142,10 +142,12 @@ splat_image = (
         "setuptools>=68.0",
         "wheel",
     )
+    .pip_install("timm>=1.0.27,<1.1", "pillow-heif", "av>=14.1")
     .run_commands(
         "pip install --no-cache-dir --no-deps git+https://github.com/facebookresearch/vggt.git",
     )
     .run_function(_bake_csrc, cpu=32.0)
+    .add_local_dir("ml-depth-pro-2/src/depth_pro_2", remote_path="/root/ml-depth-pro-2/src/depth_pro_2")
     .add_local_python_source("blenderbot")
 )
 
@@ -247,6 +249,47 @@ class _BaseSplatWorker:
             gpu_hourly_usd=rate,
             ram_cache=self._ram_cache,
         )
+
+    @modal.method()
+    def snap_camera_arc_stream(
+        self,
+        *,
+        job_id: str,
+        mp4_bytes: bytes,
+        base_cameras_doc: dict[str, Any],
+        ply_gz: bytes | None = None,
+        sample_fps: float = 12.0,
+        max_snap_frames: int = 240,
+        solve_steps: int = 80,
+        floater_clean: bool = True,
+        corridor_radius_m: float = 0.42,
+        near_clear_m: float = 0.42,
+        max_world_scale_m: float = 0.25,
+        gpu: str = "H100",
+    ) -> Iterator[dict[str, Any]]:
+        from blenderbot.splats.core_worker import snap_camera_arc_to_video_stream
+
+        jobs_vol.reload()
+        rate = GPU_HOURLY_USD.get(gpu.upper(), 3.95)
+        for ev in snap_camera_arc_to_video_stream(
+            job_id=job_id,
+            jobs_root=Path("/jobs"),
+            mp4_bytes=mp4_bytes,
+            base_cameras_doc=base_cameras_doc,
+            ply_gz=ply_gz,
+            sample_fps=sample_fps,
+            max_snap_frames=max_snap_frames,
+            solve_steps=solve_steps,
+            floater_clean=floater_clean,
+            corridor_radius_m=corridor_radius_m,
+            near_clear_m=near_clear_m,
+            max_world_scale_m=max_world_scale_m,
+            gpu_hourly_usd=rate,
+            ram_cache=self._ram_cache,
+        ):
+            if ev.get("event") == "snap_done":
+                jobs_vol.commit()
+            yield ev
 
 
 @app.cls(

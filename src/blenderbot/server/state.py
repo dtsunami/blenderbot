@@ -148,6 +148,7 @@ class SplatJobRecord:
     modal_render_url: str | None = None
     blender_render_url: str | None = None
     stage_timings: dict[str, float] = field(default_factory=dict)
+    config: dict[str, Any] = field(default_factory=dict)
     imported_object: str | None = None
     task: asyncio.Task[Any] | None = field(default=None, repr=False)
 
@@ -185,6 +186,7 @@ class SplatJobRecord:
             "modal_render_url": self.modal_render_url,
             "blender_render_url": self.blender_render_url,
             "stage_timings": self.stage_timings,
+            "config": self.config,
             "imported_object": self.imported_object,
         }
 
@@ -338,7 +340,8 @@ class WebState:
         )
         for d in disk_dirs[:max_items]:
             ply_p = d / "splat.ply"
-            if not ply_p.is_file():
+            telem_p = d / "telemetry.jsonl"
+            if not ply_p.is_file() and not telem_p.is_file():
                 continue
             splat_p = d / "splat.splat"
             proxy_p = d / "proxy_collision.glb"
@@ -353,37 +356,48 @@ class WebState:
             telem_p = d / "telemetry.jsonl"
 
             step = 0
+            tot_steps = 0
             n_gauss = 0
             psnr = 0.0
             loss_v = 0.0
             l1_v = 0.0
             ssim_v = 0.0
+            it_sec = 0.0
             cost_usd = 0.0
             wall_s = 0.0
             gpu_lbl = "H100"
             src_mode = "blender" if d.name.startswith("blender_") else "video"
             st_timings: dict[str, float] = {}
+            saw_done = False
+            last_stage_ev = ""
 
             if telem_p.is_file():
                 try:
                     lines = telem_p.read_text(encoding="utf-8", errors="ignore").strip().splitlines()
-                    for ln in reversed(lines[-25:]):
+                    for ln in reversed(lines[-40:]):
                         row = json.loads(ln)
-                        if row.get("event") == "done" and step == 0:
-                            step = int(row.get("step") or 0)
-                            n_gauss = int(row.get("n_gaussians") or 0)
+                        ev_kind = row.get("event")
+                        if ev_kind == "done" and not saw_done:
+                            saw_done = True
+                            step = int(row.get("step") or step or 0)
+                            tot_steps = max(tot_steps, step)
+                            n_gauss = int(row.get("n_gaussians") or n_gauss or 0)
                             cost_usd = float(row.get("cost_usd") or 0.0)
                             wall_s = float(row.get("wall_s") or 0.0)
                             dev = str(row.get("device") or "")
                             gpu_lbl = "L40S" if "L40S" in dev else "H100"
-                        elif row.get("event") == "telemetry" and psnr == 0.0:
+                        elif ev_kind == "stage" and not last_stage_ev:
+                            last_stage_ev = str(row.get("stage") or "")
+                        elif ev_kind == "telemetry" and psnr == 0.0:
                             psnr = float(row.get("psnr") or 0.0)
                             loss_v = float(row.get("loss") or 0.0)
                             l1_v = float(row.get("l1") or 0.0)
                             ssim_v = float(row.get("ssim") or 0.0)
+                            it_sec = float(row.get("it_per_sec") or 0.0)
                             st_timings = dict(row.get("stage_timings") or {})
                             if step == 0:
                                 step = int(row.get("step") or 0)
+                            tot_steps = max(tot_steps, int(row.get("total_steps") or 0))
                             if n_gauss == 0:
                                 n_gauss = int(row.get("n_gaussians") or 0)
                 except Exception:  # noqa: BLE001, S110
@@ -392,7 +406,7 @@ class WebState:
             if n_gauss == 0:
                 if splat_p.is_file():
                     n_gauss = splat_p.stat().st_size // 32
-                else:
+                elif ply_p.is_file():
                     try:
                         with ply_p.open("rb") as fh:
                             hdr_b = fh.read(512).decode("ascii", errors="ignore")
@@ -404,42 +418,70 @@ class WebState:
                     except Exception:  # noqa: BLE001, S110
                         pass
 
+            saved_cfg: dict[str, Any] = {}
+            src_meta_p = d / "job_source.json"
+            if src_meta_p.is_file():
+                try:
+                    s_meta = json.loads(src_meta_p.read_text(encoding="utf-8"))
+                    if isinstance(s_meta.get("config"), dict):
+                        saved_cfg = dict(s_meta["config"])
+                    elif isinstance(s_meta.get("launch_args"), dict):
+                        saved_cfg = dict(s_meta["launch_args"])
+                except Exception:  # noqa: BLE001, S110
+                    pass
+
+            if tot_steps <= 0:
+                cfg_iters = int(((saved_cfg.get("train") or {}).get("iterations")) or 0)
+                tot_steps = cfg_iters if cfg_iters > 0 else step
+
+            has_ply = ply_p.is_file()
+            telem_age_s = (time.time() - telem_p.stat().st_mtime) if telem_p.is_file() else 999999.0
+            is_fresh_active = (not saw_done) and telem_age_s < 75.0
+            eff_stage = (
+                (last_stage_ev or "train")
+                if is_fresh_active
+                else ("completed" if has_ply else "stopped")
+            )
+            created_ts = ply_p.stat().st_mtime if has_ply and not is_fresh_active else telem_p.stat().st_mtime
+            prev_cb = int(prev_p.stat().st_mtime_ns) if prev_p.is_file() else 0
+            diff_cb = int(diff_p.stat().st_mtime_ns) if diff_p.is_file() else 0
             out.append(
                 {
                     "job_id": d.name,
                     "source_mode": src_mode,
                     "source_label": self.session.sandbox.rel(src_vid).replace("\\", "/") if src_vid else d.name,
                     "gpu": gpu_lbl,
-                    "iterations": step,
-                    "created_at": ply_p.stat().st_mtime,
-                    "stage": "completed",
+                    "iterations": tot_steps or step,
+                    "created_at": created_ts,
+                    "stage": eff_stage,
                     "step": step,
-                    "total_steps": step,
+                    "total_steps": tot_steps or step,
                     "psnr": round(psnr, 2),
                     "loss": round(loss_v, 4),
                     "l1": round(l1_v, 4),
                     "ssim": round(ssim_v, 4),
-                    "it_per_sec": 0.0,
+                    "it_per_sec": round(it_sec, 1) if is_fresh_active else 0.0,
                     "n_gaussians": n_gauss,
-                    "ply_size_bytes": ply_p.stat().st_size,
+                    "ply_size_bytes": ply_p.stat().st_size if has_ply else 0,
                     "has_orig": (d / "splat.orig.ply").is_file(),
                     "elapsed_sec": round(wall_s, 1),
                     "cost_usd": round(cost_usd, 5),
                     "error": None,
-                    "ply_rel": self.session.sandbox.rel(ply_p).replace("\\", "/"),
+                    "ply_rel": self.session.sandbox.rel(ply_p).replace("\\", "/") if has_ply else None,
                     "splat_url": self.media_url_for(splat_p) if splat_p.is_file() else None,
                     "proxy_glb_rel": self.session.sandbox.rel(proxy_p).replace("\\", "/") if proxy_p.is_file() else None,
                     "proxy_glb_url": self.media_url_for(proxy_p) if proxy_p.is_file() else None,
-                    "preview_url": self.media_url_for(prev_p) if prev_p.is_file() else None,
-                    "diff_url": self.media_url_for(diff_p) if diff_p.is_file() else None,
+                    "preview_url": f"{self.media_url_for(prev_p)}&v={prev_cb}" if prev_p.is_file() else None,
+                    "diff_url": f"{self.media_url_for(diff_p)}&v={diff_cb}" if diff_p.is_file() else None,
                     "gt_url": self.media_url_for(gt_p) if gt_p is not None else None,
                     "cameras_url": self.media_url_for(cam_p) if cam_p.is_file() else None,
                     "cameras_rel": self.session.sandbox.rel(cam_p).replace("\\", "/") if cam_p.is_file() else None,
                     "source_video_rel": self.session.sandbox.rel(src_vid).replace("\\", "/") if src_vid else None,
                     "source_video_url": self.media_url_for(src_vid) if src_vid else None,
                     "modal_render_url": self.media_url_for(modal_mp4) if modal_mp4.is_file() else None,
-                    "blender_render_url": self.media_url_for(blender_mp4) if blender_mp4.is_file() else None,
+                    "blender_render_url": self.blender_render_url if hasattr(self, "blender_render_url") else (self.media_url_for(blender_mp4) if blender_mp4.is_file() else None),
                     "stage_timings": st_timings,
+                    "config": saved_cfg,
                     "imported_object": None,
                 }
             )
@@ -536,6 +578,73 @@ class WebState:
             )
         return out[:max_items]
 
+    def scan_media_jobs(self, max_items: int = 40) -> list[dict[str, Any]]:
+        """Merge active in-memory Seedance/Seedream/Blender jobs with persisted disk outputs."""
+        out: list[dict[str, Any]] = []
+        seen_rels: set[str] = set()
+        cwd = self.session.cfg.cwd
+
+        for jid in self.job_order[:max_items]:
+            rec = self.jobs.get(jid)
+            if rec is not None:
+                d_rec = rec.to_dict()
+                out.append(d_rec)
+                if rec.output_rel:
+                    seen_rels.add(rec.output_rel.replace("\\", "/"))
+
+        # Also surface persisted `assets/seedance/*`, `assets/seedream/*`, and `renders/*` runs
+        disk_candidates: list[tuple[float, Path, str]] = []
+        for sub_rel, j_kind in (("assets/seedance", "seedance"), ("assets/seedream", "seedream"), ("renders", "local_render")):
+            folder = cwd / sub_rel
+            if not folder.is_dir():
+                continue
+            try:
+                for p in folder.iterdir():
+                    if not p.is_file() or p.name.startswith("."):
+                        continue
+                    ext = p.suffix.lower()
+                    if ext not in IMAGE_EXTS and ext not in VIDEO_EXTS:
+                        continue
+                    rel = self.session.sandbox.rel(p).replace("\\", "/")
+                    if rel in seen_rels:
+                        continue
+                    disk_candidates.append((p.stat().st_mtime, p, j_kind))
+            except OSError:
+                continue
+
+        disk_candidates.sort(key=lambda t: t[0], reverse=True)
+        for mtime, p, j_kind in disk_candidates[: max(0, max_items - len(out))]:
+            rel = self.session.sandbox.rel(p).replace("\\", "/")
+            prefix = "sd-disk" if j_kind == "seedance" else "sr-disk" if j_kind == "seedream" else "bl-local"
+            model_lbl = (
+                "bytedance/seedance-2.5"
+                if j_kind == "seedance"
+                else "bytedance-seed/seedream-5-5"
+                if j_kind == "seedream"
+                else "blender-5.3-local"
+            )
+            out.append(
+                {
+                    "local_id": f"{prefix}:{p.stem}",
+                    "remote_job_id": None,
+                    "prompt": f"Persisted {j_kind.replace('_', ' ')} artifact ({p.name})",
+                    "model": model_lbl,
+                    "mode": "local" if j_kind == "local_render" else "standard",
+                    "output_rel": rel,
+                    "created_at": float(mtime),
+                    "stage": "completed",
+                    "elapsed_sec": 0.0,
+                    "cost_usd": 0.0,
+                    "error": None,
+                    "media_url": self.media_url_for(p),
+                    "width": None,
+                    "height": None,
+                    "duration_sec": None,
+                    "conditioning": {"size_bytes": p.stat().st_size, "persisted": True},
+                }
+            )
+        return out[:max_items]
+
     def scan_workspace_media(self, max_items: int = 180) -> list[dict[str, Any]]:
         from PIL import Image
 
@@ -624,6 +733,73 @@ class WebState:
                     "is_seedream": "seedream" in rel.lower(),
                     "cost_usd": cost_by_rel.get(rel),
                     "url": self.media_url_for(p),
+                }
+            )
+        return items
+
+    def scan_workspace_blends(self, max_items: int = 80) -> list[dict[str, Any]]:
+        """Scan workspace `.blend` files and cross-reference sessions that authored/used them."""
+        from blenderbot.session.log import list_sessions
+
+        cwd = self.session.cfg.cwd
+        found: list[tuple[float, Path]] = []
+
+        def _walk_blends(folder: Path, depth: int) -> None:
+            if depth > 4:
+                return
+            try:
+                entries = list(folder.iterdir())
+            except OSError:
+                return
+            for entry in entries:
+                name = entry.name
+                if name.startswith(".") and name not in (".",):
+                    continue
+                if entry.is_dir():
+                    if name in SKIP_SCAN_DIRS or name == "snaps":
+                        continue
+                    _walk_blends(entry, depth + 1)
+                elif entry.is_file() and entry.suffix.lower() == ".blend":
+                    try:
+                        st_b = entry.stat()
+                        if st_b.st_size > 0:
+                            found.append((st_b.st_mtime, entry))
+                    except OSError:
+                        continue
+
+        _walk_blends(cwd, 0)
+        found.sort(key=lambda t: t[0], reverse=True)
+
+        sessions_by_blend: dict[str, list[str]] = {}
+        for sm in list_sessions(self.session.cfg.home, limit=50):
+            bfp = str(sm.get("blend_filepath") or "").strip()
+            sid = str(sm.get("id") or "")
+            if bfp and sid:
+                try:
+                    norm_b = str(Path(bfp).resolve()).lower()
+                    sessions_by_blend.setdefault(norm_b, []).append(sid)
+                except OSError:
+                    continue
+
+        items: list[dict[str, Any]] = []
+        for mtime, p in found[:max_items]:
+            rel = self.session.sandbox.rel(p).replace("\\", "/")
+            folder_rel = str(Path(rel).parent).replace("\\", "/")
+            if folder_rel == ".":
+                folder_rel = "workspace"
+            norm_p = str(p.resolve()).lower()
+            items.append(
+                {
+                    "path": rel,
+                    "abs_path": str(p.resolve()),
+                    "folder": folder_rel,
+                    "name": p.name,
+                    "kind": "blend",
+                    "ext": ".blend",
+                    "size_bytes": p.stat().st_size,
+                    "mtime": int(mtime),
+                    "url": self.media_url_for(p),
+                    "session_ids": sessions_by_blend.get(norm_p, [])[:6],
                 }
             )
         return items

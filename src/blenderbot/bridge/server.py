@@ -12,6 +12,7 @@ Supports BOTH execution modes with the exact same wire protocol and op handlers:
 
 from __future__ import annotations
 
+import atexit
 import os
 import queue
 import socketserver
@@ -50,7 +51,7 @@ class _PendingRPC:
 
 
 class _BridgeTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    allow_reuse_address = True
+    allow_reuse_address = os.name != "nt"
     daemon_threads = True
 
     def __init__(
@@ -334,6 +335,7 @@ class BlenderBridgeServer:
 
 
 _ACTIVE_GUI_SERVER: BlenderBridgeServer | None = None
+_ATEXIT_REGISTERED = False
 
 
 def start_in_blender_gui(
@@ -345,7 +347,7 @@ def start_in_blender_gui(
     """Start `BlenderBridgeServer` inside interactive GUI Blender via `bpy.app.timers`."""
     import bpy
 
-    global _ACTIVE_GUI_SERVER
+    global _ACTIVE_GUI_SERVER, _ATEXIT_REGISTERED
     if _ACTIVE_GUI_SERVER is not None and not _ACTIVE_GUI_SERVER.stopped:
         stop_in_blender_gui()
 
@@ -357,8 +359,19 @@ def start_in_blender_gui(
         home=home,
         discovery_filename="bridge.json",
     )
-    info = srv.start_background_listener()
+    try:
+        info = srv.start_background_listener()
+    except OSError:
+        if port != 0:
+            srv.port = 0
+            info = srv.start_background_listener()
+        else:
+            raise
     _ACTIVE_GUI_SERVER = srv
+
+    if not _ATEXIT_REGISTERED:
+        atexit.register(stop_in_blender_gui)
+        _ATEXIT_REGISTERED = True
 
     def _timer_callback() -> float | None:
         if srv.stopped:

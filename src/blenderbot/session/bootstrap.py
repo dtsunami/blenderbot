@@ -53,17 +53,22 @@ class Session:
     bus: SessionBus
     transport: BlenderTransport | None
     auto_connect_blender: bool = True
+    preferred_transport: str = ""
     blender_grounding_snapshot: str = ""
     blender_connect_note: str | None = None
     agents_sections: list[dict[str, Any]] = field(default_factory=list)
     grounding_notices: list[str] = field(default_factory=list)
     pending_prompts: dict[str, Any] | None = None
     web_server: Any = None
+    _failed_gui_probe_sig: tuple[int, int, float] | None = field(default=None, repr=False)
 
     async def maybe_auto_connect_blender(self) -> bool:
-        """Opportunistically attach if Blender is available and not yet connected."""
-        if self.transport is not None or not self.auto_connect_blender:
-            return self.transport is not None
+        """Opportunistically attach if Blender is available (or upgrade headless -> GUI in auto mode)."""
+        if self.transport is not None:
+            await self.maybe_upgrade_to_gui_bridge()
+            return True
+        if not self.auto_connect_blender:
+            return False
         try:
             await self.reconnect_blender()
             return True
@@ -71,12 +76,54 @@ class Session:
             self.blender_connect_note = str(err).splitlines()[0]
             return False
 
+    async def maybe_upgrade_to_gui_bridge(self) -> bool:
+        """Hot-attach onto a newly opened GUI Blender bridge when currently running headless in `auto` mode."""
+        want = (self.preferred_transport or self.cfg.transport).strip().lower()
+        if want != "auto" or self.transport is None or self.transport.mode != "headless":
+            return False
+        if self.agent.busy:
+            return False
+
+        from blenderbot.bridge.protocol import read_discovery
+        from blenderbot.transport.bridge_client import BridgeTransport
+
+        disc = read_discovery(self.cfg.home)
+        if disc is None or disc.mode != "gui" or not disc.token:
+            return False
+        sig = (disc.pid, disc.port, disc.started_at)
+        if sig == self._failed_gui_probe_sig:
+            return False
+
+        bt = BridgeTransport(host=disc.host, port=disc.port, token=disc.token)
+        try:
+            st = await bt.call("blender.status", timeout=1.5)
+        except Exception:  # noqa: BLE001
+            self._failed_gui_probe_sig = sig
+            await bt.close()
+            return False
+
+        old = self.transport
+        self.transport = bt
+        self.agent.transport = bt
+        self.blender_connect_note = None
+        if old is not None:
+            with contextlib.suppress(Exception):
+                await old.close()
+        self.bus.publish(
+            "blender-changed",
+            {"connected": True, "mode": bt.mode, "status": st},
+        )
+        return True
+
     async def reconnect_blender(self, mode: str | None = None) -> dict[str, Any]:
+        if mode:
+            self.preferred_transport = mode.strip().lower()
+        eff_mode = (mode or self.preferred_transport or self.cfg.transport).strip().lower()
         if self.transport is not None:
             await self.transport.close()
             self.transport = None
             self.agent.transport = None
-        eff_mode = mode or self.cfg.transport
+        self._failed_gui_probe_sig = None
         self.transport = await connect_blender(
             mode=eff_mode,
             home=self.cfg.home,
@@ -87,6 +134,11 @@ class Session:
         self.agent.transport = self.transport
         st = await self.transport.call("blender.status", timeout=8.0)
         self.blender_connect_note = None
+        sc_info = st.get("scene") if isinstance(st.get("scene"), dict) else {}
+        self.log.update_blend_association(
+            blend_filepath=str(st.get("filepath") or ""),
+            scene_name=str(sc_info.get("name") or ""),
+        )
         self.bus.publish(
             "blender-changed",
             {"connected": True, "mode": self.transport.mode, "status": st},
@@ -94,6 +146,23 @@ class Session:
         return st
 
     async def close(self) -> None:
+        if self.transport is not None:
+            with contextlib.suppress(Exception):
+                st = await self.transport.call("blender.status", timeout=3.0)
+                sc_info = st.get("scene") if isinstance(st.get("scene"), dict) else {}
+                final_snap: str | None = None
+                if st.get("is_dirty") and self.agent.stats.get("ops", 0) > 0:
+                    snap_res = await self.transport.call(
+                        "scene.snapshot_save",
+                        {"dir": str(self.log.dir), "prefix": "session_final"},
+                        timeout=5.0,
+                    )
+                    final_snap = str(snap_res.get("snapshot_path") or "")
+                self.log.update_blend_association(
+                    blend_filepath=str(st.get("filepath") or self.log.meta.get("blend_filepath") or ""),
+                    scene_name=str(sc_info.get("name") or self.log.meta.get("scene_name") or ""),
+                    last_snapshot=final_snap,
+                )
         self.log.update_totals(
             self.agent.stats,
             provider=self.cfg.provider,

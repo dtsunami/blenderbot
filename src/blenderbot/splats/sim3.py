@@ -697,6 +697,50 @@ def catmull_rom_vec3(p0: Vec3, p1: Vec3, p2: Vec3, p3: Vec3, t: float) -> Vec3:
     return (out[0], out[1], out[2])
 
 
+def centripetal_catmull_rom_vec3(
+    p0: Vec3,
+    p1: Vec3,
+    p2: Vec3,
+    p3: Vec3,
+    u: float,
+    dt01: float = 1.0,
+    dt12: float = 1.0,
+    dt23: float = 1.0,
+) -> Vec3:
+    """Barry-Goldman centripetal (`α=0.5`) + time-chord non-uniform Catmull-Rom spline.
+
+    Guaranteed cusp-free and overshoot-free across sharp 90° indoor walkthrough turns and
+    non-uniform `mpdecimate` pauses (`dt01 != dt12 != dt23`).
+    """
+    u_c = max(0.0, min(1.0, float(u)))
+
+    def _knot_step(pa: Vec3, pb: Vec3, dt_s: float) -> float:
+        chord = math.sqrt(vec3_norm(vec3_sub(pb, pa)))
+        return max(1e-4, 0.7 * chord + 0.3 * math.sqrt(max(1e-4, dt_s)))
+
+    s0 = 0.0
+    s1 = s0 + _knot_step(p0, p1, dt01)
+    s2 = s1 + _knot_step(p1, p2, dt12)
+    s3 = s2 + _knot_step(p2, p3, dt23)
+    s = s1 + u_c * (s2 - s1)
+
+    def _lerp(va: Vec3, vb: Vec3, ta: float, tb: float, tc: float) -> Vec3:
+        denom = max(1e-8, tb - ta)
+        w = (tc - ta) / denom
+        return (
+            va[0] + w * (vb[0] - va[0]),
+            va[1] + w * (vb[1] - va[1]),
+            va[2] + w * (vb[2] - va[2]),
+        )
+
+    a1 = _lerp(p0, p1, s0, s1, s)
+    a2 = _lerp(p1, p2, s1, s2, s)
+    a3 = _lerp(p2, p3, s2, s3, s)
+    b1 = _lerp(a1, a2, s0, s2, s)
+    b2 = _lerp(a2, a3, s1, s3, s)
+    return _lerp(b1, b2, s1, s2, s)
+
+
 def camera_orientation_angles_deg(quat_bl_wxyz: Sequence[float]) -> dict[str, Any]:
     """Compute intuitive world-space camera basis + Yaw / Pitch / Roll (degrees) in Blender Z-up space.
 
@@ -730,6 +774,91 @@ def camera_orientation_angles_deg(quat_bl_wxyz: Sequence[float]) -> dict[str, An
         "pitch_deg": pitch,
         "roll_deg": roll,
     }
+
+
+def euler_yaw_pitch_roll_to_blender_quat(yaw_deg: float, pitch_deg: float, roll_deg: float) -> QuatWXYZ:
+    """Exact inverse of `camera_orientation_angles_deg`: construct a gravity-level Blender `(w,x,y,z)` quaternion.
+
+    Interpolating unwrapped `(yaw_deg, pitch_deg, roll_deg)` keeps the horizon locked (`roll ≈ 0°`)
+    across fast 150°–360° whip-pans instead of quaternion SLERP banking diagonally across the ceiling
+    or flipping 180° the wrong way!
+    """
+    yr = math.radians(float(yaw_deg))
+    pr = math.radians(max(-89.5, min(89.5, float(pitch_deg))))
+    rr = math.radians(float(roll_deg))
+
+    cp = math.cos(pr)
+    fwd: Vec3 = (math.sin(yr) * cp, math.cos(yr) * cp, math.sin(pr))
+    world_up: Vec3 = (0.0, 0.0, 1.0)
+    h_right_raw = vec3_cross(fwd, world_up)
+    if vec3_norm(h_right_raw) < 1e-6:
+        h_right: Vec3 = (math.cos(yr), -math.sin(yr), 0.0)
+    else:
+        h_right = vec3_normalize(h_right_raw)
+    h_up = vec3_normalize(vec3_cross(h_right, fwd))
+
+    cr, sr = math.cos(rr), math.sin(rr)
+    right = (
+        cr * h_right[0] + sr * h_up[0],
+        cr * h_right[1] + sr * h_up[1],
+        cr * h_right[2] + sr * h_up[2],
+    )
+    up = (
+        -sr * h_right[0] + cr * h_up[0],
+        -sr * h_right[1] + cr * h_up[1],
+        -sr * h_right[2] + cr * h_up[2],
+    )
+    # Blender camera looks down `-Z_cam`, so column 2 of `R_bl` is `-fwd`
+    r_bl: Mat3 = (
+        (right[0], up[0], -fwd[0]),
+        (right[1], up[1], -fwd[1]),
+        (right[2], up[2], -fwd[2]),
+    )
+    return rotmat_to_quat(r_bl)
+
+
+def pchip_monotone_scalar(
+    v0: float,
+    v1: float,
+    v2: float,
+    v3: float,
+    u: float,
+    dt01: float = 1.0,
+    dt12: float = 1.0,
+    dt23: float = 1.0,
+) -> float:
+    """Fritsch–Carlson monotone cubic Hermite (PCHIP) interpolation on `[v1, v2]`.
+
+    Unlike linear SLERP (constant angular speed that misses fast whip-pan S-curves) and unlike
+    unconstrained Catmull-Rom (which overshoots/reverses direction after a sudden stop!), PCHIP
+    is C1-smooth, captures fast pan acceleration, and NEVER overshoots or reverses pan direction!
+    """
+    uc = max(0.0, min(1.0, float(u)))
+    h0 = max(1e-5, float(dt01))
+    h1 = max(1e-5, float(dt12))
+    h2 = max(1e-5, float(dt23))
+
+    d0 = (v1 - v0) / h0
+    d1 = (v2 - v1) / h1
+    d2 = (v3 - v2) / h2
+
+    def _slope(da: float, db: float, ha: float, hb: float) -> float:
+        if da * db <= 0.0:
+            return 0.0
+        w1 = 2.0 * hb + ha
+        w2 = hb + 2.0 * ha
+        return (w1 + w2) / (w1 / da + w2 / db)
+
+    m1 = _slope(d0, d1, h0, h1)
+    m2 = _slope(d1, d2, h1, h2)
+
+    u2 = uc * uc
+    u3 = u2 * uc
+    h00 = 2.0 * u3 - 3.0 * u2 + 1.0
+    h10 = u3 - 2.0 * u2 + uc
+    h01 = -2.0 * u3 + 3.0 * u2
+    h11 = u3 - u2
+    return h00 * v1 + h10 * (h1 * m1) + h01 * v2 + h11 * (h1 * m2)
 
 
 def interpolate_camera_trajectory(
@@ -840,6 +969,35 @@ def interpolate_camera_trajectory(
         })
         k_names.append(str(c.get("image_name") or f"key_{idx:04d}"))
 
+    # Unwrap keyframe `(yaw_deg, pitch_deg, roll_deg)` continuously (+ optional optical-flow pan hints `pan_dyaw_deg`)
+    # so fast >150° FPS mouse pans turn in the TRUE pan direction and keep the horizon level (`roll ≈ 0°`)!
+    k_yaws: list[float] = []
+    k_pitches: list[float] = []
+    k_rolls: list[float] = []
+    for ki, qk in enumerate(k_quats):
+        ang_k = camera_orientation_angles_deg(qk)
+        yk = float(ang_k["yaw_deg"])
+        pk = float(ang_k["pitch_deg"])
+        rk = float(ang_k["roll_deg"])
+        if ki > 0:
+            # Optional video optical-flow delta-yaw hint resolves >160° pan direction ambiguity (`+190°` vs `-170°`)!
+            hint_dyaw = raw_cams[ki].get("pan_dyaw_deg")
+            target_y = (k_yaws[-1] + float(hint_dyaw)) if hint_dyaw is not None else k_yaws[-1]
+            while yk - target_y > 180.0:
+                yk -= 360.0
+            while yk - target_y < -180.0:
+                yk += 360.0
+            while rk - k_rolls[-1] > 180.0:
+                rk -= 360.0
+            while rk - k_rolls[-1] < -180.0:
+                rk += 360.0
+        k_yaws.append(yk)
+        k_pitches.append(pk)
+        k_rolls.append(rk)
+
+    # Use horizon-preserving PCHIP yaw/pitch/roll interpolation whenever camera isn't looking straight at zenith/nadir
+    use_horizon_interp = max((abs(p) for p in k_pitches), default=0.0) < 80.0
+
     # Map each solved keyframe to its closest output frame index for clean timeline markers
     keyframe_At_out: dict[int, dict[str, Any]] = {}
     for ki, tk in enumerate(k_times):
@@ -869,12 +1027,23 @@ def interpolate_camera_trajectory(
                 seg_i += 1
             t0, t1 = k_times[seg_i], k_times[seg_i + 1]
             u = (t_cur - t0) / max(1e-8, t1 - t0)
-            p0 = k_locs[max(0, seg_i - 1)]
+            i_m1 = max(0, seg_i - 1)
+            i_p2 = min(n_k - 1, seg_i + 2)
+            p0 = k_locs[i_m1]
             p1 = k_locs[seg_i]
             p2 = k_locs[seg_i + 1]
-            p3 = k_locs[min(n_k - 1, seg_i + 2)]
-            loc_f = catmull_rom_vec3(p0, p1, p2, p3, u)
-            q_f = quat_slerp(k_quats[seg_i], k_quats[seg_i + 1], u)
+            p3 = k_locs[i_p2]
+            dt01 = k_times[seg_i] - k_times[i_m1] if seg_i > 0 else (t1 - t0)
+            dt12 = t1 - t0
+            dt23 = k_times[i_p2] - k_times[seg_i + 1] if (seg_i + 1) < (n_k - 1) else (t1 - t0)
+            loc_f = centripetal_catmull_rom_vec3(p0, p1, p2, p3, u, dt01, dt12, dt23)
+            if use_horizon_interp:
+                yaw_i = pchip_monotone_scalar(k_yaws[i_m1], k_yaws[seg_i], k_yaws[seg_i + 1], k_yaws[i_p2], u, dt01, dt12, dt23)
+                pit_i = pchip_monotone_scalar(k_pitches[i_m1], k_pitches[seg_i], k_pitches[seg_i + 1], k_pitches[i_p2], u, dt01, dt12, dt23)
+                rol_i = pchip_monotone_scalar(k_rolls[i_m1], k_rolls[seg_i], k_rolls[seg_i + 1], k_rolls[i_p2], u, dt01, dt12, dt23)
+                q_f = euler_yaw_pitch_roll_to_blender_quat(yaw_i, pit_i, rol_i)
+            else:
+                q_f = quat_slerp(k_quats[seg_i], k_quats[seg_i + 1], u)
             i0, i1 = k_intr[seg_i], k_intr[seg_i + 1]
             intr_f = {
                 k: i0[k] + u * (i1[k] - i0[k])
@@ -978,3 +1147,47 @@ def interpolate_camera_trajectory(
         ],
         "frames": frames_out,
     }
+
+
+def build_stereo_peer_table(viewmats_w2c: Any, active_indices: list[int]) -> dict[int, list[int]]:
+    """Pair each OpenCV W2C camera (`[M, 4, 4]`) with overlapping wide-baseline stereo peers (`12°..85°`).
+
+    Used by `core_worker` multi-view mini-batching so any near-plane floater spawned in front of
+    Camera A immediately projects across Camera B's frustum on the very same backward pass.
+    """
+    import numpy as _np
+
+    vm = _np.asarray(viewmats_w2c, dtype=_np.float64)
+    n_c = len(vm)
+    centers = _np.zeros((n_c, 3), dtype=_np.float64)
+    fwds = _np.zeros((n_c, 3), dtype=_np.float64)
+    for i in range(n_c):
+        r_i = vm[i, :3, :3]
+        t_i = vm[i, :3, 3]
+        centers[i] = -r_i.T @ t_i
+        f_i = r_i[2, :]
+        fwds[i] = f_i / max(1e-8, float(_np.linalg.norm(f_i)))
+
+    active_set = set(active_indices)
+    look_pts = centers + fwds * 2.2
+    med_span = max(0.5, float(_np.percentile(_np.linalg.norm(centers - centers.mean(axis=0), axis=1), 75)))
+
+    peers_map: dict[int, list[int]] = {}
+    for i in active_indices:
+        scored: list[tuple[float, int]] = []
+        for j in active_indices:
+            if j == i or j not in active_set:
+                continue
+            baseline = float(_np.linalg.norm(centers[j] - centers[i]))
+            look_dist = float(_np.linalg.norm(look_pts[j] - look_pts[i]))
+            cos_ang = float(_np.clip(_np.dot(fwds[i], fwds[j]), -1.0, 1.0))
+            if cos_ang > 0.05 and baseline > 0.04 * med_span:
+                ang_score = 1.0 - abs(cos_ang - 0.72)
+                prox_score = 1.0 / (1.0 + look_dist / med_span)
+                scored.append((ang_score * prox_score, j))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        if scored:
+            peers_map[i] = [idx_j for _, idx_j in scored[:8]]
+        else:
+            peers_map[i] = [j for j in active_indices if j != i][:8]
+    return peers_map

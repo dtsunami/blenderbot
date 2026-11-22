@@ -841,13 +841,29 @@ class Agent(EventEmitter):
                     on_progress=_on_op_progress,
                 )
                 self.stats["ops"] += len(ops)
+                if outcome.checkpoint is not None and self.session_log is not None:
+                    self.session_log.update_blend_association(
+                        blend_filepath=outcome.checkpoint.original_filepath or None,
+                        last_snapshot=outcome.checkpoint.snapshot_path or None,
+                    )
                 for r_item in outcome.results:
                     res_d = r_item.get("result")
-                    if r_item.get("ok") and isinstance(res_d, dict) and res_d.get("cost_usd"):
-                        op_cost = float(res_d["cost_usd"] or 0.0)
-                        if op_cost > 0:
-                            self.run_cost += op_cost
-                            self.stats["cost"] += op_cost
+                    if r_item.get("ok") and isinstance(res_d, dict):
+                        if (
+                            r_item.get("op") in ("scene.save", "scene.open")
+                            and res_d.get("filepath")
+                            and self.session_log is not None
+                        ):
+                            sc_d = res_d.get("scene") if isinstance(res_d.get("scene"), dict) else {}
+                            self.session_log.update_blend_association(
+                                blend_filepath=str(res_d["filepath"]),
+                                scene_name=str(sc_d.get("name") or "") or None,
+                            )
+                        if res_d.get("cost_usd"):
+                            op_cost = float(res_d["cost_usd"] or 0.0)
+                            if op_cost > 0:
+                                self.run_cost += op_cost
+                                self.stats["cost"] += op_cost
                 if outcome.status in ("plan-failed", "apply-failed"):
                     self.stats["op_failures"] += 1
                     self._rolling_health["op_failures"] += 1

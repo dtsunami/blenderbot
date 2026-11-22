@@ -236,9 +236,11 @@ async def _probe_live_bridge() -> dict[str, object]:
 
 def _print_doctor(cfg: Config) -> int:
     from .blender_ops import list_ops
+    from .bridge.installer import STARTUP_SCRIPT_NAME
 
     inst = discover_blender()
     addon_manifest = Path(inst.user_extensions_dir) / "blenderbot_bridge" / "blender_manifest.toml"
+    startup_hook = Path(inst.user_scripts_startup_dir) / STARTUP_SCRIPT_NAME
     live = asyncio.run(_probe_live_bridge())
     ops = list_ops()
 
@@ -255,6 +257,7 @@ def _print_doctor(cfg: Config) -> int:
         f"  blender version     {inst.blender_version or 'unknown'}",
         f"  gui process         {'RUNNING' if inst.blender_running else 'not running (HeadlessTransport ready)'}",
         f"  user extension      {'installed (' + str(addon_manifest.parent) + ')' if addon_manifest.is_file() else 'not installed (run `blenderbot --install-addon`)'}",
+        f"  startup auto-bridge {'installed (' + str(startup_hook) + ')' if startup_hook.is_file() else 'not installed (run `blenderbot --install-addon`)'}",
         f"  registered bl_ops   {len(ops)} stdlib/bpy operations",
     ]
     if live.get("connected"):
@@ -263,6 +266,10 @@ def _print_doctor(cfg: Config) -> int:
         sc = st.get("scene") or {}
         lines.append(
             f"  live gui bridge     CONNECTED -> Blender {st.get('blender_version')} | scene '{sc.get('name')}' ({sc.get('fps')} fps)"
+        )
+    elif inst.blender_running:
+        lines.append(
+            f"  live gui bridge     standby ({live.get('reason')}) — open Blender was launched before bridge loaded; restart Blender or enable 'blenderbot Bridge' in Preferences -> Add-ons"
         )
     else:
         lines.append(
@@ -324,12 +331,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.install_addon:
-        from .bridge.installer import install_blender_addon
+        from .bridge.installer import STARTUP_SCRIPT_NAME, install_blender_addon
 
+        inst = discover_blender()
         path = install_blender_addon()
+        startup_path = Path(inst.user_scripts_startup_dir) / STARTUP_SCRIPT_NAME
         sys.stdout.write(
-            f"Installed blenderbot Blender 5.x extension:\n  {path}\n\n"
-            "Enable 'blenderbot Bridge' in Blender -> Edit -> Preferences -> Add-ons.\n"
+            f"Installed blenderbot Blender 5.x extension & GUI auto-start hook:\n"
+            f"  extension: {path}\n"
+            f"  startup:   {startup_path}\n\n"
+            "Blender 5.3+ will now auto-start the GUI bridge whenever opened.\n"
+            "If Blender is already open right now, either restart it or tick 'blenderbot Bridge' in Edit -> Preferences -> Add-ons.\n"
         )
         return 0
 

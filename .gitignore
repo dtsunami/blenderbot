@@ -18,8 +18,10 @@ playblasts/
 assets/
 tt-splat/
 arcgs/
+toyxyz_RGBMocap/
 
 renders/
 *.png
 
 MuleCreate/
+ml-depth-pro-2/

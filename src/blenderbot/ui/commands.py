@@ -30,7 +30,7 @@ HELP_TEXT = """Commands
   /meshy [img|list|import]    open Meshy 7.1 Image-to-3D Studio (fal API), list `.glb` jobs, or generate/import
   /seedream [prompt] [flags]  open Seedream 5.5 Image Studio (or generate `--ref`/`--res`/`--aspect` PNG/JPG)
   /seedance [prompt] [flags]  open Seedance 2.5 GUI Studio (or generate `--video`/`--first`/`--last` MP4)
-  /splat [list|import <id>]   open 3DGS Splat Studio GUI, list splats, or import `<job_id>` into Blender
+  /splat [diag|list|import]   open 3DGS Studio, inspect noise-floor/stage timings (`diag [id]`), or import
   /fps [scene|job_id]         open dedicated full-screen Minecraft FPS Camera & 3DGS Splat Editor (`/fps`)
   /web [open]                 start/show the Seedance 2.5 & 3D Studio Web GUI sidecar
   /render [frame] [engine]    render still (`BLENDER_EEVEE` | `CYCLES` | `BLENDER_WORKBENCH`) & attach to context
@@ -184,7 +184,7 @@ async def handle_command(
         push(
             {
                 "type": "notice",
-                "message": f"Seedance 2.5 & 3D Studio running at {srv.auth_url}",
+                "message": f"blenderbot Agent & 3D Studio running at {srv.auth_url}",
             }
         )
         return {"handled": True}
@@ -212,13 +212,18 @@ async def handle_command(
 
     if cmd == "/splat":
         if not args or args[0].lower() in ("gui", "open", "studio"):
+            import webbrowser as _wb_sp
+
             from blenderbot.server import ensure_web_sidecar
 
-            srv = await ensure_web_sidecar(session, open_browser=True)
+            srv = await ensure_web_sidecar(session, open_browser=False)
+            sp_url = f"{srv.auth_url}#splat"
+            with contextlib.suppress(Exception):
+                _wb_sp.open(sp_url)
             push(
                 {
                     "type": "notice",
-                    "message": f"Opened 3DGS Splat & Seedance Studio -> {srv.auth_url}#splat",
+                    "message": f"Opened 3DGS Splat Launcher -> {sp_url}",
                 }
             )
             return {"handled": True}
@@ -272,10 +277,103 @@ async def handle_command(
             )
             return {"handled": True}
 
+        if sub in ("diag", "telemetry", "kernel"):
+            from blenderbot.splats.diagnostics import summarize_splat_telemetry
+
+            if len(args) >= 2:
+                jdir = session.sandbox.resolve_for_read(f"assets/splats/{args[1]}")
+            else:
+                dirs = sorted(
+                    (d for d in splats_root.glob("*") if d.is_dir() and (d / "telemetry.jsonl").is_file()),
+                    key=lambda p: p.stat().st_mtime,
+                    reverse=True,
+                )
+                if not dirs:
+                    push({"type": "info", "text": "No splat jobs with telemetry.jsonl found in assets/splats/."})
+                    return {"handled": True}
+                jdir = dirs[0]
+
+            diag = await asyncio.to_thread(summarize_splat_telemetry, jdir)
+            tsum = diag.get("timing_summary") or {}
+            cc = diag.get("camera_convergence") or {}
+            pa = diag.get("ply_audit") or {}
+            lines = [f"3DGS Kernel & Noise-Floor Report — {jdir.name}"]
+            if tsum.get("stages"):
+                lines.append(
+                    f"  Iteration Timing ({tsum.get('samples')} ticks): "
+                    f"mean {tsum.get('step_ms_mean')} ms/it · p95 {tsum.get('step_ms_p95')} ms · ~{tsum.get('it_per_sec_steady')} it/s"
+                )
+                for r in tsum["stages"]:
+                    lines.append(
+                        f"    {r['pct']:5.1f}%  mean={r['mean_ms']:6.3f}ms  p95={r['p95_ms']:6.2f}ms  max={r['max_ms']:6.2f}ms  {r['label']}"
+                    )
+            if cc.get("total_cameras"):
+                lines.append(
+                    f"  View Variance ({cc['total_cameras']} cams): raw σ={cc['late_raw_psnr_std_db']} dB vs "
+                    f"EMA σ={cc['late_ema_psnr_std_db']} dB (same-cam step Δ={cc['within_cam_step_jitter_db']} dB)"
+                )
+                if cc.get("worst_cameras"):
+                    w0 = cc["worst_cameras"][0]
+                    b0 = cc["best_cameras"][0]
+                    lines.append(
+                        f"    Worst view: {w0['camera']} ({w0['last_psnr']} dB, bwd {w0['mean_bwd_ms']}ms) | "
+                        f"Best view: {b0['camera']} ({b0['last_psnr']} dB, bwd {b0['mean_bwd_ms']}ms)"
+                    )
+            if pa.get("n_gaussians"):
+                lines.append(
+                    f"  PLY Audit ({pa['n_gaussians']:,} pts): opa p50={pa['opa_quantiles'][2]} "
+                    f"(dead<0.02={pa['opa_dead_low_frac']*100:.1f}%, ghost 0.02..0.08={pa['opa_ghost_band_frac']*100:.1f}%) · "
+                    f"scale max={pa['scale_m_max']}m (>0.25m={pa['giant_billboard_count']}) · aniso p95={pa['aniso_p95']}×"
+                )
+            for f in diag.get("findings") or []:
+                lines.append(f"  [{f['severity'].upper()}] {f['subsystem']}: {f['evidence']}")
+            push({"type": "info", "text": "\n".join(lines)})
+            return {"handled": True}
+
+        if sub in ("version", "status", "deploy"):
+            from blenderbot.splats.modal_deploy import (
+                check_modal_version_sync,
+                ensure_modal_deployed,
+            )
+
+            if sub == "deploy" or ("--deploy" in args):
+                force_d = "--force" in args
+                push({"type": "notice", "message": "Checking / deploying Modal `blenderbot-splat` worker…"})
+                res = await ensure_modal_deployed(force=force_d)
+                if res.get("deployed"):
+                    push(
+                        {
+                            "type": "notice",
+                            "message": (
+                                f"Deployed Modal `{res['app_name']}` ({res.get('previous_short') or 'none'} -> "
+                                f"{res['current_short']}) in {res['elapsed_s']}s"
+                            ),
+                        }
+                    )
+                else:
+                    push(
+                        {
+                            "type": "info",
+                            "text": f"Modal `{res.get('app_name', 'blenderbot-splat')}` already at {res.get('current_short')} (up_to_date={res.get('up_to_date')}).",
+                        }
+                    )
+                return {"handled": True}
+
+            st_v = await asyncio.to_thread(check_modal_version_sync)
+            state_tag = "UP TO DATE" if st_v.up_to_date else "NEEDS AUTO-DEPLOY (will auto-deploy on next job)"
+            lines = [
+                f"Modal Worker Version — `{st_v.app_name}` [{state_tag}]",
+                f"  Local SHA-256   : {st_v.current_short} ({st_v.current_hash})",
+                f"  Deployed SHA-256: {st_v.deployed_short or 'none'} ({st_v.deployed_hash or 'untagged'})",
+                f"  App ID / Time   : {st_v.app_id or '—'} · {st_v.deployed_at_utc or '—'}",
+            ]
+            push({"type": "info", "text": "\n".join(lines)})
+            return {"handled": True}
+
         push(
             {
                 "type": "info",
-                "text": "usage: /splat | /splat list | /splat import <job_id> [ellipsoids|pointcloud]",
+                "text": "usage: /splat | /splat diag [job_id] | /splat version | /splat deploy [--force] | /splat list | /splat import <job_id>",
             }
         )
         return {"handled": True}
@@ -601,13 +699,18 @@ async def handle_command(
     if cmd == "/seedance":
         # With no args (or `--gui` / `gui` / `open`), launch & open the interactive GUI Studio!
         if not args or args[0].lower() in ("gui", "open", "--gui", "--open", "studio"):
+            import webbrowser as _wb_sd
+
             from blenderbot.server import ensure_web_sidecar
 
-            srv = await ensure_web_sidecar(session, open_browser=True)
+            srv = await ensure_web_sidecar(session, open_browser=False)
+            sd_url = f"{srv.auth_url}#seedance"
+            with contextlib.suppress(Exception):
+                _wb_sd.open(sd_url)
             push(
                 {
                     "type": "notice",
-                    "message": f"Opened Seedance 2.5 GUI Studio -> {srv.auth_url}",
+                    "message": f"Opened Seedance 2.5 Video Studio -> {sd_url}",
                 }
             )
             return {"handled": True}
@@ -867,10 +970,20 @@ async def handle_command(
             if mode_arg or session.transport is None:
                 st = await session.reconnect_blender(mode_arg)
             else:
+                await session.maybe_upgrade_to_gui_bridge()
                 st = await session.transport.call("blender.status", timeout=4.0)
             sc = st.get("scene") or {}
             cnt = st.get("counts") or {}
             res_xy = sc.get("resolution") or [1920, 1080]
+            hint = ""
+            if st.get("mode") == "headless":
+                from blenderbot.config.blender_paths import discover_blender
+
+                if discover_blender().blender_running:
+                    hint = (
+                        "\n  note:     GUI Blender is open without an active bridge socket — "
+                        "restart Blender (auto-bridge is now installed) or enable 'blenderbot Bridge' in Edit -> Preferences -> Add-ons, then run `/blender`."
+                    )
             push(
                 {
                     "type": "info",
@@ -880,7 +993,7 @@ async def handle_command(
                         f"  scene:    {sc.get('name')} | engine={sc.get('engine')} | {res_xy[0]}x{res_xy[1]} @ {sc.get('fps')} fps\n"
                         f"  frames:   {sc.get('frame_start')}..{sc.get('frame_end')} (current={sc.get('frame_current')})\n"
                         f"  camera:   {sc.get('active_camera') or '(none)'}\n"
-                        f"  objects:  {cnt.get('objects', 0)} ({cnt.get('meshes', 0)} meshes, {cnt.get('lights', 0)} lights, {cnt.get('armatures', 0)} armatures)"
+                        f"  objects:  {cnt.get('objects', 0)} ({cnt.get('meshes', 0)} meshes, {cnt.get('lights', 0)} lights, {cnt.get('armatures', 0)} armatures){hint}"
                     ),
                 }
             )

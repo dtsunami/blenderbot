@@ -1,6 +1,6 @@
 # Cloud Burst 3DGS Training & Blender 5.3 Ingestion — Full Design, Provisioning & Risk Spec
 
-> **Status:** **IMPLEMENTED & VERIFIED** (`P0_CLOUD_OK`, `P1_SIM3_OK`, `P1_BLENDER_TO_SPLAT_OK`, `P2_BLENDER_OK`, `P3_REPROJECT_OK` + Web Studio & Headed Blender 5.3 Bridge live).  
+> **Status:** **IMPLEMENTED & VERIFIED (Through Phase 7)** — `P0`–`P3` gates green; upgraded with **Apple Depth Pro 2 (`ml-depth-pro-2`)** metric surface nudging + `RGB+ED` free-space floater carving, **Iterative Camera-Arc Cycles** + post-train **`Snap Arc & Clean Floaters`**, **Per-Camera 3×4 Exposure + Cauchy IRLS**, **Modal Sharded Blender 5.3 Cloud Cycles (`render.modal`)**, full **3DGS Parameter Tooltips + Agent Snicker-Test Review**, and **Versioned Multi-Pass Trajectory Comparison**.  
 > **Lineage:** Carries forward the flat 4-stage pipeline, self-contained binary parsers, and live telemetry controller from `arcgs` / `tt-splat`, moving compute off brittle local SYCL/Blackhole stacks onto **per-second serverless NVIDIA GPUs (Modal H100 / L40S, with Vast.ai / RunPod HTTP pod fallback)**.  
 > **Target Wall Time & Cost:** **25–50s** end-to-end (`MP4` $\rightarrow$ trained `.ply` + `cameras.json` in Blender 5.3) at **~$0.03–$0.05 per scene**.
 

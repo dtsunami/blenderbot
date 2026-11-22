@@ -48,26 +48,67 @@ class BlenderInstallation:
         return d
 
 
+def _is_windows_gui_blender_running() -> bool:
+    """Return True if an interactive windowed `blender.exe` (not `blender -b`) is running on Win32."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    found = False
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def _enum_cb(hwnd: int, _lparam: int) -> bool:
+        nonlocal found
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        pid = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if not pid.value:
+            return True
+        hproc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not hproc:
+            return True
+        try:
+            buf_len = wintypes.DWORD(1024)
+            buf = ctypes.create_unicode_buffer(1024)
+            if kernel32.QueryFullProcessImageNameW(
+                hproc, 0, buf, ctypes.byref(buf_len)
+            ) and buf.value.lower().endswith("\\blender.exe"):
+                found = True
+                return False
+        finally:
+            kernel32.CloseHandle(hproc)
+        return True
+
+    user32.EnumWindows(_enum_cb, 0)
+    return found
+
+
 def _is_blender_running(sys_name: str) -> bool:
     try:
         if sys_name == "Windows":
-            res = subprocess.run(
-                ["tasklist", "/FI", "IMAGENAME eq blender.exe", "/NH"],
-                capture_output=True,
-                text=True,
-                timeout=3,
-                check=False,
-            )
-            return "blender.exe" in res.stdout.lower()
+            return _is_windows_gui_blender_running()
         res = subprocess.run(
-            ["pgrep", "-f", "[bB]lender"],
+            ["ps", "-eo", "args"],
             capture_output=True,
             text=True,
             timeout=3,
             check=False,
         )
-        return res.returncode == 0
-    except (OSError, subprocess.SubprocessError):
+        for line in res.stdout.splitlines():
+            low = line.lower()
+            if "blender" not in low:
+                continue
+            tokens = line.split()
+            if not tokens or "blender" not in Path(tokens[0]).name.lower():
+                continue
+            if "-b" in tokens[1:] or "--background" in tokens[1:]:
+                continue
+            return True
+        return False
+    except Exception:  # noqa: BLE001
         return False
 
 

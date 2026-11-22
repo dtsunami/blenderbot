@@ -166,10 +166,17 @@ def create_fastapi_app(state: WebState) -> FastAPI:
     async def serve_favicon() -> FileResponse:
         return FileResponse(WEB_STATIC_DIR / "favicon.svg")
 
-    @app.get("/assets/{name}", include_in_schema=False)
-    async def serve_asset(name: str) -> Response:
-        target = (WEB_STATIC_DIR / Path(name).name).resolve()
-        if target.parent != WEB_STATIC_DIR or not target.is_file():
+    @app.get("/assets/{asset_path:path}", include_in_schema=False)
+    async def serve_asset(asset_path: str) -> Response:
+        rel_parts = Path(asset_path).parts
+        if not rel_parts or ".." in rel_parts or asset_path.startswith(("/", "\\")):
+            return JSONResponse({"error": "not found"}, status_code=404)
+        target = (WEB_STATIC_DIR / Path(*rel_parts)).resolve()
+        try:
+            target.relative_to(WEB_STATIC_DIR.resolve())
+        except ValueError:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        if not target.is_file():
             return JSONResponse({"error": "not found"}, status_code=404)
         return FileResponse(target, headers=_NO_STORE_HEADERS)
 

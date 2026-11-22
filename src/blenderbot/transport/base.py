@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from blenderbot.bridge.protocol import DEFAULT_BRIDGE_HOST, DEFAULT_BRIDGE_PORT, read_discovery
-from blenderbot.config.blender_paths import discover_blender
+from blenderbot.config.blender_paths import discover_blender, resolve_home
 
 
 class TransportConnectionError(Exception):
@@ -61,6 +61,14 @@ async def connect_blender(
     errors: list[str] = []
 
     if want in ("auto", "bridge", "gui"):
+        if home is None or Path(home).resolve() == resolve_home():
+            from blenderbot.bridge.installer import ensure_blender_addon_installed
+
+            try:
+                ensure_blender_addon_installed(port=bridge_port)
+            except Exception:  # noqa: BLE001, S110
+                pass
+
         disc = read_discovery(home)
         eff_host = disc.host if disc else bridge_host
         eff_port = disc.port if disc else bridge_port
@@ -75,10 +83,17 @@ async def connect_blender(
                 await bt.close()
                 errors.append(f"gui-bridge ({eff_host}:{eff_port}): {err}")
         elif want in ("bridge", "gui"):
-            errors.append(
-                "gui-bridge: no active ~/.blenderbot/bridge.json found "
-                "(run `blenderbot --install-addon`, enable 'blenderbot Bridge' in Blender Preferences -> Add-ons)"
-            )
+            inst_chk = discover_blender()
+            if inst_chk.blender_running:
+                errors.append(
+                    "gui-bridge: Blender GUI is open without an active bridge socket "
+                    "(restart Blender so the auto-bridge loads, or tick 'blenderbot Bridge' in Blender Edit -> Preferences -> Add-ons)"
+                )
+            else:
+                errors.append(
+                    "gui-bridge: no open Blender GUI session found "
+                    "(launch Blender 5.3+ and run `/blender`, or use `auto`/`headless`)"
+                )
 
     if want in ("auto", "headless"):
         ht = HeadlessTransport(snaps_dir=snaps_dir)

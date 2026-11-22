@@ -165,6 +165,8 @@ def create_dispatcher(
 
         if session.transport is None:
             await session.maybe_auto_connect_blender()
+        else:
+            await session.maybe_upgrade_to_gui_bridge()
         _push({"type": "user", "text": without_media}, origin=origin)
         await session.agent.run(without_media)
 

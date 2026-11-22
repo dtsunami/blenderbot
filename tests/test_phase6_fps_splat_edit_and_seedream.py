@@ -297,7 +297,8 @@ async def test_phase6_fps_studio_splat_edit_and_seedream_end_to_end(
                 assert "sash-left" in html_txt
                 assert "sash-right" in html_txt
                 assert "sash-agent" in html_txt
-                assert 'id="agent-drawer" class="agent-drawer collapsed"' in html_txt
+                assert "theater-session-wrap" in html_txt
+                assert "panel-session-inspector" in html_txt
                 assert "insp-section" in html_txt
                 assert "insp-more" in html_txt
                 assert "panel-seedance-composer" in html_txt

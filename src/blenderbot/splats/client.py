@@ -455,6 +455,11 @@ async def run_modal_splat_job(
     cls_name = "SplatWorkerL40S" if eff_gpu == "L40S" else "SplatWorker"
     eff_timeout = _resolve_client_timeout(timeout_sec, default=DEFAULT_MODAL_WORKER_TIMEOUT)
 
+    # Versioned SHA-256 auto-deploy check: ensures remote Modal worker always matches local source!
+    from .modal_deploy import ensure_modal_deployed
+
+    await ensure_modal_deployed(on_event=on_event)
+
     # On initial run pass full `cfg_dict`; on `resume` pass `cfg_dict=None` + `cfg_overrides`
     # so `core_worker.py` merges overrides onto `meta.json["config"]` without clobbering saved settings!
     base_cfg: SplatConfig | None = None
@@ -593,6 +598,10 @@ async def run_modal_splat_render(
     eff_gpu = gpu.upper()
     cls_name = "SplatWorkerL40S" if eff_gpu == "L40S" else "SplatWorker"
     eff_timeout = _resolve_client_timeout(timeout_sec, default=DEFAULT_MODAL_WORKER_TIMEOUT)
+
+    from .modal_deploy import ensure_modal_deployed
+
+    await ensure_modal_deployed(on_event=on_event)
     ply_gz = (
         gzip.compress(ply_fallback_path.read_bytes(), compresslevel=1)
         if ply_fallback_path is not None and ply_fallback_path.is_file()
@@ -663,3 +672,103 @@ async def run_modal_splat_render(
         render_fps=float(done_ev.get("render_fps", 0.0)),
         cost_usd=float(done_ev.get("cost_usd", 0.0)),
     )
+
+
+async def run_modal_snap_camera_arc(
+    *,
+    job_id: str,
+    output_dir: Path,
+    video_path: Path,
+    base_cameras_doc: dict[str, Any],
+    ply_fallback_path: Path | None = None,
+    sample_fps: float = 12.0,
+    max_snap_frames: int = 240,
+    solve_steps: int = 80,
+    floater_clean: bool = True,
+    corridor_radius_m: float = 0.42,
+    near_clear_m: float = 0.42,
+    max_world_scale_m: float = 0.25,
+    gpu: str = "H100",
+    timeout_sec: float | None = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Snap a job's camera arc directly onto the source video on Modal GPU + clean tunnel/giant floaters."""
+    import modal
+
+    eff_gpu = gpu.upper()
+    cls_name = "SplatWorkerL40S" if eff_gpu == "L40S" else "SplatWorker"
+    eff_timeout = _resolve_client_timeout(timeout_sec, default=DEFAULT_MODAL_WORKER_TIMEOUT)
+
+    from .modal_deploy import ensure_modal_deployed
+
+    await ensure_modal_deployed(on_event=on_event)
+
+    mp4_bytes = await asyncio.to_thread(video_path.read_bytes)
+    ply_gz = (
+        await asyncio.to_thread(lambda: gzip.compress(ply_fallback_path.read_bytes(), compresslevel=1))
+        if ply_fallback_path is not None and ply_fallback_path.is_file()
+        else None
+    )
+
+    q: queue.Queue[tuple[str, Any]] = queue.Queue()
+
+    def _producer() -> None:
+        try:
+            worker_cls = _bind_modal_worker_cls(
+                modal.Cls.from_name("blenderbot-splat", cls_name),
+                eff_timeout,
+            )
+            worker = worker_cls()
+            gen = worker.snap_camera_arc_stream.remote_gen(
+                job_id=job_id,
+                mp4_bytes=mp4_bytes,
+                base_cameras_doc=base_cameras_doc,
+                ply_gz=ply_gz,
+                sample_fps=sample_fps,
+                max_snap_frames=max_snap_frames,
+                solve_steps=solve_steps,
+                floater_clean=floater_clean,
+                corridor_radius_m=corridor_radius_m,
+                near_clear_m=near_clear_m,
+                max_world_scale_m=max_world_scale_m,
+                gpu=eff_gpu,
+            )
+            for item in gen:
+                q.put(("ev", item))
+            q.put(("eof", None))
+        except Exception as exc:  # noqa: BLE001
+            q.put(("err", exc))
+
+    thr = threading.Thread(target=_producer, daemon=True)
+    thr.start()
+
+    done_ev: dict[str, Any] | None = None
+    while True:
+        try:
+            kind, payload = q.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.05)
+            continue
+        if kind == "err":
+            raise RuntimeError(f"Modal camera arc snap failed: {payload}") from payload
+        if kind == "eof":
+            break
+        if kind == "ev":
+            if on_event is not None:
+                on_event(payload)
+            if payload.get("event") == "snap_done":
+                done_ev = payload
+
+    if done_ev is None:
+        raise RuntimeError("Modal camera arc snap ended without snap_done.")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if done_ev.get("cameras_json"):
+        (output_dir / "cameras.json").write_text(str(done_ev["cameras_json"]), encoding="utf-8")
+    if done_ev.get("ply_gz"):
+        (output_dir / "splat.ply").write_bytes(gzip.decompress(done_ev["ply_gz"]))
+    if done_ev.get("splat_gz"):
+        (output_dir / "splat.splat").write_bytes(gzip.decompress(done_ev["splat_gz"]))
+
+    clean = {k: v for k, v in done_ev.items() if k not in ("cameras_json", "ply_gz", "splat_gz")}
+    return clean

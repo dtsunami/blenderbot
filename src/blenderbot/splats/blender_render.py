@@ -679,6 +679,10 @@ async def run_modal_blender_render(
         else None
     )
 
+    from .modal_deploy import ensure_modal_deployed
+
+    await ensure_modal_deployed(on_event=on_event)
+
     if len(ranges) == 1:
         done_ev = await _run_single_modal_shard(
             cls_name=cls_name,

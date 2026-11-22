@@ -7,7 +7,7 @@
 
 ## 1. Current State of `blenderbot` (`D:\blenderbot`)
 
-All 6 phases of `blenderbot` are complete, lint-clean, and verified end-to-end:
+All 7 phases of `blenderbot` are complete, lint-clean, and verified end-to-end (including Meshy 7.1 fal Queue integration, Modal sharded Blender 5.3 Cycles rendering, Apple Depth Pro 2 `RGB+ED` surface nudging, iterative video-arc registration + `Snap Arc`, full 3DGS parameter tooltips + Agent Snicker-Test review, and versioned multi-pass trajectory comparison):
 - **Blender 5.3+ Core Harness (`src/blenderbot/agent/`, `blender_ops/`, `bridge/`, `transport/`):**
   - Single fenced `bl_ops` protocol + verbatim `--blenderbot:NAME--` payload blocks + transactional `bpy.tx` rollback + unified `.blend`/workspace `Journal` (`/undo`, `/redo`).
   - Dual transport: `BridgeTransport` (`127.0.0.1:18766`, `~/.blenderbot/bridge.json` token-authenticated NDJSON RPC drained on Blender's main thread) + `HeadlessTransport` (warm `blender.exe -b` daemon).

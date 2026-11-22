@@ -57,9 +57,58 @@ def test_discover_blender_and_addon_installer(tmp_path: Path) -> None:
         "render.playblast",
     }.issubset(op_names)
 
-    addon_dir = install_blender_addon(target_extensions_dir=tmp_path)
+    startup_dir = tmp_path / "startup"
+    addon_dir = install_blender_addon(target_extensions_dir=tmp_path, target_startup_dir=startup_dir)
     assert (addon_dir / "blender_manifest.toml").is_file()
     assert (addon_dir / "__init__.py").is_file()
+    assert (startup_dir / "blenderbot_bridge_startup.py").is_file()
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_auto_upgrade_headless_to_live_gui_bridge(
+    blender_worker: HeadlessTransport,
+    tmp_path: Path,
+) -> None:
+    from blenderbot.session.bootstrap import bootstrap_session
+
+    sess = await bootstrap_session(
+        cwd=tmp_path,
+        home=tmp_path / "home",
+        injected_transport=None,
+        auto_connect_blender=False,
+    )
+    try:
+        # Simulate starting with a headless transport in `auto` mode before GUI Blender opens
+        assert blender_worker._client is not None
+        fake_headless = BridgeTransport(
+            host=blender_worker._client.host,
+            port=blender_worker._client.port,
+            token=blender_worker._client.token,
+            mode_label="headless",
+        )
+        sess.transport = fake_headless
+        sess.agent.transport = fake_headless
+
+        # No bridge.json yet -> stays headless
+        assert await sess.maybe_upgrade_to_gui_bridge() is False
+        assert sess.transport.mode == "headless"
+
+        # Now GUI Blender writes `~/.blenderbot/bridge.json` -> hot-upgrades to `gui`!
+        disc = BridgeDiscovery(
+            host=blender_worker._client.host,
+            port=blender_worker._client.port,
+            token=blender_worker._client.token,
+            pid=12345,
+            started_at=200.0,
+            mode="gui",
+            blender_version="5.3.0",
+        )
+        write_discovery(disc, home=sess.cfg.home)
+        assert await sess.maybe_upgrade_to_gui_bridge() is True
+        assert sess.transport is not None
+        assert sess.transport.mode == "gui"
+    finally:
+        await sess.close()
 
 
 def test_bridge_discovery_and_token_auth(tmp_path: Path) -> None:

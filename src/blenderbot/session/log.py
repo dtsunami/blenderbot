@@ -82,6 +82,10 @@ class SessionLog:
             "provider": provider,
             "model": model_id,
             "resumed_from": resumed_from,
+            "blend_filepath": "",
+            "scene_name": "",
+            "last_snapshot": "",
+            "first_prompt": "",
             "transcript_accumulated": True,
             "totals_accumulated": True,
             "totals": dict(self._base_totals),
@@ -92,8 +96,36 @@ class SessionLog:
     def _flush_meta(self) -> None:
         self.meta_path.write_text(json.dumps(self.meta, indent=2) + "\n", encoding="utf-8")
 
+    def update_blend_association(
+        self,
+        *,
+        blend_filepath: str | None = None,
+        scene_name: str | None = None,
+        last_snapshot: str | None = None,
+    ) -> None:
+        changed = False
+        if blend_filepath is not None and str(blend_filepath) != self.meta.get("blend_filepath", ""):
+            self.meta["blend_filepath"] = str(blend_filepath)
+            changed = True
+        if scene_name is not None and str(scene_name) != self.meta.get("scene_name", ""):
+            self.meta["scene_name"] = str(scene_name)
+            changed = True
+        if last_snapshot is not None and str(last_snapshot) != self.meta.get("last_snapshot", ""):
+            self.meta["last_snapshot"] = str(last_snapshot)
+            changed = True
+        if changed:
+            self._flush_meta()
+
     def record(self, event_type: str, data: Any) -> None:
         safe_data = sanitize_utf8(data)
+        if (
+            event_type == "user"
+            and isinstance(safe_data, dict)
+            and safe_data.get("text")
+            and not self.meta.get("first_prompt")
+        ):
+            self.meta["first_prompt"] = sanitize_utf8_str(str(safe_data["text"])).strip()[:160]
+            self._flush_meta()
         line = sanitize_utf8_str(
             _redact(
                 json.dumps(

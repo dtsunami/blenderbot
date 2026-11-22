@@ -182,6 +182,10 @@ class Ledger:
                 return seg.pinned
         return False
 
+    def clear(self) -> None:
+        self.segments.clear()
+        self._next_id = 1
+
     def clear_conversation(self) -> int:
         before = len(self.segments)
         self.segments = [s for s in self.segments if s.type in PROTECTED_TYPES]
